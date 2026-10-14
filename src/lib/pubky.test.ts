@@ -120,6 +120,25 @@ describe('persisted grant lifecycle', () => {
     expect(mocks.remove).toHaveBeenCalledExactlyOnceWith('saved-session')
   })
 
+  it('completes logout when the SDK already removed the exact restored session record', async () => {
+    const { persistSession, signOut } = await import('./pubky')
+    const session = makeSession()
+    await persistSession(session)
+    mocks.remove.mockRejectedValueOnce(Object.assign(new Error('Stored Pubky session not found: saved-session'), { name: 'ClientStateError' }))
+    await expect(signOut(session)).resolves.toBeUndefined()
+    expect(localValues.has(SESSION_KEY)).toBe(false)
+    expect(session.signout).toHaveBeenCalledOnce()
+  })
+
+  it.each(['Storage transaction failed', 'Stored Pubky session not found: another-session'])('does not hide a different SDK cleanup error: %s', async message => {
+    const { persistSession, signOut } = await import('./pubky')
+    const session = makeSession()
+    await persistSession(session)
+    const error = Object.assign(new Error(message), { name: 'ClientStateError' })
+    mocks.remove.mockRejectedValueOnce(error)
+    await expect(signOut(session)).rejects.toBe(error)
+  })
+
   it('prevents a slower older persistence operation from replacing the newer pointer', async () => {
     const { persistSession, discardSession } = await import('./pubky')
     let completeOlder!: (value: { id: string }) => void

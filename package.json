@@ -14,7 +14,11 @@
     "test:crdt": "vitest run src/lib/crdt.test.ts src/lib/crdt.convergence.test.ts src/lib/local-notebook.test.ts src/lib/notebook-sync.test.ts src/lib/notebook-sync.integration.test.ts src/lib/notes.test.ts src/App.sync.test.tsx",
     "test:crdt:mutations": "node scripts/check-crdt-mutations.mjs",
     "test:interop": "npm --prefix ../pubky-notes-cli run build && node scripts/crdt-interop.mjs",
-    "test:homeserver": "npm --prefix ../pubky-notes-cli run build && node scripts/crdt-homeserver.mjs --local-testnet"
+    "test:homeserver": "npm --prefix ../pubky-notes-cli run build && node scripts/crdt-homeserver.mjs --local-testnet",
+    "test:collaboration": "vitest run src/lib/shared-note.test.ts src/lib/collaboration",
+    "test:collaboration:infrastructure": "node --test scripts/test-collaboration-infrastructure.mjs",
+    "test:collaboration:browser": "playwright test",
+    "signaling": "node scripts/collaboration-signaling.mjs"
   },
   "dependencies": {
     "@synonymdev/pubky": "0.16.1",
@@ -25,9 +29,11 @@
     "react-dom": "^19.3.0",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
+    "ws": "^8.22.0",
     "yjs": "13.6.33"
   },
   "devDependencies": {
+    "@playwright/test": "^1.64.1",
     "@testing-library/react": "^16.3.3",
     "@testing-library/user-event": "^14.6.8",
     "@types/node": "^22.0.0",

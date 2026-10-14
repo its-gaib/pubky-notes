@@ -17,6 +17,11 @@
   --danger: #b94d53;
 }
 
+.collaboration-status { display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: transparent; color: var(--accent); font-size: 12px; }
+.collaboration-note-name { font-weight: 600; overflow-wrap: anywhere; }
+.collaboration-request { padding: 12px; border-radius: 7px; background: var(--accent-soft); }
+@media (max-width: 1000px) { .collaboration-button > span { display: none; } }
+
 * { box-sizing: border-box; }
 html, body, #root { width: 100%; height: 100%; margin: 0; }
 body { min-width: 320px; overflow: hidden; }

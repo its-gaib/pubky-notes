@@ -1,0 +1,43 @@
+# Copy outside the repository; replace the domain, secret, IPs and TLS paths.
+# This example targets coturn 4.18.0. The CLI and DTLS listeners are off by default.
+listening-port=3478
+tls-listening-port=5349
+listening-ip=PUBLIC_OR_INTERFACE_IP
+relay-ip=PUBLIC_OR_INTERFACE_IP
+# If the interface has a private address behind one-to-one NAT, uncomment:
+# external-ip=PUBLIC_IP/PRIVATE_INTERFACE_IP
+min-port=49160
+max-port=49200
+realm=turn.example.com
+fingerprint
+use-auth-secret
+static-auth-secret=REPLACE_WITH_AT_LEAST_32_RANDOM_BYTES
+cert=/etc/coturn/tls/fullchain.pem
+pkey=/etc/coturn/tls/privkey.pem
+no-multicast-peers
+no-tcp-relay
+user-quota=4
+total-quota=100
+max-bps=1048576
+bps-capacity=10485760
+max-allocate-lifetime=600
+# Block private, unspecified, loopback, link-local, CGNAT, and multicast peers.
+# Also block any other internal routes accessible from your specific server.
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=100.64.0.0-100.127.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=224.0.0.0-255.255.255.255
+denied-peer-ip=::
+denied-peer-ip=::1
+denied-peer-ip=::ffff:0:0-::ffff:ffff:ffff
+denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=ff00::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+# Disable protocol-level access logs unless needed for a time-bounded investigation.
+# Default operational logs can still contain client IPs; choose retention accordingly.
+log-file=stdout
+simple-log

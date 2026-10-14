@@ -21,7 +21,7 @@ For a separately running local testnet, copy `.env.example` to `.env.local`, set
 
 - Canonical notes: `/priv/notes/<id>.json`.
 - Explicit public snapshots: `/pub/notes/<id>.json`.
-- Records contain `id`, `title`, `content`, `createdAt`, and `updatedAt`, plus a private Yjs `crdt` envelope and optional `folder` / `deleted` metadata. Nested folders remain logical paths such as `Work/Ideas`; all files stay directly under their storage root. Empty folders are recorded separately at `/priv/notes/folders`. Public snapshots contain only the five public note fields. Moving a note does not change its ID or public link.
+- Records contain `id`, `title`, `content`, `createdAt`, and `updatedAt`, plus a private Yjs `crdt` envelope and optional `folder` / `deleted` metadata. Ordinary notes retain CRDT version 1. Collaborative notes use version 2: `update` contains shared title/content and `personal` contains the account's separate folder/Trash history. Nested folders remain logical paths such as `Work/Ideas`; all files stay directly under their storage root. Empty folders are recorded separately at `/priv/notes/folders`. Public snapshots contain only the five public note fields. Moving a note does not change its ID or public link.
 - Pubky Ring shows the authentication client ID `pubky-notes`. The app requests read/write access to exactly two roots: `/priv/notes/` and `/pub/notes/`.
 - The account row reads your public name and avatar from `/pub/pubky.app/profile.json`, following [Pubky App Specs](https://github.com/pubky/pubky-app-specs/blob/main/SPEC.md#pubkyappuser). Click the abbreviated identifier to copy your complete `pubky…` identifier. Profile reads require no additional permissions; a missing profile or image falls back without blocking your notebook.
 - Edits save locally first, then synchronize to `/priv`. The app distinguishes device storage from verified homeserver storage. Publishing saves the private draft and writes the specific text reviewed when Publish was clicked; newly merged remote private text is not silently published. Later edits remain private until **Update public copy** is clicked.
@@ -47,13 +47,25 @@ IndexedDB persistence protects reloads and temporary outages, but clearing site 
 
 ## Vercel
 
-`vercel.json` configures the Vite build, SPA routing and browser security headers. No server secrets or application database are needed: the browser connects directly to Pubky.
+`vercel.json` configures the Vite build, SPA routing, ICE configuration endpoint, and browser security headers. The default deployment needs no application database or server secrets: browsers connect to Pubky and use its public HTTP relay for encrypted collaboration introductions. A production TURN provider needs separate configuration as described below.
 
 ```sh
 vercel deploy --prod
 ```
 
 Public links use `/?owner=<z32-public-key>&note=<note-id>`.
+
+## Two-person collaboration
+
+Connect Pubky, open a note, choose **Collaborate → Create shared copy**, and send the invitation link. The original note remains unchanged. The shared copy begins with only the current visible title and Markdown, so old deleted private text is not included. The other person signs in, opens the invitation, and chooses **Join collaboration**. Compare their displayed connection code before choosing **Allow collaborator**. The code authenticates a browser key; it does not verify a Pubky profile identity.
+
+Each participant edits the same Yjs document through an ordered WebRTC data channel and independently saves the complete merged document under `/priv/notes/<id>.json` on their own homeserver. Folder changes and Trash belong only to that person's copy. Publication remains a separate, explicit action. The footer's **Peer received** means that peer acknowledged local device persistence; the existing **Saved to Pubky** status describes your own homeserver.
+
+Both browsers must be online together to exchange changes. Offline changes remain in the local outbox and merge when the connection returns. Reloading on the same browser/account reuses the locally stored invitation and admitted browser keys. Collaboration keys are separate from Pubky sessions and are kept in account-scoped IndexedDB; clearing site data removes those connection credentials. Signing out closes the peer connection. **Disconnect collaboration** pauses live exchange while retaining both copies.
+
+Invitation secrets live in the URL fragment and are removed from the address bar after opening. Signaling is encrypted and signed with a pinned host key, and a host admits only one guest browser key. The peer receives only validated, bounded title/content updates, never Pubky sessions, personal metadata, or publication commands. These are trusted-editor collaborations: an admitted editor can change or delete shared text and retain previously received content.
+
+See [collaboration hosting](docs/collaboration-hosting.md) for signaling, TURN relay configuration, connectivity limits, and optional self-hosting. TURN availability is shown honestly in the collaboration dialog. The CLI can read and edit version 2 documents, but does not yet join live peer connections.
 
 ## Verification
 
@@ -62,7 +74,18 @@ npm test                    # Entire offline test suite
 npm run test:crdt            # CRDT, durable storage, sync, and relevant UI tests
 npm run test:crdt:mutations  # Prove the new tests detect six deliberate defects
 npm run build               # TypeScript and production bundle
+npm run test:collaboration   # Shared document, invitation, transport and framing tests
+npm run test:collaboration:infrastructure # Signaling and relay-credential API tests
+npm run test:collaboration:browser # Actual two-browser WebRTC + local Pubky testnet
 ```
+
+The browser suite requires the local Pubky testnet described below, Playwright Chromium (`npx playwright install chromium`), and the disposable TURN fixture running in another terminal:
+
+```sh
+node scripts/collaboration/start-local-turn.mjs
+```
+
+It uses two separate disposable Pubky accounts and checks real private homeserver files. Cases cover admission, concurrent edits, personal folders and publication, logout, offline merging, reload, and actual relay-to-relay traffic with the initial handshake deliberately dropped. The default test discovery service runs locally. To check the existing public Pubky relay as well, run `COLLAB_E2E_SIGNAL_URL=https://httprelay.pubky.app/inbox/ npx playwright test -g 'approved browsers'`. No personal sessions or notes are used.
 
 Convergence tests run four independent replicas through five editing rounds under four seeded delivery schedules. Every packet crosses a JSON serialization boundary; delivery includes duplicates, stale states, and different ordering. An independent ledger checks for lost insertions and resurrected deletions after each delivery, and the final text is checked against an expected document built from user actions. Additional cases cover overlapping edits, Unicode and Markdown, folder/title changes, deletion, and explicit restoration.
 

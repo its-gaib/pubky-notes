@@ -102,6 +102,44 @@ try {
       await assert.rejects(cli.call('crdt:mergeNotes', b, a), { name: 'LineageConflictError' })
     }
   })
+  await test('shared v2 browser and CLI edits merge into the live document without sharing personal metadata', async () => {
+    const { createSharedNote, SharedNoteDocument, joinSharedNote } = web.shared
+    const base = createSharedNote(initializeNote(fixture('shared-live')))
+    const browser = new SharedNoteDocument(base)
+    const peer = new SharedNoteDocument(joinSharedNote(browser.descriptor, browser.getUpdate()))
+    try {
+      browser.edit({ content: `Browser\n${base.content}`, folder: 'My browser folder' })
+      const terminal = await cli.call('crdt:editNote', copy(base), { content: `${base.content}\nCLI`, deleted: true })
+      const merged = await exchange(browser.note, terminal)
+      browser.mergeLocal(merged)
+      assert.equal(browser.note.content, `Browser\n${base.content}\nCLI`)
+      assert.equal(browser.note.deleted, true)
+      assert.equal(browser.note.folder, 'My browser folder')
+      peer.applyPeerUpdate(browser.getUpdate(peer.getStateVector()))
+      assert.equal(peer.note.content, browser.note.content)
+      assert.equal(peer.note.folder, undefined)
+      assert.equal(peer.note.deleted, undefined)
+      assert.deepEqual(await cli.call('crdt:validateCrdtNote', copy(browser.note)), browser.note)
+    } finally { browser.destroy(); peer.destroy() }
+  })
+
+  await test('shared v2 CLI personal-only changes survive reload without changing the peer update', async () => {
+    const { createSharedNote, SharedNoteDocument } = web.shared
+    const base = createSharedNote(initializeNote(fixture('shared-personal')))
+    const moved = await cli.call('crdt:editNote', copy(base), { folder: 'CLI/Private', deleted: true })
+    assert.equal(moved.crdt.update, base.crdt.update)
+    assert.notEqual(noteRevision(moved), noteRevision(base))
+    assert.equal(await cli.call('crdt:noteRevision', moved), noteRevision(moved))
+    const browser = new SharedNoteDocument(copy(moved))
+    try {
+      browser.edit({ content: `${browser.note.content}\nBrowser after reload` })
+      const restored = await cli.call('crdt:editNote', copy(browser.note), { deleted: false })
+      same(mergeNotes(browser.note, restored), await cli.call('crdt:mergeNotes', restored, browser.note))
+      assert.equal(restored.folder, 'CLI/Private')
+      assert.equal(restored.deleted, undefined)
+      assert.equal(restored.content, `${base.content}\nBrowser after reload`)
+    } finally { browser.destroy() }
+  })
   console.log(`Current-source web/CLI interoperability: ${passed} scenarios passed.`)
 } finally {
   await cli.close()

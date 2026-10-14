@@ -14,7 +14,8 @@ export async function openWebModules() {
   try {
     const crdt = await server.ssrLoadModule('/src/lib/crdt.ts')
     const notes = await server.ssrLoadModule('/src/lib/notes.ts')
-    return { crdt, notes, close: () => server.close() }
+    const shared = await server.ssrLoadModule('/src/lib/shared-note.ts')
+    return { crdt, notes, shared, close: () => server.close() }
   } catch (error) {
     await server.close()
     throw error

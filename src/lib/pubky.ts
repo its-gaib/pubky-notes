@@ -129,7 +129,13 @@ async function forgetSession(savedId: string | null): Promise<void> {
   try {
     if (localStorage.getItem(SESSION_KEY) === savedId) localStorage.removeItem(SESSION_KEY)
   } finally {
-    await getPubky().browserSessionStore.remove(savedId)
+    try { await getPubky().browserSessionStore.remove(savedId) }
+    catch (error) {
+      // SDK 0.16.1 can remove a restored record during successful signout.
+      // Only that exact missing record is an already-completed cleanup.
+      if (!(error instanceof Error) || error.name !== 'ClientStateError' ||
+          error.message !== `Stored Pubky session not found: ${savedId}`) throw error
+    }
   }
 }
 
