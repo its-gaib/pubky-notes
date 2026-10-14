@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Session } from '@synonymdev/pubky'
 import type { Note, NoteRecord } from './lib/notes'
@@ -255,5 +255,97 @@ describe('private saving and explicit publication', () => {
       content: 'A private edit that is not ready for publication.',
     }))
     expect(screen.getByText('Public copy published')).toBeTruthy()
+  })
+})
+
+describe('folders and notebook-wide search', () => {
+  function organizedNotebook(): NoteRecord[] {
+    const privateGarden = { ...savedNote, title: 'Private garden', content: 'Tomatoes and herbs.', folder: 'Personal/Garden' }
+    const publicGarden = { ...savedNote, id: 'public-garden', title: 'Public garden', content: 'Tomatoes in the community garden.', folder: 'Work' }
+    const otherPrivate = { ...savedNote, id: 'unfiled-garden', title: 'Unfiled garden', content: 'Tomatoes to grow.' }
+    return [
+      { note: privateGarden, published: null },
+      { note: publicGarden, published: { ...publicGarden } },
+      { note: otherPrivate, published: null },
+    ]
+  }
+
+  async function openNotebook(records: NoteRecord[]) {
+    const session = candidateSession()
+    mocks.restoreSession.mockResolvedValue(session)
+    mocks.listNotes.mockResolvedValue(records)
+    render(<App />)
+    await screen.findByRole('button', { name: 'Disconnect from Pubky' })
+    await waitFor(() => expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe(records[0].note.title))
+    return session
+  }
+
+  it('searches title and content across folders and visibility, then restores the selected scope when cleared', async () => {
+    await openNotebook(organizedNotebook())
+    fireEvent.click(screen.getByRole('button', { name: 'Open folder Personal' }))
+    const notes = within(screen.getByRole('region', { name: 'Notes' }))
+    expect(notes.getByText('Private garden', { exact: true })).toBeTruthy()
+    expect(notes.queryByText('Public garden', { exact: true })).toBeNull()
+    expect(notes.queryByText('Unfiled garden', { exact: true })).toBeNull()
+
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search all notes' }), {
+      target: { value: ' GARDEN tomatoes ' },
+    })
+    expect(notes.getByText('Private garden', { exact: true })).toBeTruthy()
+    expect(notes.getByText('Public garden', { exact: true })).toBeTruthy()
+    expect(notes.getByText('Unfiled garden', { exact: true })).toBeTruthy()
+
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search all notes' }), { target: { value: '' } })
+    expect(notes.getByText('Private garden', { exact: true })).toBeTruthy()
+    expect(notes.queryByText('Public garden', { exact: true })).toBeNull()
+    expect(notes.queryByText('Unfiled garden', { exact: true })).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /^Private$/ }))
+    expect(notes.queryByText('Public garden', { exact: true })).toBeNull()
+    expect(notes.getByText('Unfiled garden', { exact: true })).toBeTruthy()
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search all notes' }), { target: { value: 'garden tomatoes' } })
+    expect(notes.getByText('Public garden', { exact: true })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Clear search' }))
+    expect(notes.queryByText('Public garden', { exact: true })).toBeNull()
+    expect(notes.getByText('Private garden', { exact: true })).toBeTruthy()
+    expect(notes.getByText('Unfiled garden', { exact: true })).toBeTruthy()
+    expect(mocks.saveNote).not.toHaveBeenCalled()
+    expect(mocks.publishNote).not.toHaveBeenCalled()
+  })
+
+  it('creates a nested folder by moving a note and saves its organization privately', async () => {
+    const original = { ...savedNote }
+    const session = await openNotebook([{ note: original, published: { ...original } }])
+    fireEvent.click(screen.getByRole('button', { name: /^Move note$/ }))
+    const dialog = within(screen.getByRole('dialog', { name: 'Move note' }))
+    fireEvent.change(dialog.getByRole('combobox', { name: /^Folder$/ }), { target: { value: ' Work / Project ' } })
+    await act(async () => { fireEvent.click(dialog.getByRole('button', { name: /^Move$/ })) })
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Move note' })).toBeNull())
+    await act(async () => { fireEvent.keyDown(window, { key: 's', ctrlKey: true }) })
+
+    expect(mocks.saveNote).toHaveBeenCalledWith(session, expect.objectContaining({
+      id: original.id, title: original.title, content: original.content, folder: 'Work/Project',
+    }))
+    expect(screen.getByRole('button', { name: 'Open folder Work' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Open folder Work/Project' })).toBeTruthy()
+    expect(mocks.publishNote).not.toHaveBeenCalled()
+    expect(mocks.unpublishNote).not.toHaveBeenCalled()
+  })
+
+  it('starts a new note in the selected nested folder with the Markdown template', async () => {
+    const session = await openNotebook(organizedNotebook())
+    fireEvent.click(screen.getByRole('button', { name: 'Open folder Personal/Garden' }))
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Create a new note' })) })
+    const content = (screen.getByRole('textbox', { name: 'Markdown content' }) as HTMLTextAreaElement).value
+    expect(content).toContain('## Heading')
+    expect(content).toContain('**Bold**')
+    expect(content).toContain('- [ ] Task')
+    expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe('Untitled note')
+    await act(async () => { fireEvent.keyDown(window, { key: 's', ctrlKey: true }) })
+
+    expect(mocks.saveNote).toHaveBeenCalledExactlyOnceWith(session, expect.objectContaining({
+      title: 'Untitled note', content, folder: 'Personal/Garden',
+    }))
+    expect(mocks.publishNote).not.toHaveBeenCalled()
   })
 })

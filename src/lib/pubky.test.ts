@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Session } from '@synonymdev/pubky'
-import { APP_CAPABILITIES, APP_CLIENT_ID, IS_TESTNET } from '../config'
+import { APP_CAPABILITIES, APP_CLIENT_ID, APP_PATHS, LEGACY_PATHS, IS_TESTNET } from '../config'
 
 const mocks = vi.hoisted(() => ({ save: vi.fn(), restore: vi.fn(), remove: vi.fn() }))
 vi.mock('@synonymdev/pubky', () => ({
@@ -141,6 +141,43 @@ describe('persisted grant lifecycle', () => {
     mocks.restore.mockRejectedValue(new Error('Offline'))
     await expect(restoreSession()).rejects.toThrow('Offline')
     expect(localValues.get(SESSION_KEY)).toBe('saved-session')
+    expect(mocks.remove).not.toHaveBeenCalled()
+  })
+})
+
+
+describe('namespace authorization upgrade', () => {
+  it('requests only the four exact new and legacy roots', () => {
+    expect(APP_CAPABILITIES.split(',')).toEqual([
+      '/priv/notes/:rw', '/pub/notes/:rw', '/priv/notes.pubky.app/notes/:rw', '/pub/notes.pubky.app/notes/:rw',
+    ])
+  })
+
+  it('forgets an old-only saved grant and reports that sign-in is required', async () => {
+    const { restoreSession } = await import('./pubky')
+    const oldSession = makeSession()
+    Object.assign(oldSession.info, { capabilities: Object.values(LEGACY_PATHS).map(path => `${path}:rw`) })
+    localValues.set(SESSION_KEY, 'old-session')
+    mocks.restore.mockResolvedValue(oldSession)
+    await expect(restoreSession()).rejects.toMatchObject({ name: 'NotesPermissionError', message: expect.stringContaining('Sign in again') })
+    expect(localValues.has(SESSION_KEY)).toBe(false)
+    expect(mocks.remove).toHaveBeenCalledExactlyOnceWith('old-session')
+  })
+
+  it('rejects a grant without legacy cleanup access before persisting it', async () => {
+    const { persistSession } = await import('./pubky')
+    const session = makeSession()
+    Object.assign(session.info, { capabilities: Object.values(APP_PATHS).map(path => `${path}:rw`) })
+    await expect(persistSession(session)).rejects.toMatchObject({ name: 'NotesPermissionError' })
+    expect(mocks.save).not.toHaveBeenCalled()
+  })
+
+  it('restores upgraded grants with all required scopes', async () => {
+    const { restoreSession } = await import('./pubky')
+    const session = makeSession()
+    localValues.set(SESSION_KEY, 'upgraded')
+    mocks.restore.mockResolvedValue(session)
+    await expect(restoreSession()).resolves.toBe(session)
     expect(mocks.remove).not.toHaveBeenCalled()
   })
 })

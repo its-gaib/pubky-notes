@@ -1,7 +1,8 @@
 import { PubkyResource, PublicKey } from '@synonymdev/pubky'
-import type { Address, Path, Session } from '@synonymdev/pubky'
-import { APP_PATHS } from '../config'
+import type { Address, Path, Session, StorageLock } from '@synonymdev/pubky'
+import { APP_PATHS, LEGACY_PATHS } from '../config'
 import { getPubky } from './pubky'
+import { normalizeFolder } from './folders'
 
 export interface Note {
   id: string
@@ -9,6 +10,7 @@ export interface Note {
   content: string
   createdAt: string
   updatedAt: string
+  folder?: string
 }
 
 export interface NoteRecord {
@@ -22,6 +24,7 @@ const MAX_TITLE_LENGTH = 200
 const LIST_PAGE_SIZE = 100
 const MAX_NOTES = 2_000
 const DOWNLOAD_CONCURRENCY = 5
+const MIGRATION_LOCK_SECONDS = 60
 type StorageSpace = keyof typeof APP_PATHS
 
 export function createNote(): Note {
@@ -35,6 +38,7 @@ export function notePath(space: StorageSpace, id: string): Path {
 }
 
 export async function listNotes(session: Session): Promise<NoteRecord[]> {
+  await migrateLegacyNotes(session)
   const [privateNotes, publicNotes] = await Promise.all([
     readFolder(session, 'private'),
     readFolder(session, 'public'),
@@ -57,31 +61,31 @@ export async function saveNote(session: Session, note: Note): Promise<Note> {
 export async function publishNote(session: Session, note: Note): Promise<Note> {
   // Publishing is always explicit. Ordinary edits update the private original only.
   const saved = await saveNote(session, note)
-  await session.storage.putJson(notePath('public', saved.id), saved)
-  return saved
+  const snapshot = publicSnapshot(saved)
+  await session.storage.putJson(notePath('public', saved.id), snapshot)
+  return snapshot
 }
 
 export async function unpublishNote(session: Session, id: string): Promise<void> {
   const privatePath = notePath('private', id)
-  const publicPath = notePath('public', id)
   if (!await session.storage.exists(privatePath)) {
-    let response: Response
-    try {
-      response = await session.storage.get(publicPath)
-    } catch (error) {
-      if (isMissing(error)) return
-      throw error
-    }
-    // Preserve an orphaned snapshot if another app removed its private original.
-    const snapshot = validateNote(await readBoundedJson(response), id)
-    await saveNote(session, snapshot)
+    // A legacy private draft always takes precedence over a public snapshot.
+    const original = await readOptionalNote(session, legacyPath('private', id), id)
+      ?? await readOptionalNote(session, notePath('public', id), id)
+      ?? await readOptionalNote(session, legacyPath('public', id), id)
+    if (original) await saveNote(session, original)
   }
-  await deleteIfPresent(session, publicPath)
+  // Report success only once neither old nor new public copies remain.
+  await deleteIfPresent(session, notePath('public', id))
+  await deleteIfPresent(session, legacyPath('public', id))
 }
 
 export async function deleteNote(session: Session, id: string): Promise<void> {
-  // If public deletion fails, preserve the private original and report the failure.
+  // Keep the original if either public deletion fails. Remove legacy private data
+  // before the current draft so a failed cleanup cannot resurrect a deleted note.
   await deleteIfPresent(session, notePath('public', id))
+  await deleteIfPresent(session, legacyPath('public', id))
+  await deleteIfPresent(session, legacyPath('private', id))
   await deleteIfPresent(session, notePath('private', id))
 }
 
@@ -89,16 +93,96 @@ export async function loadPublicNote(owner: string, id: string): Promise<Note> {
   requireId(id)
   const publicKey = PublicKey.from(owner)
   try {
-    const address: Address = `pubky${publicKey.z32()}${APP_PATHS.public}${id}.json`
-    const response = await getPubky().publicStorage.get(address)
-    return validateNote(await readBoundedJson(response), id)
+    const read = async (folder: typeof APP_PATHS.public | typeof LEGACY_PATHS.public) => {
+      const address: Address = `pubky${publicKey.z32()}${folder}${id}.json`
+      const response = await getPubky().publicStorage.get(address)
+      return publicSnapshot(validateNote(await readBoundedJson(response), id))
+    }
+    try { return await read(APP_PATHS.public) } catch (error) {
+      if (!isMissing(error)) throw error
+      return await read(LEGACY_PATHS.public)
+    }
   } finally {
     publicKey.free()
   }
 }
 
+function legacyPath(space: StorageSpace, id: string): Path {
+  requireId(id)
+  return `${LEGACY_PATHS[space]}${id}.json`
+}
+
+function publicSnapshot(note: Note): Note {
+  const { folder: _folder, ...snapshot } = note
+  return snapshot
+}
+
+async function readOptionalNote(session: Session, path: Path, id: string): Promise<Note | null> {
+  try { return validateNote(await readBoundedJson(await session.storage.get(path)), id) } catch (error) {
+    if (isMissing(error)) return null
+    throw error
+  }
+}
+
+async function migrateLegacyNotes(session: Session): Promise<void> {
+  for (const space of ['private', 'public'] as const) {
+    const ids = await listIds(session, LEGACY_PATHS[space])
+    // Migrate snapshots independently: a private draft must never become public.
+    for (const id of ids) await migrateLegacyNote(session, space, id)
+  }
+}
+
+async function migrateLegacyNote(session: Session, space: StorageSpace, id: string): Promise<void> {
+  const sourcePath = legacyPath(space, id)
+  const destinationPath = notePath(space, id)
+  const locks: StorageLock[] = []
+  try {
+    // Reserving both paths prevents another device from overwriting either copy
+    // between the comparison, write, verification, and source removal.
+    const sourceLock = await session.storage.lock(sourcePath, MIGRATION_LOCK_SECONDS)
+    locks.push(sourceLock)
+    const destinationLock = await session.storage.lock(destinationPath, MIGRATION_LOCK_SECONDS)
+    locks.push(destinationLock)
+    const original = await readOptionalNote(session, sourcePath, id)
+    if (!original) return
+    const copy = space === 'public' ? publicSnapshot(original) : original
+    const existing = await readOptionalNote(session, destinationPath, id)
+    if (existing && !sameNote(existing, copy)) {
+      const error = new Error(`Could not move “${original.title || id}”: different notes already exist at ${sourcePath} and ${destinationPath}. Both copies are preserved. Export or rename one copy before retrying.`)
+      error.name = 'NotesMigrationConflictError'
+      throw error
+    }
+    if (!existing) {
+      await session.storage.refreshLock(sourceLock, MIGRATION_LOCK_SECONDS)
+      await session.storage.putTextLocked(destinationLock, JSON.stringify(copy))
+    }
+    const verified = await readOptionalNote(session, destinationPath, id)
+    if (!verified || !sameNote(verified, copy)) {
+      throw new Error('The moved note could not be verified. Its original has been preserved; reconnect to retry.')
+    }
+    // Expired locks fail closed. Keep both copies if the move took too long.
+    await session.storage.refreshLock(destinationLock, MIGRATION_LOCK_SECONDS)
+    await session.storage.refreshLock(sourceLock, MIGRATION_LOCK_SECONDS)
+    await session.storage.deleteLocked(sourceLock)
+  } catch (error) {
+    if (hasStatus(error, 405)) {
+      throw new Error('Your homeserver needs storage lock support to safely move existing notes. The original files are preserved.')
+    }
+    throw error
+  } finally {
+    for (const lock of locks.reverse()) {
+      try { await session.storage.unlock(lock) } catch { /* Locks expire even if the network disconnects. */ }
+      lock.free()
+    }
+  }
+}
+
+function sameNote(left: Note, right: Note): boolean {
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
 async function readFolder(session: Session, space: StorageSpace): Promise<Note[]> {
-  const ids = await listIds(session, space)
+  const ids = await listIds(session, APP_PATHS[space])
   const results: Note[] = new Array(ids.length)
   let index = 0
   await Promise.all(Array.from({ length: Math.min(DOWNLOAD_CONCURRENCY, ids.length) }, async () => {
@@ -106,14 +190,14 @@ async function readFolder(session: Session, space: StorageSpace): Promise<Note[]
       const position = index++
       const id = ids[position]
       const response = await session.storage.get(notePath(space, id))
-      results[position] = validateNote(await readBoundedJson(response), id)
+      const note = validateNote(await readBoundedJson(response), id)
+      results[position] = space === 'public' ? publicSnapshot(note) : note
     }
   }))
   return results
 }
 
-async function listIds(session: Session, space: StorageSpace): Promise<string[]> {
-  const folder = APP_PATHS[space]
+async function listIds(session: Session, folder: Path): Promise<string[]> {
   const owner = session.info.publicKey.z32()
   const ids = new Set<string>()
   const seenCursors = new Set<string>()
@@ -140,7 +224,7 @@ async function listIds(session: Session, space: StorageSpace): Promise<string[]>
         if (!filename.endsWith('.json') || filename.includes('/')) continue
         const id = filename.slice(0, -5)
         requireId(id)
-        if (resource.path !== notePath(space, id)) throw new Error('Invalid note path.')
+        if (resource.path !== `${folder}${id}.json`) throw new Error('Invalid note path.')
         ids.add(id)
       } finally {
         resource.free()
@@ -156,7 +240,10 @@ async function listIds(session: Session, space: StorageSpace): Promise<string[]>
 }
 
 async function readBoundedJson(response: Response): Promise<unknown> {
-  if (!response.ok) throw new Error(`The note could not be loaded (HTTP ${response.status}).`)
+  if (!response.ok) {
+    const error = new Error(`The note could not be loaded (HTTP ${response.status}).`)
+    throw Object.assign(error, { data: { statusCode: response.status } })
+  }
   const contentLength = response.headers.get('content-length')
   if (contentLength && Number(contentLength) > MAX_NOTE_BYTES) {
     await response.body?.cancel()
@@ -204,6 +291,11 @@ function validateNote(value: unknown, expectedId: string): Note {
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   }
+  if (record.folder !== undefined) {
+    if (typeof record.folder !== 'string') throw new Error('Invalid note folder.')
+    const folder = normalizeFolder(record.folder)
+    if (folder) note.folder = folder
+  }
   if (new TextEncoder().encode(JSON.stringify(note)).byteLength > MAX_NOTE_BYTES) {
     throw new Error('This note is too large to save.')
   }
@@ -224,8 +316,11 @@ async function deleteIfPresent(session: Session, path: Path): Promise<void> {
 }
 
 function isMissing(error: unknown): boolean {
+  return hasStatus(error, 404) || hasStatus(error, 410)
+}
+
+function hasStatus(error: unknown, status: number): boolean {
   if (typeof error !== 'object' || error === null || !('data' in error)) return false
   const data = error.data
-  return typeof data === 'object' && data !== null && 'statusCode' in data &&
-    (data.statusCode === 404 || data.statusCode === 410)
+  return typeof data === 'object' && data !== null && 'statusCode' in data && data.statusCode === status
 }

@@ -1,6 +1,6 @@
 import { AuthFlowKind, Pubky } from '@synonymdev/pubky'
 import type { GrantAuthFlow, Session } from '@synonymdev/pubky'
-import { APP_CAPABILITIES, APP_CLIENT_ID, APP_PATHS, HTTP_RELAY, IS_TESTNET, TESTNET_HOST } from '../config'
+import { APP_CAPABILITIES, APP_CLIENT_ID, APP_PATHS, LEGACY_PATHS, HTTP_RELAY, IS_TESTNET, TESTNET_HOST } from '../config'
 
 const SESSION_KEY = `${APP_CLIENT_ID}:${IS_TESTNET ? 'testnet' : 'mainnet'}:session`
 let instance: Pubky | undefined
@@ -92,6 +92,10 @@ export async function restoreSession(): Promise<Session | null> {
     sessionRecords.set(session, savedId)
     return session
   } catch (error) {
+    if (error instanceof Error && error.name === 'NotesPermissionError') {
+      await forgetSession(savedId)
+      throw error
+    }
     if (isInvalidSession(error)) {
       await forgetSession(savedId)
       return null
@@ -131,7 +135,7 @@ async function forgetSession(savedId: string | null): Promise<void> {
 
 function requireAppCapabilities(session: Session): void {
   const capabilities = session.info.capabilities
-  const allowed = Object.values(APP_PATHS).every((path) =>
+  const allowed = [...Object.values(APP_PATHS), ...Object.values(LEGACY_PATHS)].every((path) =>
     ['r', 'w'].every((action) => capabilities.some((capability) => {
       const separator = capability.lastIndexOf(':')
       const scope = capability.slice(0, separator)
@@ -140,7 +144,7 @@ function requireAppCapabilities(session: Session): void {
     })),
   )
   if (!allowed) {
-    const error = new Error('Authorize read and write access to both Notes folders to continue.')
+    const error = new Error('Sign in again to authorize the new Notes folders and safely move your existing notes.')
     error.name = 'NotesPermissionError'
     throw error
   }
@@ -148,7 +152,7 @@ function requireAppCapabilities(session: Session): void {
 
 function isInvalidSession(error: unknown): boolean {
   return error instanceof Error &&
-    ['AuthenticationError', 'InvalidInput', 'ClientStateError', 'NotesPermissionError'].includes(error.name)
+    ['AuthenticationError', 'InvalidInput', 'ClientStateError'].includes(error.name)
 }
 
 function canceledError(): Error {

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Session } from '@synonymdev/pubky'
-import { APP_PATHS } from '../config'
+import type { Session, StorageLock } from '@synonymdev/pubky'
+import { APP_PATHS, LEGACY_PATHS } from '../config'
 
 const mocks = vi.hoisted(() => ({ publicGet: vi.fn() }))
 vi.mock('./pubky', () => ({ getPubky: () => ({ publicStorage: { get: mocks.publicGet } }) }))
@@ -33,7 +33,18 @@ const missing = { data: { statusCode: 404 } }
 
 function makeSession(initial: Array<[string, Note]> = []) {
   const files = new Map<string, Note>(initial)
+  const locks = new Map<string, StorageLock>()
   const storage = {
+    lock: vi.fn(async (path: string) => {
+      if (locks.has(path)) throw { data: { statusCode: 423 } }
+      const lock = { path, free: vi.fn(), timeoutSeconds: 60 } as unknown as StorageLock
+      locks.set(path, lock)
+      return lock
+    }),
+    unlock: vi.fn(async (lock: StorageLock) => { locks.delete(lock.path) }),
+    refreshLock: vi.fn(async (_lock: StorageLock) => undefined),
+    putTextLocked: vi.fn(async (lock: StorageLock, body: string) => { files.set(lock.path, JSON.parse(body)) }),
+    deleteLocked: vi.fn(async (lock: StorageLock) => { if (!files.delete(lock.path)) throw missing }),
     putJson: vi.fn(async (path: string, note: Note) => { files.set(path, note) }),
     exists: vi.fn(async (path: string) => files.has(path)),
     delete: vi.fn(async (path: string) => { if (!files.delete(path)) throw missing }),
@@ -144,7 +155,8 @@ describe('private notes and explicit public snapshots', () => {
     const { session, storage, files } = makeSession([[notePath('private', 'note-1'), fixture()]])
     await deleteNote(session, 'note-1')
     expect(storage.delete.mock.calls.map(([path]) => path)).toEqual([
-      notePath('public', 'note-1'), notePath('private', 'note-1'),
+      notePath('public', 'note-1'), `${LEGACY_PATHS.public}note-1.json`,
+      `${LEGACY_PATHS.private}note-1.json`, notePath('private', 'note-1'),
     ])
     expect(files.size).toBe(0)
   })
@@ -222,5 +234,181 @@ describe('loading and validating notes', () => {
     mocks.publicGet.mockResolvedValue(new Response(JSON.stringify(fixture())))
     await expect(loadPublicNote('owner', 'note-1')).resolves.toEqual(fixture())
     expect(mocks.publicGet).toHaveBeenCalledExactlyOnceWith(`pubkyowner${notePath('public', 'note-1')}`)
+  })
+})
+
+
+describe('flat storage and private folder metadata', () => {
+  it('uses exact flat paths regardless of a note’s folder', async () => {
+    expect(APP_PATHS).toEqual({ private: '/priv/notes/', public: '/pub/notes/' })
+    const { session, files } = makeSession()
+    await saveNote(session, { ...fixture(), folder: ' Work / Ideas ' })
+    expect([...files.keys()]).toEqual(['/priv/notes/note-1.json'])
+    expect(files.get('/priv/notes/note-1.json')?.folder).toBe('Work/Ideas')
+  })
+
+  it('never exposes private folder names in published snapshots', async () => {
+    const { session, files } = makeSession()
+    const snapshot = await publishNote(session, { ...fixture(), folder: 'Secret/Project' })
+    expect(files.get(notePath('private', 'note-1'))?.folder).toBe('Secret/Project')
+    expect(snapshot).toEqual(fixture())
+    expect(files.get(notePath('public', 'note-1'))).toEqual(fixture())
+    await saveNote(session, { ...fixture(), folder: 'Other/Folder' })
+    expect(files.get(notePath('public', 'note-1'))).toEqual(fixture())
+  })
+
+  it('accepts old files without folders and rejects malformed metadata', async () => {
+    const { session, storage } = makeSession()
+    await saveNote(session, fixture())
+    await saveNote(session, { ...fixture(), folder: '' })
+    expect(storage.putJson.mock.calls[1][1]).not.toHaveProperty('folder')
+    for (const folder of [null, 42, ['Work'], '../other', 'Work/../../other']) {
+      await expect(saveNote(session, { ...fixture(), folder } as Note)).rejects.toThrow()
+    }
+    expect(storage.putJson).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('safe legacy namespace migration', () => {
+  const legacy = (space: 'private' | 'public', id = 'note-1') => `${LEGACY_PATHS[space]}${id}.json`
+
+  it('moves draft and published snapshot independently, verifying each before removal', async () => {
+    const draft = { ...fixture('note-1', 'Unpublished draft'), folder: 'Private/Folder' }
+    const published = fixture('note-1', 'Old public snapshot')
+    const { session, storage, files } = makeSession([[legacy('private'), draft], [legacy('public'), published]])
+    await expect(listNotes(session)).resolves.toEqual([{ note: draft, published }])
+    expect([...files.keys()].sort()).toEqual([notePath('private', 'note-1'), notePath('public', 'note-1')].sort())
+    expect(files.get(notePath('public', 'note-1'))?.content).toBe('Old public snapshot')
+    expect(storage.putTextLocked).toHaveBeenCalledTimes(2)
+    expect(storage.deleteLocked).toHaveBeenCalledTimes(2)
+    for (const [index, [lock]] of storage.deleteLocked.mock.calls.entries()) {
+      const destination = lock.path.replace(LEGACY_PATHS.private, APP_PATHS.private).replace(LEGACY_PATHS.public, APP_PATHS.public)
+      const reads = storage.get.mock.calls.flatMap(([path], position) => path === destination ? [storage.get.mock.invocationCallOrder[position]] : [])
+      expect(reads.some(order => order > storage.putTextLocked.mock.invocationCallOrder[index] && order < storage.deleteLocked.mock.invocationCallOrder[index])).toBe(true)
+    }
+    expect(storage.unlock).toHaveBeenCalledTimes(4)
+  })
+
+  it('excludes folder metadata when migrating a public snapshot', async () => {
+    const note = { ...fixture(), folder: 'Old private organization' }
+    const { session, files } = makeSession([[legacy('public'), note]])
+    await listNotes(session)
+    expect(files.get(notePath('public', note.id))).toEqual(fixture())
+    expect(files.has(notePath('private', note.id))).toBe(false)
+  })
+
+  it('keeps legacy data after a failed destination write and retries safely', async () => {
+    const note = fixture()
+    const { session, storage, files } = makeSession([[legacy('private'), note]])
+    storage.putTextLocked.mockRejectedValueOnce(new Error('Offline'))
+    await expect(listNotes(session)).rejects.toThrow('Offline')
+    expect(files.get(legacy('private'))).toEqual(note)
+    expect(storage.deleteLocked).not.toHaveBeenCalled()
+    await expect(listNotes(session)).resolves.toEqual([{ note, published: null }])
+    expect(files.has(legacy('private'))).toBe(false)
+  })
+
+  it('keeps the source when read-back verification differs', async () => {
+    const { session, storage, files } = makeSession([[legacy('private'), fixture()]])
+    storage.putTextLocked.mockImplementationOnce(async (lock) => { files.set(lock.path, fixture('note-1', 'Wrong content')) })
+    await expect(listNotes(session)).rejects.toThrow('could not be verified')
+    expect(files.get(legacy('private'))).toEqual(fixture())
+    expect(storage.deleteLocked).not.toHaveBeenCalled()
+  })
+
+  it('resumes after source deletion failed without overwriting the verified destination', async () => {
+    const note = fixture()
+    const { session, storage, files } = makeSession([[legacy('private'), note]])
+    storage.deleteLocked.mockRejectedValueOnce(new Error('Delete unavailable'))
+    await expect(listNotes(session)).rejects.toThrow('Delete unavailable')
+    expect(files.get(legacy('private'))).toEqual(note)
+    expect(files.get(notePath('private', note.id))).toEqual(note)
+    await expect(listNotes(session)).resolves.toEqual([{ note, published: null }])
+    expect(storage.putTextLocked).toHaveBeenCalledTimes(1)
+    expect(files.has(legacy('private'))).toBe(false)
+  })
+
+  it('preserves both copies and reports a descriptive error for destination conflicts', async () => {
+    const oldNote = fixture('note-1', 'Legacy draft')
+    const newNote = fixture('note-1', 'New draft')
+    const { session, storage, files } = makeSession([[legacy('private'), oldNote], [notePath('private', 'note-1'), newNote]])
+    await expect(listNotes(session)).rejects.toMatchObject({ name: 'NotesMigrationConflictError', message: expect.stringContaining('Both copies are preserved') })
+    expect(files.get(legacy('private'))).toEqual(oldNote)
+    expect(files.get(notePath('private', 'note-1'))).toEqual(newNote)
+    expect(storage.putTextLocked).not.toHaveBeenCalled()
+    expect(storage.deleteLocked).not.toHaveBeenCalled()
+  })
+
+  it('fails safely when the server cannot reserve both paths or a lock expires', async () => {
+    const { session, storage, files } = makeSession([[legacy('private'), fixture()]])
+    storage.lock.mockRejectedValueOnce({ data: { statusCode: 405 } })
+    await expect(listNotes(session)).rejects.toThrow('needs storage lock support')
+    expect(files.get(legacy('private'))).toEqual(fixture())
+    storage.refreshLock.mockRejectedValueOnce({ data: { statusCode: 412 } })
+    await expect(listNotes(session)).rejects.toEqual({ data: { statusCode: 412 } })
+    expect(storage.deleteLocked).not.toHaveBeenCalled()
+    expect(files.get(legacy('private'))).toEqual(fixture())
+  })
+
+  it('unpublishes both roots and preserves the legacy private draft over snapshots', async () => {
+    const draft = fixture('note-1', 'Private draft')
+    const snapshot = fixture('note-1', 'Public snapshot')
+    const { session, files } = makeSession([
+      [legacy('private'), draft], [legacy('public'), snapshot], [notePath('public', 'note-1'), snapshot],
+    ])
+    await unpublishNote(session, 'note-1')
+    expect(files.get(notePath('private', 'note-1'))).toEqual(draft)
+    expect(files.has(legacy('public'))).toBe(false)
+    expect(files.has(notePath('public', 'note-1'))).toBe(false)
+  })
+
+  it('reports legacy public cleanup failure without deleting either private copy', async () => {
+    const note = fixture()
+    const { session, storage, files } = makeSession([
+      [legacy('private'), note], [legacy('public'), note], [notePath('private', note.id), note], [notePath('public', note.id), note],
+    ])
+    storage.delete.mockImplementation(async (path) => {
+      if (path === legacy('public')) throw new Error('Legacy public delete failed')
+      files.delete(path)
+    })
+    await expect(deleteNote(session, note.id)).rejects.toThrow('Legacy public delete failed')
+    expect(files.has(legacy('private'))).toBe(true)
+    expect(files.has(notePath('private', note.id))).toBe(true)
+    await expect(unpublishNote(session, note.id)).rejects.toThrow('Legacy public delete failed')
+  })
+
+  it('removes every copy so a subsequent load cannot resurrect a deleted legacy note', async () => {
+    const note = fixture()
+    const { session, files } = makeSession([
+      [legacy('private'), note], [legacy('public'), note], [notePath('private', note.id), note], [notePath('public', note.id), note],
+    ])
+    await deleteNote(session, note.id)
+    expect(files.size).toBe(0)
+    await expect(listNotes(session)).resolves.toEqual([])
+  })
+
+  it('keeps the current private copy if legacy private cleanup fails', async () => {
+    const note = fixture()
+    const { session, storage, files } = makeSession([[legacy('private'), note], [notePath('private', note.id), note]])
+    storage.delete.mockImplementation(async (path) => {
+      if (path === legacy('private')) throw new Error('Legacy private delete failed')
+      files.delete(path)
+    })
+    await expect(deleteNote(session, note.id)).rejects.toThrow('Legacy private delete failed')
+    expect(files.get(notePath('private', note.id))).toEqual(note)
+  })
+
+  it.each([404, 410])('falls back to legacy public links only when new paths return %i', async (statusCode) => {
+    mocks.publicGet.mockReset().mockRejectedValueOnce({ data: { statusCode } }).mockResolvedValueOnce(new Response(JSON.stringify(fixture())))
+    await expect(loadPublicNote('owner', 'note-1')).resolves.toEqual(fixture())
+    expect(mocks.publicGet.mock.calls.map(([path]) => path)).toEqual([
+      `pubkyowner${notePath('public', 'note-1')}`, `pubkyowner${legacy('public')}`,
+    ])
+  })
+
+  it.each([403, 500])('does not mask a %i from the new public path with legacy data', async (statusCode) => {
+    mocks.publicGet.mockReset().mockRejectedValueOnce({ data: { statusCode } })
+    await expect(loadPublicNote('owner', 'note-1')).rejects.toEqual({ data: { statusCode } })
+    expect(mocks.publicGet).toHaveBeenCalledTimes(1)
   })
 })

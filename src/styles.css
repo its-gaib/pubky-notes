@@ -66,6 +66,19 @@ button svg { pointer-events: none; }
 .nav-item.active { background: #eae9f5; color: #6661af; font-weight: 550; }
 .count, .nav-item .count { margin-left: auto; color: #a2a1ac; font-size: 11px; font-variant-numeric: tabular-nums; }
 .nav-item.active .count { color: #8c87b8; }
+.folder-section { display: flex; flex: 1; flex-direction: column; min-height: 92px; margin-top: 18px; }
+.folder-tree { min-height: 0; overflow-x: hidden; overflow-y: auto; padding: 3px; margin: 0 -3px; }
+.folder-tree button:focus-visible { outline-offset: -2px; }
+.folder-row { display: flex; align-items: center; gap: 1px; min-width: 0; min-height: 33px; border-radius: 5px; }
+.folder-toggle { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 20px; width: 20px; height: 28px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: #737583; }
+.folder-toggle svg { width: 13px; height: 13px; }
+.folder-toggle:hover { background: #eaeae8; color: #444753; }
+.folder-select { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; min-height: 32px; padding: 6px 4px; border: 0; border-radius: 5px; background: transparent; color: #666c79; text-align: left; font-size: 13px; line-height: 1.4; }
+.folder-select > svg { width: 14px; height: 14px; stroke-width: 1.7; }
+.folder-select > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-select:hover { background: #eaeae8; color: #444753; }
+.folder-select.active { background: #eae9f5; color: #6661af; font-weight: 550; }
+.folder-root.nav-item { min-height: 33px; margin-bottom: 2px; padding-top: 6px; padding-bottom: 6px; }
 .sidebar-bottom { display: flex; flex-direction: column; gap: 8px; margin-top: auto; padding-top: 16px; }
 .avatar { display: grid; place-items: center; width: 31px; height: 31px; flex-shrink: 0; border: 1px solid #dbdae6; border-radius: 50%; background: #e9e7f1; color: #82779d; font-size: 12px; font-weight: 600; }
 .account-row { display: flex; align-items: center; gap: 9px; min-width: 0; padding: 2px 6px; }
@@ -89,6 +102,9 @@ button svg { pointer-events: none; }
 .search-box input::placeholder { color: #a2a3aa; }
 .search-box:focus-within { border-color: #b6b2e1; box-shadow: 0 0 0 2px #eeedf8; }
 .search-box input:focus-visible { outline: none; }
+.search-box input::-webkit-search-cancel-button { appearance: none; }
+.search-clear.icon-button { width: 24px; height: 26px; margin-right: -6px; }
+.search-clear svg { width: 13px; height: 13px; }
 .note-list { flex: 1; min-height: 0; padding: 0 7px 10px; overflow-y: auto; }
 .note-card { display: block; width: 100%; margin: 2px 0 4px; padding: 12px 10px; border: 1px solid transparent; border-radius: 7px; background: transparent; text-align: left; transition: background .15s, border-color .15s; }
 .note-card:hover { background: #f2f2ef; }
@@ -101,6 +117,9 @@ button svg { pointer-events: none; }
 .note-card-meta > span:last-child { margin-left: auto; }
 .note-card-meta svg { width: 10px; height: 10px; }
 .note-card-meta .visibility-badge { padding: 0; border: 0; background: transparent; font-size: 11px; }
+.note-card-meta .folder-path { display: inline-flex; align-items: center; gap: 3px; min-width: 0; overflow: hidden; color: #747080; text-overflow: ellipsis; white-space: nowrap; }
+.note-card-meta .folder-path > span { overflow: hidden; text-overflow: ellipsis; }
+.note-card-meta > :not(.folder-path) { flex-shrink: 0; }
 .new-note-button { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 35px; margin: 8px 12px 18px; padding: 8px 11px; border: 1px solid #dedce9; border-radius: 6px; background: #f5f4fa; color: #79729e; font-size: 13px; font-weight: 500; }
 .new-note-button:hover { background: #eae8f5; border-color: #ccc7e4; }
 .new-note-button svg { width: 14px; height: 14px; }
@@ -173,6 +192,11 @@ button svg { pointer-events: none; }
 .editor-bottom { display: flex; align-items: center; gap: 10px; min-height: 32px; padding: 5px 20px; border-top: 1px solid var(--line); color: #8d8895; font-size: 12px; }
 .editor-bottom > :last-child { margin-left: auto; }
 .editor-bottom svg { width: 11px; height: 11px; margin-right: 4px; }
+.folder-location { display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 45%; padding: 3px 4px; border: 0; border-radius: 4px; background: transparent; color: #726b80; font-size: inherit; line-height: 1.4; }
+.folder-location:hover { background: #f2f1f7; color: #625b85; }
+.folder-location svg { margin-right: 0; }
+.folder-location > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.editor-bottom > :not(.folder-location) { flex-shrink: 0; }
 
 .empty-state { display: flex; align-items: center; justify-content: center; flex: 1; flex-direction: column; gap: 13px; min-height: 200px; padding: 35px 24px; color: #9a95a8; text-align: center; }
 .empty-state > svg { width: 32px; height: 32px; margin-bottom: 4px; color: #b7b0cc; stroke-width: 1.25; }
@@ -220,6 +244,7 @@ button svg { pointer-events: none; }
 
 /* Notebook controls and shared reader details. */
 .sidebar { overflow-y: auto; }
+.sidebar > :not(.folder-section) { flex-shrink: 0; }
 .brand { margin-bottom: 20px; text-decoration: none; }
 .brand:hover { color: #353644; }
 .sidebar > .new-note-button { justify-content: flex-start; flex-shrink: 0; margin: 0 0 18px; padding-right: 10px; padding-left: 11px; }
@@ -230,8 +255,9 @@ button svg { pointer-events: none; }
 .account-row { margin-top: 6px; padding-top: 14px; border-top: 1px solid #e7e7e1; }
 .account-row strong { font-size: 11px; }
 .network-label { align-self: center; margin-top: 3px; font-size: 11px; letter-spacing: .5px; }
-.notes-header h2 { display: flex; align-items: center; gap: 8px; }
-.notes-header h2 > span { display: grid; place-items: center; min-width: 19px; height: 18px; padding: 0 5px; border: 1px solid #e9e8e5; border-radius: 5px; color: #8d8b96; font-size: 11px; font-weight: 400; letter-spacing: 0; }
+.notes-header h2 { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 14px; }
+.notes-heading-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.notes-header h2 > .count { display: grid; place-items: center; flex-shrink: 0; min-width: 19px; height: 18px; padding: 0 5px; border: 1px solid #e9e8e5; border-radius: 5px; color: #8d8b96; font-size: 11px; font-weight: 400; letter-spacing: 0; }
 .note-card-title strong { min-width: 0; overflow: hidden; font-weight: 550; text-overflow: ellipsis; }
 .note-card-title > svg:last-child { width: 11px; height: 11px; margin-left: auto; color: #b2acbd; }
 .note-title-input { margin-bottom: 20px; }
@@ -289,8 +315,8 @@ p.auth-instructions { padding-left: 0; font-size: 13px; }
   .mobile-menu { display: inline-flex; }
   .notes-header { gap: 5px; padding: 0 10px; }
   .notes-header .mobile-menu { margin-left: -3px; }
-  .notes-header h2 { font-size: 15px; }
-  .notes-header h2 > span { padding: 0 4px; }
+  .notes-header h2 { font-size: 14px; }
+  .notes-header h2 > .count { padding: 0 4px; }
   .editor-content { padding-top: 22px; padding-right: 24px; padding-left: 24px; }
 }
 @media (max-width: 700px) {
@@ -319,6 +345,7 @@ p.auth-instructions { padding-left: 0; font-size: 13px; }
   .markdown-preview { font-size: 16px; }
   .editor-bottom { gap: 8px; min-height: 32px; padding: 5px 14px max(5px, env(safe-area-inset-bottom)); font-size: 11px; }
   .save-status { font-size: 11px; }
+  .folder-location { max-width: 38%; }
   .modal-backdrop { padding: 16px; }
   .modal { max-height: calc(100dvh - 32px); padding: 24px; border-radius: 11px; }
   .toast { right: 18px; bottom: max(18px, env(safe-area-inset-bottom)); left: 18px; max-width: none; font-size: 12px; }
