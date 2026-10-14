@@ -170,7 +170,7 @@ function Notebook() {
   async function addNote(imported?: { title: string; content: string }) {
     try {
       await flush()
-      const draft = { ...createNote(), ...(imported ?? {}) }
+      const draft = { ...createNote(), content: SAMPLE_MARKDOWN, ...(imported ?? {}) }
       setRecords(current => [{ note: draft, published: null }, ...current]); setActiveId(draft.id); setMode('write'); setQuery(''); setFilter('all'); setMobileList(false)
       setStatus(session ? 'Unsaved changes' : 'Not saved')
     } catch (error) { notice(errorMessage(error), true) }

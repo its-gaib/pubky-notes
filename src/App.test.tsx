@@ -192,7 +192,7 @@ describe('sign-in candidate lifecycle', () => {
 })
 
 describe('private saving and explicit publication', () => {
-  it('shows a copyable sample for an empty notebook without storing it, and creates blank notes', async () => {
+  it('keeps the empty-notebook sample unsaved and uses it as the template for new notes', async () => {
     const session = candidateSession()
     mocks.restoreSession.mockResolvedValue(session)
     mocks.listNotes.mockResolvedValue([])
@@ -211,11 +211,11 @@ describe('private saving and explicit publication', () => {
 
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Create a new note' })) })
     expect(screen.queryByRole('textbox', { name: 'Sample Markdown' })).toBeNull()
-    expect((screen.getByRole('textbox', { name: 'Markdown content' }) as HTMLTextAreaElement).value).toBe('')
+    expect((screen.getByRole('textbox', { name: 'Markdown content' }) as HTMLTextAreaElement).value).toBe(sample.value)
     await act(async () => { await vi.advanceTimersByTimeAsync(950) })
     expect(mocks.saveNote).toHaveBeenCalledExactlyOnceWith(session, expect.objectContaining({
       title: 'Untitled note',
-      content: '',
+      content: sample.value,
     }))
     expect(mocks.publishNote).not.toHaveBeenCalled()
   })

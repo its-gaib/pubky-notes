@@ -32,7 +32,7 @@ Authentication uses scoped Pubky Ring grant sessions. SDK-managed IndexedDB stor
 
 ## Features and boundaries
 
-Search, Markdown editing/preview with GFM tables and task lists, formatting tools, `.md` import/export, explicit publish/update/unpublish, and responsive navigation. Use Ctrl/⌘+S to save immediately.
+Search, Markdown editing/preview with GFM tables and task lists, formatting tools, `.md` import/export, explicit publish/update/unpublish, and responsive navigation. New notes start with the concise Markdown sample as a template; imported files retain their own content. Use Ctrl/⌘+S to save immediately.
 
 Notes are limited to 250,000 content characters / 512 KiB serialized, titles to 200 characters, and each private/public folder to 2,000 entries. Imports accept files up to 512 KiB and must also satisfy the note limits when saving. Lists paginate; note downloads are bounded and use limited concurrency.
 
