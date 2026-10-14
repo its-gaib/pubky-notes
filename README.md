@@ -30,7 +30,7 @@ For a separately running local testnet, copy `.env.example` to `.env.local`, set
 
 Existing accounts must reconnect once to authorize the new paths. On connection, legacy private drafts and public snapshots migrate independently, so unpublished edits stay private. Migration locks both paths, verifies the destination before removing the source, and resumes safely after interruptions. Conflicting versions are preserved and reported rather than overwritten. Homeservers without storage-lock support retain the original files and report that migration requires an upgrade. Public links try the new path first and fall back to the legacy path only when the new file is missing.
 
-Authentication uses scoped Pubky Ring grant sessions. SDK-managed IndexedDB stores session credentials; localStorage contains only the opaque session record ID. Note bodies are not cached in localStorage or IndexedDB. Markdown raw HTML is disabled; remote images render as text to avoid tracking readers.
+Authentication uses scoped Pubky Ring grant sessions. SDK-managed IndexedDB stores session credentials; localStorage contains the opaque session record ID and sidebar layout preferences. Note bodies are not cached in localStorage or IndexedDB. Markdown raw HTML is disabled; remote images render as text to avoid tracking readers.
 
 ## Features and boundaries
 
