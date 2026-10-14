@@ -156,7 +156,7 @@ describe('sign-in candidate lifecycle', () => {
     expect(cancel).toHaveBeenCalledOnce()
     expect(mocks.persistSession).not.toHaveBeenCalled()
     expect(screen.queryByRole('button', { name: 'Disconnect from Pubky' })).toBeNull()
-    expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe('Welcome to your notebook')
+    expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe('')
   })
 
   it('discards the candidate and preserves the scratchpad if listing its notes fails', async () => {
@@ -170,7 +170,7 @@ describe('sign-in candidate lifecycle', () => {
     expect(mocks.discardSession).toHaveBeenCalledExactlyOnceWith(session, undefined)
     expect(mocks.persistSession).not.toHaveBeenCalled()
     expect(screen.queryByRole('button', { name: 'Disconnect from Pubky' })).toBeNull()
-    expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe('Welcome to your notebook')
+    expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe('')
   })
 
   it('cleans up the specific stored record if canceled while persistence is pending', async () => {
@@ -216,7 +216,7 @@ describe('private saving and explicit publication', () => {
     expect(mocks.publishNote).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByRole('button', { name: 'Share' }))
-    expect(screen.getByRole('dialog', { name: 'A note worth sharing' })).toBeTruthy()
+    expect(screen.getByRole('dialog', { name: 'Share note' })).toBeTruthy()
     expect(mocks.publishNote).not.toHaveBeenCalled()
 
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Publish public copy' })) })

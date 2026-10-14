@@ -13,7 +13,7 @@ npm test
 npm run build
 ```
 
-The checked-in `.env` selects **Pubky mainnet**. Sign in with an existing identity in **Pubky Ring** using the QR code, phone link, or copyable authorization link. The app never requests a secret key or creates a mainnet identity. Until connected, the example notebook is an in-memory scratchpad; it is not uploaded or retained after reload. Connecting replaces the scratchpad with the signed-in notebook. Export drafts first if needed.
+The checked-in `.env` selects **Pubky mainnet**. Sign in with an existing identity in **Pubky Ring** using the QR code, phone link, or copyable authorization link. The app never requests a secret key or creates a mainnet identity. Until connected, the blank notebook is an in-memory scratchpad; it is not uploaded or retained after reload. Connecting replaces the scratchpad with the signed-in notebook. Export drafts first if needed.
 
 For a separately running local testnet, copy `.env.example` to `.env.local`, set `VITE_PUBKY_TESTNET=true`, and configure `VITE_PUBKY_TESTNET_HOST` if necessary. The default testnet relay uses port 15412. The production Vercel headers intentionally allow HTTPS connections; use Vite locally for the HTTP testnet. Production uses the SDK’s default auth relay unless `VITE_PUBKY_HTTP_RELAY` is configured.
 
