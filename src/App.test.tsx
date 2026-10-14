@@ -156,7 +156,7 @@ describe('sign-in candidate lifecycle', () => {
     expect(cancel).toHaveBeenCalledOnce()
     expect(mocks.persistSession).not.toHaveBeenCalled()
     expect(screen.queryByRole('button', { name: 'Disconnect from Pubky' })).toBeNull()
-    expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe('')
+    expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe('Markdown basics')
   })
 
   it('discards the candidate and preserves the scratchpad if listing its notes fails', async () => {
@@ -170,7 +170,7 @@ describe('sign-in candidate lifecycle', () => {
     expect(mocks.discardSession).toHaveBeenCalledExactlyOnceWith(session, undefined)
     expect(mocks.persistSession).not.toHaveBeenCalled()
     expect(screen.queryByRole('button', { name: 'Disconnect from Pubky' })).toBeNull()
-    expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe('')
+    expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe('Markdown basics')
   })
 
   it('cleans up the specific stored record if canceled while persistence is pending', async () => {
@@ -192,12 +192,41 @@ describe('sign-in candidate lifecycle', () => {
 })
 
 describe('private saving and explicit publication', () => {
+  it('shows a copyable sample for an empty notebook without storing it, and creates blank notes', async () => {
+    const session = candidateSession()
+    mocks.restoreSession.mockResolvedValue(session)
+    mocks.listNotes.mockResolvedValue([])
+    render(<App />)
+
+    const sample = await screen.findByRole('textbox', { name: 'Sample Markdown' }) as HTMLTextAreaElement
+    expect(sample.readOnly).toBe(true)
+    expect(sample.value).toContain('**Bold**')
+    expect(screen.getByRole('button', { name: 'Copy Markdown' })).toBeTruthy()
+
+    vi.useFakeTimers()
+    await act(async () => { await vi.advanceTimersByTimeAsync(950) })
+    await act(async () => { fireEvent.keyDown(window, { key: 's', ctrlKey: true }) })
+    expect(mocks.saveNote).not.toHaveBeenCalled()
+    expect(mocks.publishNote).not.toHaveBeenCalled()
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Create a new note' })) })
+    expect(screen.queryByRole('textbox', { name: 'Sample Markdown' })).toBeNull()
+    expect((screen.getByRole('textbox', { name: 'Markdown content' }) as HTMLTextAreaElement).value).toBe('')
+    await act(async () => { await vi.advanceTimersByTimeAsync(950) })
+    expect(mocks.saveNote).toHaveBeenCalledExactlyOnceWith(session, expect.objectContaining({
+      title: 'Untitled note',
+      content: '',
+    }))
+    expect(mocks.publishNote).not.toHaveBeenCalled()
+  })
+
   it('autosaves edits privately and publishes only after confirmation in Share', async () => {
     const session = candidateSession()
     mocks.restoreSession.mockResolvedValue(session)
     render(<App />)
     await screen.findByRole('button', { name: 'Disconnect from Pubky' })
     await waitFor(() => expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe(savedNote.title))
+    expect(screen.queryByRole('textbox', { name: 'Sample Markdown' })).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: 'Write' }))
     vi.useFakeTimers()
