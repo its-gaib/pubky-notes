@@ -23,6 +23,7 @@ For a separately running local testnet, copy `.env.example` to `.env.local`, set
 - Explicit public snapshots: `/pub/notes/<id>.json`.
 - Records contain `id`, `title`, `content`, `createdAt`, and `updatedAt`. Nested folders exist only as optional private `folder` metadata, such as `Work/Ideas`; all files remain directly under their storage root. Public snapshots omit folder metadata. Moving a note between folders does not change its ID or public link.
 - Pubky Ring shows the authentication client ID `pubky-notes`. The app requests read/write access to exactly two roots: `/priv/notes/` and `/pub/notes/`.
+- The account row reads your public name and avatar from `/pub/pubky.app/profile.json`, following [Pubky App Specs](https://github.com/pubky/pubky-app-specs/blob/main/SPEC.md#pubkyappuser). Click the abbreviated identifier to copy your complete `pubky…` identifier. Profile reads require no additional permissions; a missing profile or image falls back without blocking your notebook.
 - New notes and edits autosave to `/priv`. Publishing first saves the private draft, then writes a public snapshot. Later edits remain private until **Update public copy** is clicked.
 - A public link opens a read-only Markdown page without authentication. Public notes are publicly readable and discoverable, not secret links.
 - Unpublish removes the public snapshot. Deleting a note removes its public snapshot before its private draft; failures are reported. Unpublishing cannot retract copies already downloaded.
