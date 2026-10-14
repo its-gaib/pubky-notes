@@ -10,7 +10,11 @@
     "dev": "vite --host 0.0.0.0",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 0.0.0.0",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:crdt": "vitest run src/lib/crdt.test.ts src/lib/crdt.convergence.test.ts src/lib/local-notebook.test.ts src/lib/notebook-sync.test.ts src/lib/notebook-sync.integration.test.ts src/lib/notes.test.ts src/App.sync.test.tsx",
+    "test:crdt:mutations": "node scripts/check-crdt-mutations.mjs",
+    "test:interop": "npm --prefix ../pubky-notes-cli run build && node scripts/crdt-interop.mjs",
+    "test:homeserver": "npm --prefix ../pubky-notes-cli run build && node scripts/crdt-homeserver.mjs --local-testnet"
   },
   "dependencies": {
     "@synonymdev/pubky": "0.16.1",

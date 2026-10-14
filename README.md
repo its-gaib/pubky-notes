@@ -57,7 +57,37 @@ Public links use `/?owner=<z32-public-key>&note=<note-id>`.
 
 ## Verification
 
-`npm test` exercises CRDT convergence and validation, scoped durable caches and guest adoption, in-flight saves, folder operations, recovery and Trash, public snapshot privacy, scoped authorization, pagination, and bounded downloads. `npm run build` checks TypeScript and creates the production bundle. A live Ring approval and your homeserver are needed to verify a mainnet account end to end.
+```sh
+npm test                    # Entire offline test suite
+npm run test:crdt            # CRDT, durable storage, sync, and relevant UI tests
+npm run test:crdt:mutations  # Prove the new tests detect six deliberate defects
+npm run build               # TypeScript and production bundle
+```
+
+Convergence tests run four independent replicas through five editing rounds under four seeded delivery schedules. Every packet crosses a JSON serialization boundary; delivery includes duplicates, stale states, and different ordering. An independent ledger checks for lost insertions and resurrected deletions after each delivery, and the final text is checked against an expected document built from user actions. Additional cases cover overlapping edits, Unicode and Markdown, folder/title changes, deletion, and explicit restoration.
+
+Storage integration tests run the actual cache, synchronization, note serialization, and SDK address parsing together. Only the transport is simulated, with serialized files and session-owned exclusive locks. They cover independent device caches, lock contention, a committed write whose response is lost, restarts, late acknowledgements, history recovery, and public snapshot privacy. The mutation command copies the project into a temporary directory and verifies that dropping remote updates, replacing whole texts, discarding pending edits, bypassing recovery, and leaking private or unreviewed content cause test failures. It never changes working-tree source files.
+
+Cross-project checks require the current CLI checkout at `../pubky-notes-cli`, with its dependencies installed. These commands build that checkout and exercise its actual implementation in a separate process, rather than relying only on a frozen compatibility fixture:
+
+```sh
+npm --prefix ../pubky-notes-cli ci
+npm run test:interop         # Current web/CLI history exchange; no network
+npm run test:homeserver      # Explicit local-testnet integration; real SDK/storage
+```
+
+The homeserver test uses only `Pubky.testnet('127.0.0.1')`, creates a random disposable identity, and never loads Ring credentials or existing notes. It fails if the local testnet is unavailable. It verifies real locks, read-back, web/CLI merging, revision conflicts, publication privacy, and deletion/restoration, then removes its generated files and signs out its test sessions. Ordinary `npm test` does not contact a homeserver.
+
+If a local testnet is not already running, the image verified with SDK 0.16.1 can be started separately:
+
+```sh
+docker run --rm --name pubky-notes-testnet \
+  -p 127.0.0.1:6286-6288:6286-6288 \
+  -p 127.0.0.1:15411-15412:15411-15412 \
+  synonymsoft/homeserver-testnet@sha256:4e404fee8b11b87642eb61cd055620e07c76947ab5bf149e20feb84f44a6c0f8
+```
+
+The broader suite also covers account isolation and guest adoption, editor saves, folder operations, authorization, pagination, and bounded downloads. Mainnet Ring approval remains a separate manual check; automated tests do not use a user's account.
 
 The SDK version is pinned to 0.16.1. Some linked Pubky agent-skill references target earlier SDK versions; implementation follows installed types and the current template.
 
