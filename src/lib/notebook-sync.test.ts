@@ -88,6 +88,33 @@ describe('durable homeserver synchronization', () => {
     expect(result.pending).toEqual([])
   })
 
+  it('uploads later edits from a stale tab to the same recovery copy after reopening storage', async () => {
+    const original = note()
+    const replacement = editNote(note(), { content: 'Independent homeserver version' })
+    const remote = new Map<string, Note>([[replacement.id, replacement]])
+    mocks.list.mockImplementation(async () => [...remote.values()].map(row))
+    mocks.save.mockImplementation(async (_session, draft: Note) => {
+      const existing = remote.get(draft.id)
+      const saved = existing ? mergeNotes(existing, draft) : draft
+      remote.set(saved.id, saved)
+      return saved
+    })
+    await writeLocalNote(scope, row(original))
+    const recovered = await synchronizeNotebook(session, scope)
+    const recoveryId = recovered.records.find(record => record.note.id !== original.id)!.note.id
+    await closeLocalNotebook()
+
+    const later = editNote(original, { content: 'Latest edits from the stale tab' })
+    await writeLocalNote(scope, row(later))
+    const synchronized = await synchronizeNotebook(session, scope)
+
+    expect(synchronized.records).toHaveLength(2)
+    expect(synchronized.pending).toEqual([])
+    expect(remote.get(original.id)).toEqual(replacement)
+    expect(remote.get(recoveryId)?.content).toBe(later.content)
+    expect(synchronized.records.find(record => record.note.id === recoveryId)?.published).toBeNull()
+  })
+
   it('keeps folders pending when the homeserver does not retain the write', async () => {
     await writeLocalFolders(scope, ['Work'])
     await expect(uploadNotebook(session, scope)).rejects.toThrow('did not retain')

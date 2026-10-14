@@ -1,10 +1,11 @@
 import { editNote, ensureCrdt, initializeNote, mergeNotes, noteRevision } from './crdt'
+import type { CrdtNote } from './crdt'
 import { normalizeFolderPaths } from './folder-store'
 import type { NoteRecord } from './notes'
 
 const DATABASE_NAME = 'pubky-notes:local:v1'
 const MAX_NOTES = 2_000
-const STORES = ['notes', 'metadata', 'claims']
+const STORES = ['notes', 'metadata', 'claims', 'recoveries']
 
 interface StoredNote {
   scope: string
@@ -27,12 +28,24 @@ interface GuestClaim {
   targetId: string
 }
 
+export interface LocalNoteRecovery {
+  id: string
+  createdAt: string
+  lineage: string
+  targetId: string
+}
+
+interface StoredRecovery extends LocalNoteRecovery {
+  scope: string
+}
+
 export interface LocalNotebook {
   records: NoteRecord[]
   pending: string[]
   folders: string[]
   foldersPending: boolean
   activeId: string
+  recoveries?: LocalNoteRecovery[]
 }
 
 export interface AdoptedNotebook extends LocalNotebook {
@@ -47,13 +60,23 @@ export async function readLocalNotebook(scope: string): Promise<LocalNotebook> {
   return transact('readonly', async (transaction) => readNotebook(transaction, scope))
 }
 
+/** Resolve this exact local history without routing a remote acknowledgement. */
+export async function resolveLocalNoteDestination(scope: string, note: CrdtNote): Promise<{ scope: string; id: string }> {
+  requireScope(scope)
+  const prepared = await ensureCrdt(note)
+  return transact('readonly', (transaction) => resolveLocalDestination(transaction, scope, prepared))
+}
+
 /** Commit the edit and its outbox entry together before reporting a local save. */
 export async function writeLocalNote(scope: string, record: NoteRecord): Promise<NoteRecord> {
   requireScope(scope)
   const prepared = { ...record, note: await ensureCrdt(record.note) }
   return transact('readwrite', async (transaction) => {
-    const destination = await resolveDestination(transaction, scope, prepared.note.id)
+    const destination = await resolveLocalDestination(transaction, scope, prepared.note)
     const incoming = remapRecord(prepared, destination.id)
+    // A copy made to preserve an incompatible history starts private, including
+    // writes from a stale tab that still remembers the original publication.
+    if (destination.id !== prepared.note.id) incoming.published = null
     const store = transaction.objectStore('notes')
     const existing = await request<StoredNote | undefined>(store.get([destination.scope, destination.id]))
     const merged: NoteRecord = existing
@@ -87,6 +110,13 @@ export async function acknowledgeLocalNote(
       }
       store.put({ scope: destination.scope, id: recovered.note.id, record: recovered, pending: true } satisfies StoredNote)
       store.put({ scope: destination.scope, id: destination.id, record: incoming, pending: false } satisfies StoredNote)
+      transaction.objectStore('recoveries').put({
+        scope: destination.scope,
+        id: destination.id,
+        createdAt: existing.record.note.createdAt,
+        lineage: existing.record.note.crdt!.lineage,
+        targetId: recovered.note.id,
+      } satisfies StoredRecovery)
       // Guest tabs holding the recovered history must follow it to its new ID.
       const claims = transaction.objectStore('claims')
       const relatedClaims = await request<GuestClaim[]>(claims.index('destination').getAll([destination.scope, destination.id]))
@@ -223,14 +253,19 @@ function openDatabase(): Promise<IDBDatabase> {
       reject(new Error('Local note storage is unavailable in this browser.'))
       return
     }
-    const opening = indexedDB.open(DATABASE_NAME, 1)
+    const opening = indexedDB.open(DATABASE_NAME, 2)
     opening.onupgradeneeded = () => {
       const db = opening.result
-      db.createObjectStore('notes', { keyPath: ['scope', 'id'] }).createIndex('scope', 'scope')
-      db.createObjectStore('metadata', { keyPath: 'scope' })
-      const claims = db.createObjectStore('claims', { keyPath: ['scope', 'id'] })
-      claims.createIndex('scope', 'scope')
-      claims.createIndex('destination', ['targetScope', 'targetId'])
+      if (!db.objectStoreNames.contains('notes')) {
+        db.createObjectStore('notes', { keyPath: ['scope', 'id'] }).createIndex('scope', 'scope')
+        db.createObjectStore('metadata', { keyPath: 'scope' })
+        const claims = db.createObjectStore('claims', { keyPath: ['scope', 'id'] })
+        claims.createIndex('scope', 'scope')
+        claims.createIndex('destination', ['targetScope', 'targetId'])
+      }
+      if (!db.objectStoreNames.contains('recoveries')) {
+        db.createObjectStore('recoveries', { keyPath: ['scope', 'id', 'createdAt', 'lineage'] }).createIndex('scope', 'scope')
+      }
     }
     opening.onsuccess = () => {
       const db = opening.result
@@ -278,6 +313,26 @@ async function resolveDestination(transaction: IDBTransaction, scope: string, id
   return claim ? { scope: claim.targetScope, id: claim.targetId } : { scope, id }
 }
 
+async function resolveLocalDestination(transaction: IDBTransaction, scope: string, note: CrdtNote): Promise<{ scope: string; id: string }> {
+  const destination = await resolveDestination(transaction, scope, note.id)
+  return {
+    scope: destination.scope,
+    id: await resolveRecoveryId(transaction, destination.scope, destination.id, note.createdAt, note.crdt!.lineage),
+  }
+}
+
+async function resolveRecoveryId(transaction: IDBTransaction, scope: string, id: string, createdAt: string, lineage: string): Promise<string> {
+  const seen = new Set<string>()
+  const recoveries = transaction.objectStore('recoveries')
+  while (!seen.has(id)) {
+    seen.add(id)
+    const recovery = await request<StoredRecovery | undefined>(recoveries.get([scope, id, createdAt, lineage]))
+    if (!recovery) return id
+    id = recovery.targetId
+  }
+  throw new Error('The local note recovery destination contains a cycle.')
+}
+
 async function readStoredNotes(transaction: IDBTransaction, scope: string): Promise<StoredNote[]> {
   const records = await request<StoredNote[]>(transaction.objectStore('notes').index('scope').getAll(scope, MAX_NOTES + 1))
   if (records.length > MAX_NOTES) throw new Error(`This local notebook exceeds the ${MAX_NOTES.toLocaleString()} note limit.`)
@@ -289,10 +344,17 @@ async function readMetadata(transaction: IDBTransaction, scope: string): Promise
 }
 
 async function readNotebook(transaction: IDBTransaction, scope: string): Promise<LocalNotebook> {
-  const [stored, metadata] = await Promise.all([readStoredNotes(transaction, scope), readMetadata(transaction, scope)])
+  const [stored, metadata, redirects] = await Promise.all([
+    readStoredNotes(transaction, scope), readMetadata(transaction, scope),
+    request<StoredRecovery[]>(transaction.objectStore('recoveries').index('scope').getAll(scope)),
+  ])
+  const recoveries = await Promise.all(redirects.map(async ({ id, createdAt, lineage }) => ({
+    id, createdAt, lineage, targetId: await resolveRecoveryId(transaction, scope, id, createdAt, lineage),
+  })))
   stored.sort((left, right) => right.record.note.updatedAt.localeCompare(left.record.note.updatedAt))
   return { records: stored.map(({ record }) => record), pending: stored.filter(({ pending }) => pending).map(({ id }) => id),
-    folders: metadata.folders, foldersPending: metadata.foldersPending, activeId: metadata.activeId }
+    folders: metadata.folders, foldersPending: metadata.foldersPending, activeId: metadata.activeId,
+    ...(recoveries.length ? { recoveries } : {}) }
 }
 
 async function checkCapacity(transaction: IDBTransaction, scope: string): Promise<void> {

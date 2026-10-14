@@ -12,8 +12,8 @@ import { createNote, listNotes, loadPublicNote, publishNote, unpublishNote } fro
 import type { Note, NoteRecord } from './lib/notes'
 import { filterNotes, folderContains, folderLabel, folderPaths, normalizeFolder, renameFolderPath } from './lib/folders'
 import { loadFolders, normalizeFolderPaths } from './lib/folder-store'
-import { editNote, initializeNote, mergeNotes, noteRevision } from './lib/crdt'
-import { adoptGuestNotebook, readLocalNotebook, setLocalActiveId, writeLocalFolders, writeLocalNote } from './lib/local-notebook'
+import { editNote, initializeNote, LineageConflictError, mergeNotes, noteRevision } from './lib/crdt'
+import { adoptGuestNotebook, readLocalNotebook, resolveLocalNoteDestination, setLocalActiveId, writeLocalFolders, writeLocalNote } from './lib/local-notebook'
 import type { LocalNotebook } from './lib/local-notebook'
 import { GUEST_SCOPE, mergeRemoteNotebook, scopeForSession, synchronizeNotebook, uploadNotebook } from './lib/notebook-sync'
 
@@ -51,6 +51,8 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : 'Something went wrong. Please try again.'
 }
 function dateLabel(value: string) { return new Date(value).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) }
+function historyKey(scope: string, note: Note) { return JSON.stringify([scope, note.id, note.createdAt, note.crdt?.lineage]) }
+function sameHistory(left: Note, right: Note) { return left.id === right.id && left.createdAt === right.createdAt && left.crdt?.lineage === right.crdt?.lineage }
 function publicUrl(owner: string, id: string) { const url = new URL(window.location.origin); url.searchParams.set('owner', owner); url.searchParams.set('note', id); return url.href }
 function download(note: Note) {
   const blob = new Blob([`# ${note.title || 'Untitled note'}\n\n${note.content}`], { type: 'text/markdown;charset=utf-8' })
@@ -197,17 +199,52 @@ function Notebook() {
     recordsRef.current = next; setRecords(next)
   }, [])
   const persistRecord = useCallback((record: NoteRecord, capturedScope = scopeRef.current): Promise<NoteRecord> => {
-    const key = `${capturedScope}/${record.note.id}`
-    dirtyLocal.current.set(key, { scope: capturedScope, record })
+    const key = historyKey(capturedScope, record.note)
+    const entry = { scope: capturedScope, record }
+    dirtyLocal.current.set(key, entry)
     if (scopeRef.current === capturedScope) setNeedsSync(true)
     if (scopeRef.current === capturedScope) setStatus('Saving on this device…')
     const work = async () => {
       try {
         const saved = await writeLocalNote(capturedScope, record)
-        if (noteRevision(dirtyLocal.current.get(key)?.record.note ?? record.note) === noteRevision(record.note)) dirtyLocal.current.delete(key)
+        const destination = capturedScope === GUEST_SCOPE ? await resolveLocalNoteDestination(capturedScope, record.note) : { scope: capturedScope, id: saved.note.id }
+        if (destination.scope !== capturedScope) {
+          // Another tab already claimed this guest history for one account. Keep
+          // the old guest ID as its routing handle; account text/IDs must never
+          // become new guest drafts that a later login could claim elsewhere.
+          if (dirtyLocal.current.get(key) === entry) dirtyLocal.current.delete(key)
+          if (scopeRef.current === capturedScope) setStatus(dirtyLocal.current.size || dirtyFolders.current ? 'Saving on this device…' : 'Saved on this device')
+          return saved
+        }
+        if (saved.note.id !== record.note.id) {
+          // The cache durably moved this exact history, possibly in another tab.
+          // Carry later typing to that ID before releasing its old pending entry.
+          const pending = dirtyLocal.current.get(key)
+          const visible = scopeRef.current === capturedScope ? recordsRef.current.find(row => sameHistory(row.note, record.note)) : undefined
+          let recovered = saved
+          for (const latest of [pending?.record, visible]) {
+            if (latest) recovered = { note: mergeNotes(recovered.note, { ...latest.note, id: saved.note.id }), published: null }
+          }
+          const targetKey = historyKey(capturedScope, recovered.note)
+          const targetPending = dirtyLocal.current.get(targetKey)
+          if (targetPending) recovered = { note: mergeNotes(recovered.note, targetPending.record.note), published: null }
+          if (noteRevision(recovered.note) !== noteRevision(saved.note)) {
+            void persistRecord(recovered, capturedScope).catch(error => { if (scopeRef.current === capturedScope) notice(errorMessage(error), true) })
+          }
+          if (dirtyLocal.current.get(key) === pending) dirtyLocal.current.delete(key)
+          if (visible) {
+            const target = recordsRef.current.find(row => sameHistory(row.note, recovered.note))
+            if (target) recovered = { note: mergeNotes(recovered.note, target.note), published: null }
+            replaceRecords([...recordsRef.current.filter(row => !sameHistory(row.note, record.note) && row.note.id !== recovered.note.id), recovered])
+            if (activeIdRef.current === record.note.id) {
+              activeIdRef.current = recovered.note.id; setActiveId(recovered.note.id)
+              void setLocalActiveId(capturedScope, recovered.note.id).catch(error => notice(errorMessage(error), true))
+            }
+          }
+        } else if (dirtyLocal.current.get(key) === entry) dirtyLocal.current.delete(key)
         if (scopeRef.current === capturedScope) {
           const current = recordsRef.current.find(row => row.note.id === saved.note.id)
-          if (current && current.note.crdt?.lineage === saved.note.crdt?.lineage) {
+          if (current && sameHistory(current.note, saved.note)) {
             const merged = mergeNotes(current.note, saved.note)
             if (noteRevision(current.note) !== noteRevision(merged)) replaceRecords(recordsRef.current.map(row => row.note.id === merged.id ? { ...row, note: merged } : row))
           }
@@ -219,7 +256,7 @@ function Notebook() {
     const pending = localQueue.current.then(work, work)
     localQueue.current = pending.catch(() => undefined)
     return pending
-  }, [replaceRecords])
+  }, [replaceRecords, notice])
   const persistFolders = useCallback((folders: string[], capturedScope = scopeRef.current): Promise<void> => {
     const entry = { scope: capturedScope, folders }
     dirtyFolders.current = entry
@@ -249,20 +286,22 @@ function Notebook() {
     const incoming = new Map(notebook.records.map(row => [row.note.id, row]))
     let recoveredActive: string | undefined
     for (const row of current) {
-      const remote = incoming.get(row.note.id)
-      if (!remote) incoming.set(row.note.id, row)
-      else if (row.note.crdt?.lineage === remote.note.crdt?.lineage) incoming.set(row.note.id, { ...remote, note: mergeNotes(row.note, remote.note) })
-      else {
-        // A remote replacement can race typing after the cache made its recovery copy.
-        // Route those still-visible operations into that copy instead of discarding them.
-        const recovery = [...incoming.values()].find(candidate => candidate.note.id !== row.note.id && candidate.note.crdt?.lineage === row.note.crdt?.lineage)
-        const recoveredId = recovery?.note.id ?? crypto.randomUUID()
-        const recovered = { note: recovery ? mergeNotes(recovery.note, { ...row.note, id: recoveredId }) :
-          editNote({ ...row.note, id: recoveredId }, { title: `${row.note.title.slice(0, 188)} (recovered)` }), published: null }
-        incoming.set(recoveredId, recovered)
-        dirtyLocal.current.delete(`${capturedScope}/${row.note.id}`)
-        if (activeIdRef.current === row.note.id) recoveredActive = recoveredId
-        if (!recovery || noteRevision(recovery.note) !== noteRevision(recovered.note)) void persistRecord(recovered, capturedScope).catch(() => undefined)
+      const redirect = notebook.recoveries?.find(candidate => candidate.id === row.note.id && candidate.createdAt === row.note.createdAt && candidate.lineage === row.note.crdt?.lineage)
+      const destinationId = redirect?.targetId ?? row.note.id
+      const remote = incoming.get(destinationId)
+      const local = destinationId === row.note.id ? row : { note: { ...row.note, id: destinationId }, published: null }
+      if (remote && sameHistory(local.note, remote.note)) {
+        const merged = { ...remote, note: mergeNotes(local.note, remote.note), ...(redirect ? { published: null } : {}) }
+        incoming.set(destinationId, merged)
+        if (redirect) {
+          if (activeIdRef.current === row.note.id) recoveredActive = destinationId
+          if (noteRevision(merged.note) !== noteRevision(remote.note)) void persistRecord(merged, capturedScope).catch(() => undefined)
+        }
+      } else {
+        // A snapshot can race a recovery transaction. Let the cache resolve the
+        // exact source identity instead of guessing another document's lineage.
+        incoming.set(row.note.id, row)
+        if (remote || redirect) void persistRecord(row, capturedScope).catch(() => undefined)
       }
     }
     let next = [...incoming.values()]
@@ -295,9 +334,9 @@ function Notebook() {
     if (background && Date.now() - lastBackground.current < 5000) return
     lastBackground.current = Date.now()
     const job = (async () => {
-      await flushLocal()
-      if (scopeRef.current === capturedScope) setStatus('Syncing…')
       try {
+        await flushLocal()
+        if (scopeRef.current === capturedScope) setStatus('Syncing…')
         const notebook = await (pull ? synchronizeNotebook(capturedSession, capturedScope) : uploadNotebook(capturedSession, capturedScope))
         displayNotebook(folderVersion.current === capturedFolderVersion ? notebook : { ...notebook, folders: foldersRef.current, foldersPending: true }, capturedScope)
       } catch (error) {
@@ -571,9 +610,19 @@ function Notebook() {
       await flushLocal()
       if (syncJob.current) await syncJob.current.catch(() => undefined)
       if (action === 'publish') {
+        // Resolve replacements before publishing, while retaining exactly the
+        // text the user reviewed. A recovered ID needs a fresh publish action.
+        await sync(true)
+        await flushLocal()
+        const destination = await resolveLocalNoteDestination(capturedScope, reviewed)
+        if (destination.scope !== capturedScope || destination.id !== reviewed.id) {
+          setModal(null)
+          notice('This note has a different history on Pubky. Both versions are kept privately. Review the recovered note and choose Share again to publish it.', true)
+          return
+        }
         const published = await publishNote(capturedSession, reviewed)
         const existing = recordsRef.current.find(row => row.note.id === reviewed.id)
-        if (existing && scopeRef.current === capturedScope) {
+        if (existing && sameHistory(existing.note, reviewed) && scopeRef.current === capturedScope) {
           const updated = { ...existing, published }
           replaceRecords(recordsRef.current.map(row => row.note.id === reviewed.id ? updated : row))
           await persistRecord(updated, capturedScope)
@@ -590,7 +639,18 @@ function Notebook() {
         notice('Public copy removed.')
       }
       await sync(true)
-    } catch (error) { notice(errorMessage(error), true) } finally { setBusy(false) }
+    } catch (error) {
+      if (action === 'publish' && error instanceof LineageConflictError) {
+        try {
+          // The remote history may have changed after the first refresh. Recover
+          // privately, without retrying publication against a new target.
+          await sync(true)
+          await flushLocal()
+          setModal(null)
+          notice('The note changed to a different history before publishing. Both versions are kept privately. Review the recovered note and choose Share again to publish it.', true)
+        } catch (recoveryError) { notice(`${errorMessage(recoveryError)} Publishing stopped. Your local text is retained.`, true) }
+      } else notice(errorMessage(error), true)
+    } finally { setBusy(false) }
   }
   async function remove() {
     if (!note) return

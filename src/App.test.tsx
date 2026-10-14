@@ -267,10 +267,10 @@ describe('private saving and explicit publication', () => {
 
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Publish public copy' })) })
 
-    expect(mocks.publishNote).toHaveBeenCalledExactlyOnceWith(session, expect.objectContaining({
+    await waitFor(() => expect(mocks.publishNote).toHaveBeenCalledExactlyOnceWith(session, expect.objectContaining({
       id: savedNote.id,
       content: 'A private edit that is not ready for publication.',
-    }))
+    })))
     await waitFor(() => expect(screen.getByText('Saved to Pubky')).toBeTruthy())
     expect(screen.getByText('Public copy published.')).toBeTruthy()
   })

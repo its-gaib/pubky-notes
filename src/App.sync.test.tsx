@@ -5,10 +5,10 @@ import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Session } from '@synonymdev/pubky'
 import App from './App'
-import { initializeNote } from './lib/crdt'
+import { editNote, initializeNote, LineageConflictError } from './lib/crdt'
 import type { Note, NoteRecord } from './lib/notes'
 import { GUEST_SCOPE, scopeForSession } from './lib/notebook-sync'
-import { closeLocalNotebook, readLocalNotebook, setLocalActiveId, writeLocalNote } from './lib/local-notebook'
+import { acknowledgeLocalNote, adoptGuestNotebook, closeLocalNotebook, readLocalNotebook, setLocalActiveId, writeLocalNote } from './lib/local-notebook'
 
 configure({ asyncUtilTimeout: 3000 })
 
@@ -18,6 +18,9 @@ const mocks = vi.hoisted(() => ({
   loadFolders: vi.fn(), saveFolders: vi.fn(),
   adoptionGate: null as Promise<void> | null,
   adoptionStarted: vi.fn(),
+  localWriteGate: null as Promise<void> | null,
+  localWriteError: null as Error | null,
+  localWriteStarted: vi.fn(),
 }))
 
 vi.mock('./lib/pubky', () => ({
@@ -37,6 +40,13 @@ vi.mock('./lib/local-notebook', async importOriginal => {
   const actual = await importOriginal<typeof import('./lib/local-notebook')>()
   return {
     ...actual,
+    writeLocalNote: async (...args: Parameters<typeof actual.writeLocalNote>) => {
+      mocks.localWriteStarted(...args)
+      const error = mocks.localWriteError
+      if (mocks.localWriteGate) await mocks.localWriteGate
+      if (error) throw error
+      return actual.writeLocalNote(...args)
+    },
     adoptGuestNotebook: async (...args: Parameters<typeof actual.adoptGuestNotebook>) => {
       mocks.adoptionStarted(...args)
       if (mocks.adoptionGate) await mocks.adoptionGate
@@ -90,6 +100,8 @@ beforeEach(async () => {
   window.history.replaceState(null, '', '/')
   vi.clearAllMocks()
   mocks.adoptionGate = null
+  mocks.localWriteGate = null
+  mocks.localWriteError = null
   mocks.restore.mockResolvedValue(null)
   mocks.persist.mockResolvedValue('stored-session')
   mocks.discard.mockResolvedValue(undefined)
@@ -283,5 +295,154 @@ describe('durable local notes and account synchronization', () => {
     expect(content()).toBe('Preserve this draft through the transition')
     expect((await readLocalNotebook(GUEST_SCOPE)).records).toEqual([])
     expect((await readLocalNotebook(scopeForSession(alice))).pending).toEqual([])
+  })
+
+  it('routes newer typing from a stale signed-in tab into one durable recovery note', async () => {
+    const original = row('Shared history', 'Original private text')
+    mocks.restore.mockResolvedValue(alice)
+    mocks.list.mockResolvedValue([original])
+    render(<App />)
+    await screen.findByText('Saved to Pubky')
+    const replacement = row('Shared history', 'Independent replacement text')
+    const recovered = (await acknowledgeLocalNote(scopeForSession(alice), replacement)).recovered!
+    const write = deferred<void>()
+    mocks.localWriteGate = write.promise
+    mocks.localWriteStarted.mockClear()
+    changeContent('First stale-tab edit')
+    await waitFor(() => expect(mocks.localWriteStarted).toHaveBeenCalledOnce())
+    changeContent('First stale-tab edit and newer typing')
+    expect(screen.queryByText('Saved to Pubky')).toBeNull()
+    await act(async () => { write.resolve() })
+    await waitFor(async () => {
+      const cache = await readLocalNotebook(scopeForSession(alice))
+      expect(cache.records).toHaveLength(2)
+      expect(cache.records.find(record => record.note.id === recovered.note.id)?.note.content).toBe('First stale-tab edit and newer typing')
+      expect(content()).toBe('First stale-tab edit and newer typing')
+      expect(title()).toContain('(recovered)')
+    })
+    expect((await readLocalNotebook(scopeForSession(alice))).records.find(record => record.note.id === original.note.id)?.note.content).toBe('Independent replacement text')
+    expect(mocks.publish).not.toHaveBeenCalled()
+    await saveNow()
+    await screen.findByText('Saved to Pubky')
+    expect((await readLocalNotebook(scopeForSession(alice))).activeId).toBe(recovered.note.id)
+    expect((await readLocalNotebook(scopeForSession(alice))).records).toHaveLength(2)
+  })
+
+  it('retains newer volatile recovery edits when their local commit fails', async () => {
+    const original = row('Recover safely', 'Original text')
+    mocks.restore.mockResolvedValue(alice)
+    mocks.list.mockResolvedValue([original])
+    render(<App />)
+    await screen.findByText('Saved to Pubky')
+    const recovered = (await acknowledgeLocalNote(scopeForSession(alice), row('Recover safely', 'Replacement'))).recovered!
+    const write = deferred<void>()
+    mocks.localWriteGate = write.promise
+    mocks.localWriteStarted.mockClear()
+    changeContent('First durable edit')
+    await waitFor(() => expect(mocks.localWriteStarted).toHaveBeenCalledOnce())
+    mocks.localWriteError = new Error('Local disk unavailable')
+    changeContent('First durable edit plus unsaved typing')
+    await act(async () => { write.resolve() })
+    await screen.findByText('Not saved on this device')
+    expect(content()).toBe('First durable edit plus unsaved typing')
+    expect(screen.queryByText('Saved to Pubky')).toBeNull()
+    expect(screen.queryByText('Saved on this device')).toBeNull()
+    expect((await readLocalNotebook(scopeForSession(alice))).records.find(record => record.note.id === recovered.note.id)?.note.content).toBe('First durable edit')
+    mocks.localWriteError = null
+    await saveNow()
+    await screen.findByText('Saved to Pubky')
+    const cache = await readLocalNotebook(scopeForSession(alice))
+    expect(cache.records).toHaveLength(2)
+    expect(cache.records.find(record => record.note.id === recovered.note.id)?.note.content).toBe('First durable edit plus unsaved typing')
+    expect(cache.pending).toEqual([])
+  })
+
+  it('uses the exact recovery mapping instead of another note sharing the same lineage', async () => {
+    const original = row('Exact source', 'Source text')
+    mocks.restore.mockResolvedValue(alice)
+    mocks.list.mockResolvedValue([original])
+    render(<App />)
+    await screen.findByText('Saved to Pubky')
+    const replacement = row('Exact source', 'Replacement text')
+    const recovered = (await acknowledgeLocalNote(scopeForSession(alice), replacement)).recovered!
+    const unrelated = { note: editNote({ ...original.note, id: 'unrelated-copy' }, { title: 'Other copy', content: 'Keep this copy separate' }), published: null }
+    await acknowledgeLocalNote(scopeForSession(alice), unrelated)
+    mocks.list.mockResolvedValue([replacement, unrelated])
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh notes' }))
+    await waitFor(() => expect(title()).toBe('Exact source (recovered)'))
+    expect(content()).toBe('Source text')
+    const cache = await readLocalNotebook(scopeForSession(alice))
+    expect(cache.records).toHaveLength(3)
+    expect(cache.records.find(record => record.note.id === unrelated.note.id)?.note.content).toBe('Keep this copy separate')
+    changeContent('Source text continued')
+    await waitFor(async () => expect((await readLocalNotebook(scopeForSession(alice))).records.find(record => record.note.id === recovered.note.id)?.note.content).toBe('Source text continued'))
+  })
+
+  it('keeps a claimed guest recovery and newer typing out of a later account login', async () => {
+    render(<App />)
+    await readyGuest()
+    changeContent('Guest text claimed by Alice')
+    await screen.findByText('Saved on this device')
+    const guest = (await readLocalNotebook(GUEST_SCOPE)).records[0]
+    await adoptGuestNotebook(GUEST_SCOPE, scopeForSession(alice))
+    const replacement = row('Replacement', 'Alice replacement')
+    replacement.note.id = guest.note.id
+    const recovered = (await acknowledgeLocalNote(scopeForSession(alice), replacement)).recovered!
+    const write = deferred<void>()
+    mocks.localWriteGate = write.promise
+    mocks.localWriteStarted.mockClear()
+    changeContent('Claimed guest first edit')
+    await waitFor(() => expect(mocks.localWriteStarted).toHaveBeenCalledOnce())
+    changeContent('Claimed guest first edit and newer typing')
+    await act(async () => { write.resolve() })
+    await waitFor(async () => expect((await readLocalNotebook(scopeForSession(alice))).records.find(record => record.note.id === recovered.note.id)?.note.content).toBe('Claimed guest first edit and newer typing'))
+    expect((await readLocalNotebook(GUEST_SCOPE)).records).toEqual([])
+    mocks.list.mockResolvedValue([row('Bob private', 'Only Bob content')])
+    const { approval } = await beginLogin()
+    await approve(approval, bob)
+    await screen.findByText('Saved to Pubky')
+    expect(title()).toBe('Bob private')
+    expect((await readLocalNotebook(scopeForSession(bob))).records.map(record => record.note.content)).toEqual(['Only Bob content'])
+    expect((await readLocalNotebook(GUEST_SCOPE)).records).toEqual([])
+    expect(mocks.save.mock.calls.some(([session]) => session === bob)).toBe(false)
+  })
+
+  it('recovers a replacement history privately and requires a new publish action', async () => {
+    const original = row('Reviewed note', 'Text the user reviewed')
+    mocks.restore.mockResolvedValue(alice)
+    mocks.list.mockResolvedValue([original])
+    render(<App />)
+    await screen.findByText('Saved to Pubky')
+    mocks.list.mockResolvedValue([row('Reviewed note', 'Unseen private replacement')])
+    fireEvent.click(screen.getByRole('button', { name: 'Share' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Publish public copy' }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('choose Share again'))
+    expect(mocks.publish).not.toHaveBeenCalled()
+    expect(content()).toBe('Text the user reviewed')
+    expect(title()).toBe('Reviewed note (recovered)')
+    const cache = await readLocalNotebook(scopeForSession(alice))
+    expect(cache.records).toHaveLength(2)
+    expect(cache.records.every(record => record.published === null)).toBe(true)
+    expect(cache.records.map(record => record.note.content).sort()).toEqual(['Text the user reviewed', 'Unseen private replacement'])
+  })
+
+  it('does not retry publication when a history replacement races the publish request', async () => {
+    const original = row('Race note', 'Reviewed public text')
+    mocks.restore.mockResolvedValue(alice)
+    mocks.list.mockResolvedValue([original])
+    mocks.publish.mockImplementation(async () => {
+      mocks.list.mockResolvedValue([row('Race note', 'Unseen private text')])
+      throw new LineageConflictError()
+    })
+    render(<App />)
+    await screen.findByText('Saved to Pubky')
+    fireEvent.click(screen.getByRole('button', { name: 'Share' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Publish public copy' }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('choose Share again'))
+    expect(mocks.publish).toHaveBeenCalledExactlyOnceWith(alice, expect.objectContaining({ id: original.note.id, content: 'Reviewed public text' }))
+    expect(content()).toBe('Reviewed public text')
+    const cache = await readLocalNotebook(scopeForSession(alice))
+    expect(cache.records).toHaveLength(2)
+    expect(cache.records.every(record => record.published === null)).toBe(true)
   })
 })
