@@ -1,34 +1,28 @@
 import { PubkyResource, PublicKey } from '@synonymdev/pubky'
-import type { Address, Path, Session } from '@synonymdev/pubky'
+import type { Address, Path, Session, StorageLock } from '@synonymdev/pubky'
 import { APP_PATHS } from '../config'
 import { getPubky } from './pubky'
-import { normalizeFolder } from './folders'
+import { editNote, ensureCrdt, initializeNote, MAX_CONTENT_LENGTH, MAX_NOTE_BYTES, mergeNotes, noteRevision, prepareLocalNote, validateCrdtNote } from './crdt'
+import type { CrdtNote } from './crdt'
 
-export interface Note {
-  id: string
-  title: string
-  content: string
-  createdAt: string
-  updatedAt: string
-  folder?: string
-}
+export interface Note extends CrdtNote {}
 
 export interface NoteRecord {
   note: Note
   published: Note | null
 }
 
-export const MAX_NOTE_BYTES = 512 * 1024
-export const MAX_CONTENT_LENGTH = 250_000
-const MAX_TITLE_LENGTH = 200
+export { MAX_NOTE_BYTES, MAX_CONTENT_LENGTH }
 const LIST_PAGE_SIZE = 100
 const MAX_NOTES = 2_000
 const DOWNLOAD_CONCURRENCY = 5
+const LOCK_SECONDS = 60
 type StorageSpace = keyof typeof APP_PATHS
+type Locks = Record<StorageSpace, StorageLock>
 
 export function createNote(): Note {
   const now = new Date().toISOString()
-  return { id: crypto.randomUUID(), title: 'Untitled note', content: '', createdAt: now, updatedAt: now }
+  return initializeNote({ id: crypto.randomUUID(), title: 'Untitled note', content: '', createdAt: now, updatedAt: now })
 }
 
 export function notePath(space: StorageSpace, id: string): Path {
@@ -44,39 +38,64 @@ export async function listNotes(session: Session): Promise<NoteRecord[]> {
   const published = new Map(publicNotes.map((note) => [note.id, note]))
   const canonical = new Map(privateNotes.map((note) => [note.id, note]))
   // Keep public files discoverable even if another app removed their private original.
-  for (const note of publicNotes) if (!canonical.has(note.id)) canonical.set(note.id, note)
+  for (const note of publicNotes) if (!canonical.has(note.id)) canonical.set(note.id, await ensureCrdt(note))
   return [...canonical.values()]
     .map((note) => ({ note, published: published.get(note.id) ?? null }))
     .sort((a, b) => b.note.updatedAt.localeCompare(a.note.updatedAt))
 }
 
 export async function saveNote(session: Session, note: Note): Promise<Note> {
-  const saved = validateNote(note, note.id)
-  await session.storage.putJson(notePath('private', saved.id), saved)
-  return saved
+  requireId(note.id)
+  const local = await prepareLocalNote(note)
+  return withLocks(session, local.id, async locks => {
+    const merged = await mergeStored(session, local)
+    return writeVerified(session, locks, merged)
+  })
 }
 
 export async function publishNote(session: Session, note: Note): Promise<Note> {
-  // Publishing is always explicit. Ordinary edits update the private original only.
-  const saved = await saveNote(session, note)
-  const snapshot = publicSnapshot(saved)
-  await session.storage.putJson(notePath('public', saved.id), snapshot)
-  return snapshot
+  requireId(note.id)
+  const reviewed = await prepareLocalNote(note)
+  if (reviewed.deleted) throw new Error('Restore this note before publishing it.')
+  return withLocks(session, note.id, async locks => {
+    const merged = await mergeStored(session, reviewed)
+    if (merged.deleted) throw new Error('This note was moved to Trash. Restore it before publishing.')
+    await writeVerified(session, locks, merged)
+    // Only the text the user reviewed is published, even if private saving merged remote edits.
+    const snapshot = publicSnapshot(reviewed)
+    await renew(session, locks)
+    await session.storage.putTextLocked(locks.public, JSON.stringify(snapshot))
+    const confirmed = await readOptionalNote(session, notePath('public', note.id), note.id, false)
+    if (!confirmed || JSON.stringify(confirmed) !== JSON.stringify(snapshot)) throw new Error('The published snapshot could not be verified. Your private note is retained.')
+    return snapshot
+  })
 }
 
 export async function unpublishNote(session: Session, id: string): Promise<void> {
-  const privatePath = notePath('private', id)
-  if (!await session.storage.exists(privatePath)) {
-    const original = await readOptionalNote(session, notePath('public', id), id)
-    if (original) await saveNote(session, original)
-  }
-  await deleteIfPresent(session, notePath('public', id))
+  await withLocks(session, id, async locks => {
+    if (!await readOptionalNote(session, notePath('private', id), id)) {
+      const original = await readOptionalNote(session, notePath('public', id), id, false)
+      if (original) await writeVerified(session, locks, await ensureCrdt(original))
+    }
+    await renew(session, locks)
+    await deleteLockedIfPresent(session, locks.public)
+  })
 }
 
-export async function deleteNote(session: Session, id: string): Promise<void> {
-  // Keep the private original if deleting the public snapshot fails.
-  await deleteIfPresent(session, notePath('public', id))
-  await deleteIfPresent(session, notePath('private', id))
+export async function deleteNote(session: Session, input: Note | string): Promise<Note> {
+  const id = typeof input === 'string' ? input : input.id
+  const local = typeof input === 'string' ? null : await prepareLocalNote(input)
+  return withLocks(session, id, async locks => {
+    const original = local ? await mergeStored(session, local) :
+      await readOptionalNote(session, notePath('private', id), id) ??
+      await readOptionalNote(session, notePath('public', id), id, false)
+    if (!original) throw new Error('This note could not be found. Your local copy is retained.')
+    const tombstone = editNote(await ensureCrdt(original), { deleted: true })
+    // Keep the original untouched if removing its public snapshot fails.
+    await renew(session, locks)
+    await deleteLockedIfPresent(session, locks.public)
+    return writeVerified(session, locks, tombstone)
+  })
 }
 
 export async function loadPublicNote(owner: string, id: string): Promise<Note> {
@@ -85,19 +104,18 @@ export async function loadPublicNote(owner: string, id: string): Promise<Note> {
   try {
     const address: Address = `pubky${publicKey.z32()}${APP_PATHS.public}${id}.json`
     const response = await getPubky().publicStorage.get(address)
-    return publicSnapshot(validateNote(await readBoundedJson(response), id))
+    return validateNote(await readBoundedJson(response), id, false)
   } finally {
     publicKey.free()
   }
 }
 
-function publicSnapshot(note: Note): Note {
-  const { folder: _folder, ...snapshot } = note
-  return snapshot
+export function publicSnapshot(note: Note): Note {
+  return { id: note.id, title: note.title, content: note.content, createdAt: note.createdAt, updatedAt: note.updatedAt }
 }
 
-async function readOptionalNote(session: Session, path: Path, id: string): Promise<Note | null> {
-  try { return validateNote(await readBoundedJson(await session.storage.get(path)), id) } catch (error) {
+async function readOptionalNote(session: Session, path: Path, id: string, privateNote = true): Promise<Note | null> {
+  try { return await validateNote(await readBoundedJson(await session.storage.get(path)), id, privateNote) } catch (error) {
     if (isMissing(error)) return null
     throw error
   }
@@ -112,8 +130,7 @@ async function readFolder(session: Session, space: StorageSpace): Promise<Note[]
       const position = index++
       const id = ids[position]
       const response = await session.storage.get(notePath(space, id))
-      const note = validateNote(await readBoundedJson(response), id)
-      results[position] = space === 'public' ? publicSnapshot(note) : note
+      results[position] = await validateNote(await readBoundedJson(response), id, space === 'private')
     }
   }))
   return results
@@ -197,44 +214,66 @@ async function readBoundedJson(response: Response): Promise<unknown> {
   try { return JSON.parse(text) } catch { throw new Error('The homeserver returned an invalid note file.') }
 }
 
-function validateNote(value: unknown, expectedId: string): Note {
+async function validateNote(value: unknown, expectedId: string, privateNote = true): Promise<Note> {
   requireId(expectedId)
   if (typeof value !== 'object' || value === null) throw new Error('Invalid note data.')
   const record = value as Record<string, unknown>
-  if (record.id !== expectedId || typeof record.title !== 'string' ||
-      record.title.length > MAX_TITLE_LENGTH || typeof record.content !== 'string' ||
-      record.content.length > MAX_CONTENT_LENGTH || !isTimestamp(record.createdAt) || !isTimestamp(record.updatedAt)) {
-    throw new Error('Invalid note data. The file must contain a valid title, Markdown, and timestamps.')
-  }
-  const note: Note = {
-    id: expectedId,
-    title: record.title,
-    content: record.content,
-    createdAt: record.createdAt,
-    updatedAt: record.updatedAt,
-  }
-  if (record.folder !== undefined) {
-    if (typeof record.folder !== 'string') throw new Error('Invalid note folder.')
-    const folder = normalizeFolder(record.folder)
-    if (folder) note.folder = folder
-  }
-  if (new TextEncoder().encode(JSON.stringify(note)).byteLength > MAX_NOTE_BYTES) {
-    throw new Error('This note is too large to save.')
-  }
-  return note
-}
-
-function isTimestamp(value: unknown): value is string {
-  return typeof value === 'string' && value.length <= 32 &&
-    /^\d{4}-\d{2}-\d{2}T/.test(value) && Number.isFinite(Date.parse(value))
+  if (record.id !== expectedId) throw new Error('Invalid note data. The note ID must match its filename.')
+  const note = validateCrdtNote(privateNote ? value as Note : publicSnapshot(value as Note))
+  return privateNote ? ensureCrdt(note) : note
 }
 
 function requireId(id: string): void {
   if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw new Error('Invalid note ID.')
 }
 
-async function deleteIfPresent(session: Session, path: Path): Promise<void> {
-  try { await session.storage.delete(path) } catch (error) { if (!isMissing(error)) throw error }
+async function mergeStored(session: Session, local: Note): Promise<Note> {
+  const existing = await readOptionalNote(session, notePath('private', local.id), local.id) ??
+    await readOptionalNote(session, notePath('public', local.id), local.id, false)
+  return existing ? mergeNotes(local, await ensureCrdt(existing)) : local
+}
+
+async function writeVerified(session: Session, locks: Locks, note: Note): Promise<Note> {
+  await renew(session, locks)
+  await session.storage.putTextLocked(locks.private, JSON.stringify(note))
+  const confirmed = await readOptionalNote(session, notePath('private', note.id), note.id)
+  if (!confirmed || noteRevision(mergeNotes(confirmed, note)) !== noteRevision(confirmed)) {
+    throw new Error('The homeserver save could not be verified. Your local changes are retained for retry.')
+  }
+  return confirmed
+}
+
+async function withLocks<T>(session: Session, id: string, action: (locks: Locks) => Promise<T>): Promise<T> {
+  requireId(id)
+  const acquired: StorageLock[] = []
+  const locks = {} as Locks
+  try {
+    for (const space of ['private', 'public'] as const) {
+      const lock = await session.storage.lock(notePath(space, id), LOCK_SECONDS)
+      acquired.push(lock)
+      locks[space] = lock
+    }
+    await renew(session, locks)
+    return await action(locks)
+  } catch (error) {
+    if (hasStatus(error, 405)) throw new Error('This homeserver does not support safe note locking. Changes remain on this device.')
+    if (hasStatus(error, 412) || hasStatus(error, 423)) throw new Error('This note is being changed or its lock expired. Your local changes are retained for retry.')
+    throw error
+  } finally {
+    for (const lock of acquired.reverse()) {
+      try { await session.storage.unlock(lock) } catch { /* Locks expire if the connection is lost. */ }
+      lock.free()
+    }
+  }
+}
+
+async function renew(session: Session, locks: Locks): Promise<void> {
+  await session.storage.refreshLock(locks.private, LOCK_SECONDS)
+  await session.storage.refreshLock(locks.public, LOCK_SECONDS)
+}
+
+async function deleteLockedIfPresent(session: Session, lock: StorageLock): Promise<void> {
+  try { await session.storage.deleteLocked(lock) } catch (error) { if (!isMissing(error)) throw error }
 }
 
 function isMissing(error: unknown): boolean {

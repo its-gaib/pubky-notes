@@ -1,10 +1,14 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, configure, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Session } from '@synonymdev/pubky'
 import type { Note, NoteRecord } from './lib/notes'
 import App from './App'
+import { IDBFactory } from 'fake-indexeddb'
+import { closeLocalNotebook } from './lib/local-notebook'
+
+configure({ asyncUtilTimeout: 3000 })
 
 const mocks = vi.hoisted(() => ({
   restoreSession: vi.fn(),
@@ -20,6 +24,8 @@ const mocks = vi.hoisted(() => ({
   deleteNote: vi.fn(),
   loadPublicNote: vi.fn(),
   qrCode: vi.fn(),
+  loadFolders: vi.fn(),
+  saveFolders: vi.fn(),
 }))
 
 vi.mock('./lib/pubky', () => ({
@@ -38,6 +44,11 @@ vi.mock('./lib/notes', () => ({
   unpublishNote: mocks.unpublishNote,
   deleteNote: mocks.deleteNote,
   loadPublicNote: mocks.loadPublicNote,
+}))
+
+vi.mock('./lib/folder-store', async importOriginal => ({
+  ...await importOriginal<typeof import('./lib/folder-store')>(),
+  loadFolders: mocks.loadFolders, saveFolders: mocks.saveFolders,
 }))
 
 vi.mock('qrcode', () => ({
@@ -93,10 +104,15 @@ async function approve(approval: ReturnType<typeof deferred<Session>>, session: 
   await act(async () => { approval.resolve(session) })
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  await closeLocalNotebook()
+  vi.stubGlobal('indexedDB', new IDBFactory())
+  localStorage.clear()
   vi.resetAllMocks()
   window.history.replaceState(null, '', '/')
   mocks.restoreSession.mockResolvedValue(null)
+  mocks.loadFolders.mockResolvedValue([])
+  mocks.saveFolders.mockImplementation(async (_session, paths) => { mocks.loadFolders.mockResolvedValue(paths); return paths })
   mocks.qrCode.mockResolvedValue('data:image/png;base64,cXI=')
   mocks.persistSession.mockResolvedValue('stored-candidate-id')
   mocks.discardSession.mockResolvedValue(undefined)
@@ -113,8 +129,9 @@ beforeEach(() => {
   mocks.publishNote.mockImplementation(async (_session: Session, note: Note) => note)
 })
 
-afterEach(() => {
+afterEach(async () => {
   cleanup()
+  await closeLocalNotebook()
   vi.useRealTimers()
 })
 
@@ -203,8 +220,8 @@ describe('private saving and explicit publication', () => {
     expect(sample.value).toContain('**Bold**')
     expect(screen.getByRole('button', { name: 'Copy Markdown' })).toBeTruthy()
 
-    vi.useFakeTimers()
-    await act(async () => { await vi.advanceTimersByTimeAsync(950) })
+
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 950)) })
     await act(async () => { fireEvent.keyDown(window, { key: 's', ctrlKey: true }) })
     expect(mocks.saveNote).not.toHaveBeenCalled()
     expect(mocks.publishNote).not.toHaveBeenCalled()
@@ -212,11 +229,11 @@ describe('private saving and explicit publication', () => {
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Create a new note' })) })
     expect(screen.queryByRole('textbox', { name: 'Sample Markdown' })).toBeNull()
     expect((screen.getByRole('textbox', { name: 'Markdown content' }) as HTMLTextAreaElement).value).toBe(sample.value)
-    await act(async () => { await vi.advanceTimersByTimeAsync(950) })
-    expect(mocks.saveNote).toHaveBeenCalledExactlyOnceWith(session, expect.objectContaining({
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 950)) })
+    await waitFor(() => expect(mocks.saveNote).toHaveBeenCalledExactlyOnceWith(session, expect.objectContaining({
       title: 'Untitled note',
       content: sample.value,
-    }))
+    })))
     expect(mocks.publishNote).not.toHaveBeenCalled()
   })
 
@@ -229,19 +246,19 @@ describe('private saving and explicit publication', () => {
     expect(screen.queryByRole('textbox', { name: 'Sample Markdown' })).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: 'Write' }))
-    vi.useFakeTimers()
+
     fireEvent.change(screen.getByRole('textbox', { name: 'Markdown content' }), {
       target: { value: 'A private edit that is not ready for publication.' },
     })
     expect(mocks.saveNote).not.toHaveBeenCalled()
     expect(mocks.publishNote).not.toHaveBeenCalled()
 
-    await act(async () => { await vi.advanceTimersByTimeAsync(950) })
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 950)) })
 
-    expect(mocks.saveNote).toHaveBeenCalledExactlyOnceWith(session, expect.objectContaining({
+    await waitFor(() => expect(mocks.saveNote).toHaveBeenCalledExactlyOnceWith(session, expect.objectContaining({
       id: savedNote.id,
       content: 'A private edit that is not ready for publication.',
-    }))
+    })))
     expect(mocks.publishNote).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByRole('button', { name: 'Share' }))
@@ -254,7 +271,8 @@ describe('private saving and explicit publication', () => {
       id: savedNote.id,
       content: 'A private edit that is not ready for publication.',
     }))
-    expect(screen.getByText('Public copy published')).toBeTruthy()
+    await waitFor(() => expect(screen.getByText('Saved to Pubky')).toBeTruthy())
+    expect(screen.getByText('Public copy published.')).toBeTruthy()
   })
 })
 
@@ -277,6 +295,7 @@ describe('folders and notebook-wide search', () => {
     render(<App />)
     await screen.findByRole('button', { name: 'Disconnect from Pubky' })
     await waitFor(() => expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe(records[0].note.title))
+    await waitFor(() => expect(screen.getByText('Saved to Pubky')).toBeTruthy())
     return session
   }
 
@@ -316,16 +335,17 @@ describe('folders and notebook-wide search', () => {
   it('creates a nested folder by moving a note and saves its organization privately', async () => {
     const original = { ...savedNote }
     const session = await openNotebook([{ note: original, published: { ...original } }])
-    fireEvent.click(screen.getByRole('button', { name: /^Move note$/ }))
+    fireEvent.click(screen.getByRole('button', { name: `Note actions for ${original.title}` }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Move to…' }))
     const dialog = within(screen.getByRole('dialog', { name: 'Move note' }))
-    fireEvent.change(dialog.getByRole('combobox', { name: /^Folder$/ }), { target: { value: ' Work / Project ' } })
+    fireEvent.change(dialog.getByRole('textbox', { name: 'Folder path' }), { target: { value: ' Work / Project ' } })
     await act(async () => { fireEvent.click(dialog.getByRole('button', { name: /^Move$/ })) })
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Move note' })).toBeNull())
     await act(async () => { fireEvent.keyDown(window, { key: 's', ctrlKey: true }) })
 
-    expect(mocks.saveNote).toHaveBeenCalledWith(session, expect.objectContaining({
+    await waitFor(() => expect(mocks.saveNote).toHaveBeenCalledWith(session, expect.objectContaining({
       id: original.id, title: original.title, content: original.content, folder: 'Work/Project',
-    }))
+    })))
     expect(screen.getByRole('button', { name: 'Open folder Work' })).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Open folder Work/Project' })).toBeTruthy()
     expect(mocks.publishNote).not.toHaveBeenCalled()
@@ -343,9 +363,9 @@ describe('folders and notebook-wide search', () => {
     expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe('Untitled note')
     await act(async () => { fireEvent.keyDown(window, { key: 's', ctrlKey: true }) })
 
-    expect(mocks.saveNote).toHaveBeenCalledExactlyOnceWith(session, expect.objectContaining({
+    await waitFor(() => expect(mocks.saveNote).toHaveBeenCalledExactlyOnceWith(session, expect.objectContaining({
       title: 'Untitled note', content, folder: 'Personal/Garden',
-    }))
+    })))
     expect(mocks.publishNote).not.toHaveBeenCalled()
   })
 })

@@ -24,6 +24,7 @@ import {
   notePath, publishNote, saveNote, unpublishNote,
 } from './notes'
 import type { Note } from './notes'
+import { editNote, ensureCrdt, initializeNote, mergeNotes, noteRevision } from './crdt'
 
 const fixture = (id = 'note-1', content = '# A private thought'): Note => ({
   id, title: 'A note', content,
@@ -46,6 +47,11 @@ function makeSession(initial: Array<[string, Note]> = []) {
       const start = cursor ? urls.indexOf(cursor) + 1 : 0
       return urls.slice(start, start + limit)
     }),
+    lock: vi.fn(async (path: string) => ({ path, free: vi.fn() })),
+    unlock: vi.fn(async () => undefined),
+    refreshLock: vi.fn(async () => undefined),
+    putTextLocked: vi.fn(async (lock: { path: string }, text: string) => { files.set(lock.path, JSON.parse(text)) }),
+    deleteLocked: vi.fn(async (lock: { path: string }) => { if (!files.delete(lock.path)) throw missing }),
   }
   const session = { storage, info: { publicKey: { z32: () => 'owner' } } } as unknown as Session
   return { session, storage, files }
@@ -61,43 +67,43 @@ describe('private notes and explicit public snapshots', () => {
     const saved = await saveNote(session, { ...fresh, content: '# Draft', title: '  My note  ' })
     expect(saved.title).toBe('  My note  ')
     expect(saved.updatedAt).toBe(fresh.updatedAt)
-    expect(storage.putJson).toHaveBeenCalledExactlyOnceWith(`${APP_PATHS.private}${fresh.id}.json`, saved)
+    expect(storage.putTextLocked).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ path: `${APP_PATHS.private}${fresh.id}.json` }), JSON.stringify(saved))
   })
 
   it('saves the private original before publishing, leaving later edits private', async () => {
     const { session, storage, files } = makeSession()
     const published = await publishNote(session, fixture())
-    expect(storage.putJson.mock.calls.map(([path]) => path)).toEqual([
+    expect(storage.putTextLocked.mock.calls.map(([lock]) => lock.path)).toEqual([
       notePath('private', published.id), notePath('public', published.id),
     ])
-    await saveNote(session, { ...published, content: 'An unpublished change' })
+    await saveNote(session, editNote(files.get(notePath('private', published.id))!, { content: 'An unpublished change' }))
     expect(files.get(notePath('public', published.id))?.content).toBe('# A private thought')
     expect(files.get(notePath('private', published.id))?.content).toBe('An unpublished change')
   })
 
   it('preserves empty titles and surrounding spaces without changing the revision', async () => {
-    const { session, files } = makeSession()
     for (const title of ['', '  A title  ']) {
+      const { session, files } = makeSession()
       const note = { ...fixture(), title }
       await expect(publishNote(session, note)).resolves.toEqual(note)
-      expect(files.get(notePath('private', note.id))).toEqual(note)
+      expect(files.get(notePath('private', note.id))).toMatchObject(note)
       expect(files.get(notePath('public', note.id))).toEqual(note)
     }
   })
 
   it('does not publish anything when the private save fails', async () => {
     const { session, storage } = makeSession()
-    storage.putJson.mockRejectedValueOnce(new Error('Permission denied'))
+    storage.putTextLocked.mockRejectedValueOnce(new Error('Permission denied'))
     await expect(publishNote(session, fixture())).rejects.toThrow('Permission denied')
-    expect(storage.putJson).toHaveBeenCalledTimes(1)
-    expect(storage.putJson.mock.calls[0][0]).toMatch(/^\/priv\//)
+    expect(storage.putTextLocked).toHaveBeenCalledTimes(1)
+    expect(storage.putTextLocked.mock.calls[0][0].path).toMatch(/^\/priv\//)
   })
 
   it('retains the saved original and reports a failed public write', async () => {
     const { session, storage, files } = makeSession()
-    storage.putJson.mockImplementation(async (path, note) => {
-      if (path.startsWith('/pub/')) throw new Error('Public write failed')
-      files.set(path, note)
+    storage.putTextLocked.mockImplementation(async (lock, text) => {
+      if (lock.path.startsWith('/pub/')) throw new Error('Public write failed')
+      files.set(lock.path, JSON.parse(text))
     })
     await expect(publishNote(session, fixture())).rejects.toThrow('Public write failed')
     expect(files.has(notePath('private', 'note-1'))).toBe(true)
@@ -119,44 +125,54 @@ describe('private notes and explicit public snapshots', () => {
     const note = fixture()
     const { session, storage, files } = makeSession([[notePath('public', note.id), note]])
     await unpublishNote(session, note.id)
-    expect(files.get(notePath('private', note.id))).toEqual(note)
+    expect(files.get(notePath('private', note.id))).toMatchObject(note)
     expect(files.has(notePath('public', note.id))).toBe(false)
-    expect(storage.putJson.mock.invocationCallOrder[0]).toBeLessThan(storage.delete.mock.invocationCallOrder[0])
+    expect(storage.putTextLocked.mock.invocationCallOrder[0]).toBeLessThan(storage.deleteLocked.mock.invocationCallOrder[0])
   })
 
   it('preserves an orphaned public snapshot when restoring its private original fails', async () => {
     const note = fixture()
     const { session, storage, files } = makeSession([[notePath('public', note.id), note]])
-    storage.putJson.mockRejectedValueOnce(new Error('Private storage unavailable'))
+    storage.putTextLocked.mockRejectedValueOnce(new Error('Private storage unavailable'))
     await expect(unpublishNote(session, note.id)).rejects.toThrow('Private storage unavailable')
     expect(files.get(notePath('public', note.id))).toEqual(note)
-    expect(storage.delete).not.toHaveBeenCalled()
+    expect(storage.deleteLocked).not.toHaveBeenCalled()
   })
 
   it('deletes the public copy first and preserves private data if that fails', async () => {
-    const { session, storage } = makeSession()
-    storage.delete.mockRejectedValueOnce(new Error('Network unavailable'))
+    const { session, storage } = makeSession([[notePath('private', 'note-1'), fixture()]])
+    storage.deleteLocked.mockRejectedValueOnce(new Error('Network unavailable'))
     await expect(deleteNote(session, 'note-1')).rejects.toThrow('Network unavailable')
-    expect(storage.delete).toHaveBeenCalledExactlyOnceWith(notePath('public', 'note-1'))
+    expect(storage.deleteLocked).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ path: notePath('public', 'note-1') }))
   })
 
-  it('deletes a private-only note after a public 404', async () => {
+  it('preserves a private-only note as a recoverable tombstone after a public 404', async () => {
     const { session, storage, files } = makeSession([[notePath('private', 'note-1'), fixture()]])
-    await deleteNote(session, 'note-1')
-    expect(storage.delete.mock.calls.map(([path]) => path)).toEqual([
-      notePath('public', 'note-1'), notePath('private', 'note-1'),
-    ])
-    expect(files.size).toBe(0)
+    const deleted = await deleteNote(session, 'note-1')
+    expect(storage.deleteLocked.mock.calls.map(([lock]) => lock.path)).toEqual([notePath('public', 'note-1')])
+    expect(files.size).toBe(1)
+    expect(deleted).toMatchObject({ deleted: true, content: fixture().content })
+    expect(files.get(notePath('private', 'note-1'))).toEqual(deleted)
   })
 
   it('does not turn permission errors into successful unpublishing', async () => {
     const { session, storage } = makeSession([[notePath('private', 'note-1'), fixture()]])
-    storage.delete.mockRejectedValueOnce({ data: { statusCode: 403 } })
+    storage.deleteLocked.mockRejectedValueOnce({ data: { statusCode: 403 } })
     await expect(unpublishNote(session, 'note-1')).rejects.toEqual({ data: { statusCode: 403 } })
   })
 })
 
 describe('loading and validating notes', () => {
+  it('ignores the private folder registry when listing notes', async () => {
+    const note = fixture()
+    const { session, storage } = makeSession([[notePath('private', note.id), note]])
+    storage.list.mockImplementation(async (folder) => folder === APP_PATHS.private ? [
+      `pubky://owner${APP_PATHS.private}folders`, `pubky://owner${notePath('private', note.id)}`,
+    ] : [])
+    await expect(listNotes(session)).resolves.toMatchObject([{ note, published: null }])
+    expect(storage.get).toHaveBeenCalledExactlyOnceWith(notePath('private', note.id))
+  })
+
   it('lists only the two current Notes roots without writing or deleting files', async () => {
     const { session, storage } = makeSession()
     await expect(listNotes(session)).resolves.toEqual([])
@@ -184,7 +200,7 @@ describe('loading and validating notes', () => {
   it('retains discoverability of public copies whose private original is missing', async () => {
     const note = fixture()
     const { session } = makeSession([[notePath('public', note.id), note]])
-    await expect(listNotes(session)).resolves.toEqual([{ note, published: note }])
+    await expect(listNotes(session)).resolves.toMatchObject([{ note, published: note }])
   })
 
   it('treats missing folders as empty but propagates permission and network failures', async () => {
@@ -255,7 +271,7 @@ describe('flat storage and private folder metadata', () => {
     expect(files.get(notePath('private', 'note-1'))?.folder).toBe('Secret/Project')
     expect(snapshot).toEqual(fixture())
     expect(files.get(notePath('public', 'note-1'))).toEqual(fixture())
-    await saveNote(session, { ...fixture(), folder: 'Other/Folder' })
+    await saveNote(session, editNote(files.get(notePath('private', 'note-1'))!, { folder: 'Other/Folder' }))
     expect(files.get(notePath('public', 'note-1'))).toEqual(fixture())
   })
 
@@ -263,10 +279,87 @@ describe('flat storage and private folder metadata', () => {
     const { session, storage } = makeSession()
     await saveNote(session, fixture())
     await saveNote(session, { ...fixture(), folder: '' })
-    expect(storage.putJson.mock.calls[1][1]).not.toHaveProperty('folder')
+    expect(JSON.parse(storage.putTextLocked.mock.calls[1][1])).not.toHaveProperty('folder')
     for (const folder of [null, 42, ['Work'], '../other', 'Work/../../other']) {
       await expect(saveNote(session, { ...fixture(), folder } as Note)).rejects.toThrow()
     }
-    expect(storage.putJson).toHaveBeenCalledTimes(2)
+    expect(storage.putTextLocked).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('locked CRDT synchronization', () => {
+  it('locks both paths in CLI order, merges remote edits, and acknowledges the actual stored state', async () => {
+    const base = initializeNote({ ...fixture(), content: 'First\nLast' })
+    const local = editNote(base, { content: 'First local\nLast' })
+    const remote = editNote(base, { content: 'First\nLast remote' })
+    const { session, storage, files } = makeSession([[notePath('private', base.id), remote]])
+    const saved = await saveNote(session, local)
+    expect(saved.content).toBe('First local\nLast remote')
+    expect(saved).toEqual(mergeNotes(local, remote))
+    expect(saved).toEqual(files.get(notePath('private', base.id)))
+    expect(storage.lock.mock.calls.map(([path]) => path)).toEqual([notePath('private', base.id), notePath('public', base.id)])
+    expect(storage.putJson).not.toHaveBeenCalled()
+    expect(storage.get.mock.calls.filter(([path]) => path === notePath('private', base.id))).toHaveLength(2)
+    expect(storage.unlock).toHaveBeenCalledTimes(2)
+  })
+
+  it('preserves both histories when legacy versions or independent note IDs collide', async () => {
+    const { session, storage, files } = makeSession([[notePath('private', 'note-1'), fixture()]])
+    await expect(saveNote(session, { ...fixture(), content: 'Different offline legacy version' })).rejects.toThrow('different editing histories')
+    expect(storage.putTextLocked).not.toHaveBeenCalled()
+    expect(files.get(notePath('private', 'note-1'))).toEqual(fixture())
+  })
+
+  it('fails closed when locks are unsupported or expire and releases acquired locks', async () => {
+    const { session, storage } = makeSession()
+    storage.lock.mockRejectedValueOnce({ data: { statusCode: 405 } })
+    await expect(saveNote(session, fixture())).rejects.toThrow('safe note locking')
+    expect(storage.putTextLocked).not.toHaveBeenCalled()
+    expect(storage.putJson).not.toHaveBeenCalled()
+    storage.refreshLock.mockRejectedValueOnce({ data: { statusCode: 412 } })
+    await expect(saveNote(session, fixture())).rejects.toThrow('retained for retry')
+    expect(storage.putTextLocked).not.toHaveBeenCalled()
+    expect(storage.unlock).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not acknowledge a write that the homeserver accepts but fails to retain', async () => {
+    const base = await ensureCrdt(fixture())
+    const { session, storage } = makeSession([[notePath('private', base.id), base]])
+    storage.putTextLocked.mockResolvedValueOnce(undefined)
+    await expect(saveNote(session, editNote(base, { content: 'Not actually retained' }))).rejects.toThrow('could not be verified')
+    expect(storage.unlock).toHaveBeenCalledTimes(2)
+  })
+
+  it('rejects a corrupted remote snapshot without writing over it', async () => {
+    const base = initializeNote(fixture())
+    const { session, storage } = makeSession([[notePath('private', base.id), { ...base, content: 'Corrupted' }]])
+    await expect(saveNote(session, base)).rejects.toThrow('does not match')
+    expect(storage.putTextLocked).not.toHaveBeenCalled()
+  })
+
+  it('publishes only reviewed text, never merged remote edits or any private history', async () => {
+    const base = initializeNote({ ...fixture(), content: 'First\nLast', folder: 'Private/Folder' })
+    const reviewed = editNote(base, { content: 'First reviewed\nLast' })
+    const remote = editNote(base, { content: 'First\nLast secret' })
+    const { session, files } = makeSession([[notePath('private', base.id), remote]])
+    const snapshot = await publishNote(session, reviewed)
+    expect(snapshot.content).toBe('First reviewed\nLast')
+    expect(Object.keys(snapshot).sort()).toEqual(['content', 'createdAt', 'id', 'title', 'updatedAt'])
+    expect(files.get(notePath('private', base.id))?.content).toBe('First reviewed\nLast secret')
+    expect(files.get(notePath('public', base.id))).toEqual(snapshot)
+  })
+
+  it('keeps deleted notes discoverable and concurrent edits recoverable without reviving them', async () => {
+    const base = initializeNote(fixture())
+    const { session } = makeSession([[notePath('private', base.id), base]])
+    const deleted = await deleteNote(session, base)
+    const saved = await saveNote(session, editNote(base, { content: 'Offline changes' }))
+    expect(saved).toMatchObject({ deleted: true, content: 'Offline changes' })
+    expect(noteRevision(saved)).not.toBe(noteRevision(deleted))
+    await expect(listNotes(session)).resolves.toEqual([{ note: saved, published: null }])
+    await expect(publishNote(session, saved)).rejects.toThrow('Restore')
+    const restored = await saveNote(session, editNote(saved, { deleted: false }))
+    expect(restored.deleted).toBeUndefined()
+    expect(restored.content).toBe('Offline changes')
   })
 })

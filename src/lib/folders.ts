@@ -21,10 +21,13 @@ export function normalizeFolder(input: string): string {
   return path
 }
 
-export function folderPaths(records: readonly { note: { folder?: string } }[]): string[] {
+export function folderPaths(
+  records: readonly { note: { folder?: string } }[],
+  explicitFolders: readonly string[] = [],
+): string[] {
   const paths = new Set<string>()
-  for (const { note } of records) {
-    const folder = normalizeFolder(note.folder ?? '')
+  for (const input of [...explicitFolders, ...records.map(({ note }) => note.folder ?? '')]) {
+    const folder = normalizeFolder(input)
     if (!folder) continue
     const segments = folder.split('/')
     for (let depth = 1; depth <= segments.length; depth++) paths.add(segments.slice(0, depth).join('/'))

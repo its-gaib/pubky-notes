@@ -41,6 +41,15 @@ describe('folder metadata', () => {
     expect(folderContains('', 'Work')).toBe(false)
   })
 
+  it('includes explicitly created empty folders and parents alongside note folders', () => {
+    expect(folderPaths([
+      { note: { folder: 'Work/Research' } }, { note: {} },
+    ], [' Empty / Nested ', 'Work', 'Work/Research'])).toEqual([
+      'Empty', 'Empty/Nested', 'Work', 'Work/Research',
+    ])
+    expect(() => folderPaths([], ['Invalid/../Folder'])).toThrow()
+  })
+
   it('rewrites only a matching subtree and supports moving it to root', () => {
     expect(renameFolderPath('Work/Research/Books', 'Work/Research', 'Personal/Reading')).toBe('Personal/Reading/Books')
     expect(renameFolderPath('Work', 'Work', '')).toBe('')

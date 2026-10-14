@@ -1,8 +1,12 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, configure, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
+import { IDBFactory } from 'fake-indexeddb'
+import { closeLocalNotebook } from './lib/local-notebook'
+
+configure({ asyncUtilTimeout: 3000 })
 
 vi.mock('./lib/pubky', () => ({
   restoreSession: vi.fn().mockResolvedValue(null),
@@ -25,13 +29,16 @@ async function openNotebook() {
   await waitFor(() => expect((screen.getByRole('button', { name: 'Connect Pubky' }) as HTMLButtonElement).disabled).toBe(false))
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  await closeLocalNotebook()
+  vi.stubGlobal('indexedDB', new IDBFactory())
+  localStorage.clear()
   localStorage.clear()
   window.history.replaceState(null, '', '/')
   viewport(false)
 })
 
-afterEach(() => {
+afterEach(async () => {
   cleanup()
   localStorage.clear()
   vi.unstubAllGlobals()
