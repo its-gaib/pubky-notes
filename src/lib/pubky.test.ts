@@ -1,12 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Session } from '@synonymdev/pubky'
-import { APP_CAPABILITIES, APP_CLIENT_ID, APP_PATHS, LEGACY_PATHS, IS_TESTNET } from '../config'
+import { APP_CAPABILITIES, APP_CLIENT_ID, APP_PATHS, IS_TESTNET } from '../config'
 
-const mocks = vi.hoisted(() => ({ save: vi.fn(), restore: vi.fn(), remove: vi.fn() }))
+const mocks = vi.hoisted(() => ({ save: vi.fn(), restore: vi.fn(), remove: vi.fn(), startGrantAuthFlow: vi.fn() }))
 vi.mock('@synonymdev/pubky', () => ({
   AuthFlowKind: { signin: () => ({}) },
   Pubky: class {
     browserSessionStore = mocks
+    startGrantAuthFlow = mocks.startGrantAuthFlow
     static testnet() { return new this() }
   },
 }))
@@ -146,36 +147,45 @@ describe('persisted grant lifecycle', () => {
 })
 
 
-describe('namespace authorization upgrade', () => {
-  it('requests only the four exact new and legacy roots', () => {
-    expect(APP_CAPABILITIES.split(',')).toEqual([
-      '/priv/notes/:rw', '/pub/notes/:rw', '/priv/notes.pubky.app/notes/:rw', '/pub/notes.pubky.app/notes/:rw',
-    ])
+describe('Notes authorization', () => {
+  it('identifies as pubky-notes and requests only its two storage roots in Ring', async () => {
+    const { startSignIn } = await import('./pubky')
+    const session = makeSession()
+    mocks.startGrantAuthFlow.mockResolvedValue({
+      authorizationUrl: 'pubkyauth://signin_grant',
+      awaitApproval: vi.fn().mockResolvedValue(session),
+      free: vi.fn(),
+    })
+    const flow = await startSignIn()
+    await expect(flow.awaitApproval).resolves.toBe(session)
+    expect(mocks.startGrantAuthFlow).toHaveBeenCalledExactlyOnceWith(
+      '/priv/notes/:rw,/pub/notes/:rw', {}, expect.objectContaining({ clientId: 'pubky-notes' }),
+    )
   })
 
-  it('forgets an old-only saved grant and reports that sign-in is required', async () => {
+  it('forgets a saved grant missing Notes access and reports that sign-in is required', async () => {
     const { restoreSession } = await import('./pubky')
-    const oldSession = makeSession()
-    Object.assign(oldSession.info, { capabilities: Object.values(LEGACY_PATHS).map(path => `${path}:rw`) })
-    localValues.set(SESSION_KEY, 'old-session')
-    mocks.restore.mockResolvedValue(oldSession)
+    const session = makeSession()
+    Object.assign(session.info, { capabilities: ['/pub/notes/:r'] })
+    localValues.set(SESSION_KEY, 'incomplete-session')
+    mocks.restore.mockResolvedValue(session)
     await expect(restoreSession()).rejects.toMatchObject({ name: 'NotesPermissionError', message: expect.stringContaining('Sign in again') })
     expect(localValues.has(SESSION_KEY)).toBe(false)
-    expect(mocks.remove).toHaveBeenCalledExactlyOnceWith('old-session')
+    expect(mocks.remove).toHaveBeenCalledExactlyOnceWith('incomplete-session')
   })
 
-  it('rejects a grant without legacy cleanup access before persisting it', async () => {
+  it('rejects read-only access before persisting a grant', async () => {
     const { persistSession } = await import('./pubky')
     const session = makeSession()
-    Object.assign(session.info, { capabilities: Object.values(APP_PATHS).map(path => `${path}:rw`) })
+    Object.assign(session.info, { capabilities: Object.values(APP_PATHS).map(path => `${path}:r`) })
     await expect(persistSession(session)).rejects.toMatchObject({ name: 'NotesPermissionError' })
     expect(mocks.save).not.toHaveBeenCalled()
   })
 
-  it('restores upgraded grants with all required scopes', async () => {
+  it('restores grants with access to only the two Notes roots', async () => {
     const { restoreSession } = await import('./pubky')
     const session = makeSession()
-    localValues.set(SESSION_KEY, 'upgraded')
+    localValues.set(SESSION_KEY, 'notes-session')
     mocks.restore.mockResolvedValue(session)
     await expect(restoreSession()).resolves.toBe(session)
     expect(mocks.remove).not.toHaveBeenCalled()

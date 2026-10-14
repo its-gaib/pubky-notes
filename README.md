@@ -22,13 +22,11 @@ For a separately running local testnet, copy `.env.example` to `.env.local`, set
 - Canonical notes: `/priv/notes/<id>.json`.
 - Explicit public snapshots: `/pub/notes/<id>.json`.
 - Records contain `id`, `title`, `content`, `createdAt`, and `updatedAt`. Nested folders exist only as optional private `folder` metadata, such as `Work/Ideas`; all files remain directly under their storage root. Public snapshots omit folder metadata. Moving a note between folders does not change its ID or public link.
-- During migration, the app requests read/write access to exactly four roots: `/priv/notes/`, `/pub/notes/`, `/priv/notes.pubky.app/notes/`, and `/pub/notes.pubky.app/notes/`. The stable authentication client ID remains `notes.pubky.app`; it no longer determines storage paths.
+- Pubky Ring shows the authentication client ID `pubky-notes`. The app requests read/write access to exactly two roots: `/priv/notes/` and `/pub/notes/`.
 - New notes and edits autosave to `/priv`. Publishing first saves the private draft, then writes a public snapshot. Later edits remain private until **Update public copy** is clicked.
 - A public link opens a read-only Markdown page without authentication. Public notes are publicly readable and discoverable, not secret links.
-- Unpublish removes public snapshots from both current and legacy roots. Deleting a note removes both public copies before its private copies; failures are reported. Unpublishing cannot retract copies already downloaded.
+- Unpublish removes the public snapshot. Deleting a note removes its public snapshot before its private draft; failures are reported. Unpublishing cannot retract copies already downloaded.
 - Pubky `/priv` restricts access but **is not end-to-end encrypted**. The homeserver operator can read it. See the [private storage contract](https://pubky.org/private-storage.md).
-
-Existing accounts must reconnect once to authorize the new paths. On connection, legacy private drafts and public snapshots migrate independently, so unpublished edits stay private. Migration locks both paths, verifies the destination before removing the source, and resumes safely after interruptions. Conflicting versions are preserved and reported rather than overwritten. Homeservers without storage-lock support retain the original files and report that migration requires an upgrade. Public links try the new path first and fall back to the legacy path only when the new file is missing.
 
 Authentication uses scoped Pubky Ring grant sessions. SDK-managed IndexedDB stores session credentials; localStorage contains the opaque session record ID and sidebar layout preferences. Note bodies are not cached in localStorage or IndexedDB. Markdown raw HTML is disabled; remote images render as text to avoid tracking readers.
 
@@ -54,7 +52,7 @@ Public links use `/?owner=<z32-public-key>&note=<note-id>`.
 
 ## Verification
 
-`npm test` exercises flat scoped paths, private folder metadata, global search, migration retries and conflicts, authorization upgrades, publishing and cleanup, untrusted data, pagination and bounded downloads. `npm run build` checks TypeScript and creates the production bundle. A live Ring approval and your homeserver are needed to verify an existing mainnet account end to end.
+`npm test` exercises flat scoped paths, private folder metadata, global search, scoped authorization, publishing and cleanup, untrusted data, pagination and bounded downloads. `npm run build` checks TypeScript and creates the production bundle. A live Ring approval and your homeserver are needed to verify a mainnet account end to end.
 
 The SDK version is pinned to 0.16.1. Some linked Pubky agent-skill references target earlier SDK versions; implementation follows installed types and the current template.
 

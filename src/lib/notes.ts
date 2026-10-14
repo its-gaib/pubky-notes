@@ -1,6 +1,6 @@
 import { PubkyResource, PublicKey } from '@synonymdev/pubky'
-import type { Address, Path, Session, StorageLock } from '@synonymdev/pubky'
-import { APP_PATHS, LEGACY_PATHS } from '../config'
+import type { Address, Path, Session } from '@synonymdev/pubky'
+import { APP_PATHS } from '../config'
 import { getPubky } from './pubky'
 import { normalizeFolder } from './folders'
 
@@ -24,7 +24,6 @@ const MAX_TITLE_LENGTH = 200
 const LIST_PAGE_SIZE = 100
 const MAX_NOTES = 2_000
 const DOWNLOAD_CONCURRENCY = 5
-const MIGRATION_LOCK_SECONDS = 60
 type StorageSpace = keyof typeof APP_PATHS
 
 export function createNote(): Note {
@@ -38,7 +37,6 @@ export function notePath(space: StorageSpace, id: string): Path {
 }
 
 export async function listNotes(session: Session): Promise<NoteRecord[]> {
-  await migrateLegacyNotes(session)
   const [privateNotes, publicNotes] = await Promise.all([
     readFolder(session, 'private'),
     readFolder(session, 'public'),
@@ -69,23 +67,15 @@ export async function publishNote(session: Session, note: Note): Promise<Note> {
 export async function unpublishNote(session: Session, id: string): Promise<void> {
   const privatePath = notePath('private', id)
   if (!await session.storage.exists(privatePath)) {
-    // A legacy private draft always takes precedence over a public snapshot.
-    const original = await readOptionalNote(session, legacyPath('private', id), id)
-      ?? await readOptionalNote(session, notePath('public', id), id)
-      ?? await readOptionalNote(session, legacyPath('public', id), id)
+    const original = await readOptionalNote(session, notePath('public', id), id)
     if (original) await saveNote(session, original)
   }
-  // Report success only once neither old nor new public copies remain.
   await deleteIfPresent(session, notePath('public', id))
-  await deleteIfPresent(session, legacyPath('public', id))
 }
 
 export async function deleteNote(session: Session, id: string): Promise<void> {
-  // Keep the original if either public deletion fails. Remove legacy private data
-  // before the current draft so a failed cleanup cannot resurrect a deleted note.
+  // Keep the private original if deleting the public snapshot fails.
   await deleteIfPresent(session, notePath('public', id))
-  await deleteIfPresent(session, legacyPath('public', id))
-  await deleteIfPresent(session, legacyPath('private', id))
   await deleteIfPresent(session, notePath('private', id))
 }
 
@@ -93,23 +83,12 @@ export async function loadPublicNote(owner: string, id: string): Promise<Note> {
   requireId(id)
   const publicKey = PublicKey.from(owner)
   try {
-    const read = async (folder: typeof APP_PATHS.public | typeof LEGACY_PATHS.public) => {
-      const address: Address = `pubky${publicKey.z32()}${folder}${id}.json`
-      const response = await getPubky().publicStorage.get(address)
-      return publicSnapshot(validateNote(await readBoundedJson(response), id))
-    }
-    try { return await read(APP_PATHS.public) } catch (error) {
-      if (!isMissing(error)) throw error
-      return await read(LEGACY_PATHS.public)
-    }
+    const address: Address = `pubky${publicKey.z32()}${APP_PATHS.public}${id}.json`
+    const response = await getPubky().publicStorage.get(address)
+    return publicSnapshot(validateNote(await readBoundedJson(response), id))
   } finally {
     publicKey.free()
   }
-}
-
-function legacyPath(space: StorageSpace, id: string): Path {
-  requireId(id)
-  return `${LEGACY_PATHS[space]}${id}.json`
 }
 
 function publicSnapshot(note: Note): Note {
@@ -122,63 +101,6 @@ async function readOptionalNote(session: Session, path: Path, id: string): Promi
     if (isMissing(error)) return null
     throw error
   }
-}
-
-async function migrateLegacyNotes(session: Session): Promise<void> {
-  for (const space of ['private', 'public'] as const) {
-    const ids = await listIds(session, LEGACY_PATHS[space])
-    // Migrate snapshots independently: a private draft must never become public.
-    for (const id of ids) await migrateLegacyNote(session, space, id)
-  }
-}
-
-async function migrateLegacyNote(session: Session, space: StorageSpace, id: string): Promise<void> {
-  const sourcePath = legacyPath(space, id)
-  const destinationPath = notePath(space, id)
-  const locks: StorageLock[] = []
-  try {
-    // Reserving both paths prevents another device from overwriting either copy
-    // between the comparison, write, verification, and source removal.
-    const sourceLock = await session.storage.lock(sourcePath, MIGRATION_LOCK_SECONDS)
-    locks.push(sourceLock)
-    const destinationLock = await session.storage.lock(destinationPath, MIGRATION_LOCK_SECONDS)
-    locks.push(destinationLock)
-    const original = await readOptionalNote(session, sourcePath, id)
-    if (!original) return
-    const copy = space === 'public' ? publicSnapshot(original) : original
-    const existing = await readOptionalNote(session, destinationPath, id)
-    if (existing && !sameNote(existing, copy)) {
-      const error = new Error(`Could not move “${original.title || id}”: different notes already exist at ${sourcePath} and ${destinationPath}. Both copies are preserved. Export or rename one copy before retrying.`)
-      error.name = 'NotesMigrationConflictError'
-      throw error
-    }
-    if (!existing) {
-      await session.storage.refreshLock(sourceLock, MIGRATION_LOCK_SECONDS)
-      await session.storage.putTextLocked(destinationLock, JSON.stringify(copy))
-    }
-    const verified = await readOptionalNote(session, destinationPath, id)
-    if (!verified || !sameNote(verified, copy)) {
-      throw new Error('The moved note could not be verified. Its original has been preserved; reconnect to retry.')
-    }
-    // Expired locks fail closed. Keep both copies if the move took too long.
-    await session.storage.refreshLock(destinationLock, MIGRATION_LOCK_SECONDS)
-    await session.storage.refreshLock(sourceLock, MIGRATION_LOCK_SECONDS)
-    await session.storage.deleteLocked(sourceLock)
-  } catch (error) {
-    if (hasStatus(error, 405)) {
-      throw new Error('Your homeserver needs storage lock support to safely move existing notes. The original files are preserved.')
-    }
-    throw error
-  } finally {
-    for (const lock of locks.reverse()) {
-      try { await session.storage.unlock(lock) } catch { /* Locks expire even if the network disconnects. */ }
-      lock.free()
-    }
-  }
-}
-
-function sameNote(left: Note, right: Note): boolean {
-  return JSON.stringify(left) === JSON.stringify(right)
 }
 
 async function readFolder(session: Session, space: StorageSpace): Promise<Note[]> {
