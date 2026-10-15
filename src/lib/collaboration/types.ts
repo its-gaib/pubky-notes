@@ -23,6 +23,8 @@ export type ConnectionState = 'connecting' | 'waiting' | 'approval' | 'connected
 export interface CollaborationStatus {
   state: ConnectionState
   relayAvailable: boolean
+  /** A failed connection attempt remains visible through automatic retries. */
+  issue?: 'direct-connection-failed' | 'connection-failed'
   peerFingerprint?: string
   /** Negotiated through authenticated SDP; absent for older app versions. */
   presenceSupported?: boolean

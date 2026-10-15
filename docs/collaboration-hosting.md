@@ -10,7 +10,7 @@ The first version requires overlapping online time to exchange edits. Each parti
 
 ## Current relay availability
 
-No managed TURN account or production coturn server has been provisioned by this change. With no server-side TURN configuration, `POST /api/collaboration-ice` returns STUN only and `relayAvailable: false`. Direct connections can work, but restrictive networks may fail to connect. The UI must not describe this configuration as having a working relay fallback.
+No managed TURN account or production coturn server has been provisioned by this change. The endpoint supports Cloudflare Realtime TURN and coturn, but neither is activated by deploying this code alone. With no server-side TURN configuration, `POST /api/collaboration-ice` returns STUN only and `relayAvailable: false`. Direct connections can work, but restrictive networks may fail to connect. The UI must not describe this configuration as having a working relay fallback.
 
 The current [OpenRelay instructions](https://www.metered.ca/tools/openrelay/) require a free account for browser credentials. Their same page still documents a public static-auth endpoint; on 2026-10-14, our forced-relay Chromium check gathered no relay candidates from it, and TCP connections to ports 80 and 443 timed out from this development machine. This does not establish global service availability, but it does not justify configuring it as a working fallback. The identical browser check succeeded through the local coturn fixture, selecting a relay-to-relay candidate pair and delivering a synthetic message.
 
@@ -51,10 +51,32 @@ X-Pubky-Notes-Collaboration: 1
 
 The response is `{ iceServers: RTCIceServer[], relayAvailable: boolean, expiresAt?: number }`. `expiresAt` is Unix time in **milliseconds**. Clients refresh credentials before constructing a new connection after expiration. The response is never cacheable. If no relay is configured, it contains only a public STUN address.
 
+### Managed Cloudflare TURN
+
+This option runs credential issuance on Vercel while Cloudflare carries the relayed traffic. Create a TURN key in your own Cloudflare account, following the [official credential instructions](https://developers.cloudflare.com/realtime/turn/generate-credentials/), and configure these **server-only Vercel environment variables**:
+
+| Variable | Value |
+| --- | --- |
+| `COLLABORATION_TURN_PROVIDER` | `cloudflare` |
+| `CLOUDFLARE_TURN_KEY_ID` | The Cloudflare TURN key ID |
+| `CLOUDFLARE_TURN_API_TOKEN` | The API token for that TURN key, not a browser credential |
+| `COLLABORATION_ALLOWED_ORIGINS` | `https://pubky-notes.vercel.app`, or exact comma-separated application origins without trailing slashes |
+| `UPSTASH_REDIS_REST_URL` | HTTPS REST URL for a shared Upstash Redis instance |
+| `UPSTASH_REDIS_REST_TOKEN` | Server-side Redis REST token with permission to execute the limiter script |
+
+Remove any `COLLABORATION_TURN_SECRET` and `COLLABORATION_TURN_URLS` values when selecting Cloudflare. Mixed or incomplete provider configurations fail closed. The provider selector must be explicit for Cloudflare. No account, key, Redis instance, or paid service is created automatically; these credentials and the shared quota store are still required to activate the fallback.
+
+After the origin and shared quota checks succeed, the endpoint calls Cloudflare's fixed HTTPS credential API with a ten-minute TTL. It rejects redirects, times out after five seconds, bounds the response to 16 KiB, and accepts only the documented Cloudflare STUN/TURN addresses and transports on ports 3478, 443, 80, and 5349. It returns only validated temporary ICE credentials, with expiry measured conservatively from the request start. Provider errors and long-term secrets are not returned to browsers. Custom Cloudflare TURN domains are not supported by this adapter.
+
+Redeploy after adding the variables, then verify the production endpoint returns `relayAvailable: true`. Finish activation by testing a real connection with `iceTransportPolicy: 'relay'` and confirming the selected candidate pair in `getStats()` uses a relay. A successful credential response alone does not prove traffic can traverse the relay.
+
+### Existing coturn server
+
 To use your coturn server, set these **server-only Vercel environment variables**:
 
 | Variable | Value |
 | --- | --- |
+| `COLLABORATION_TURN_PROVIDER` | `coturn`; optional for existing deployments using only the coturn variables |
 | `COLLABORATION_TURN_URLS` | Comma-separated `turn:turn.example.com:3478?transport=udp,turn:turn.example.com:3478?transport=tcp,turns:turn.example.com:5349?transport=tcp` |
 | `COLLABORATION_TURN_SECRET` | The same random shared secret configured in coturn; at least 32 characters |
 | `COLLABORATION_ALLOWED_ORIGINS` | Exact comma-separated application origins, with no trailing slash |
@@ -65,7 +87,7 @@ Never place these secrets in `VITE_*` variables. Configure the SPA rewrite to le
 
 The endpoint creates ten-minute [coturn REST credentials](https://github.com/coturn/coturn/wiki/turnserver#turn-rest-api) using a timestamped username and HMAC-SHA1, as specified by coturn. The browser receives only the temporary username/password. An exact Origin check and explicit request header reduce cross-site browser abuse. They are not proof of user identity, and non-browser callers can imitate them.
 
-One atomic [Redis REST EVAL](https://upstash.com/docs/redis/features/restapi) enforces a global limit of 1,000 issuances and a per-IP limit of 30 issuances per ten-minute window across all function instances. IP addresses are HMAC-hashed with a rotating window before becoming Redis keys. On Vercel, the endpoint uses the [platform-supplied client IP](https://vercel.com/docs/headers/request-headers); elsewhere it uses the socket address. Missing configuration, unknown client IPs, and rate-store failures do not issue TURN credentials. These limits bound issuance, not all possible bandwidth; coturn also needs allocation and bandwidth quotas.
+For either provider, one atomic [Redis REST EVAL](https://upstash.com/docs/redis/features/restapi) enforces a global limit of 1,000 issuances and a per-IP limit of 30 issuances per ten-minute window across all function instances, before generating credentials. IP addresses are HMAC-hashed with the selected provider's server-side secret and a rotating window before becoming Redis keys. On Vercel, the endpoint uses the [platform-supplied client IP](https://vercel.com/docs/headers/request-headers); elsewhere it uses the socket address. Missing configuration, unknown client IPs, and rate-store failures do not issue TURN credentials. These limits bound issuance, not all possible bandwidth; coturn also needs allocation and bandwidth quotas, and managed-provider usage should be monitored in its account.
 
 ## Optional self-hosted TURN
 
@@ -85,7 +107,7 @@ docker run --detach --restart unless-stopped --name pubky-notes-turn \
 
 Allow inbound UDP/TCP 3478, TCP 5349, and UDP 49160–49200 in the firewall. TURN over TLS on TCP 443 improves compatibility with restrictive networks when that port can be dedicated to coturn. If the server is behind one-to-one NAT, configure `external-ip=PUBLIC_IP/PRIVATE_INTERFACE_IP` and forward the same ports. Restrict peer destinations to exclude internal networks and cloud metadata endpoints. The example denies private, loopback, link-local, CGNAT, and multicast ranges and sets allocation/bandwidth limits. Add any other internal networks routed from your host. Do not enable loopback peers in production. `no-tcp-relay` disables TCP **peer** allocations; browser connections to the TURN server over TCP/TLS remain available. [Coturn configuration reference](https://github.com/coturn/coturn/blob/master/examples/etc/turnserver.conf), [official Docker instructions](https://github.com/coturn/coturn/blob/master/docker/coturn/README.md).
 
-Managed TURN avoids operating this server. [Cloudflare Realtime TURN](https://developers.cloudflare.com/realtime/turn/generate-credentials/) requires an account and a server-side key, and uses its own credential-generation API rather than coturn's local HMAC secret. Supporting it would require a separate adapter. Its [published pricing](https://developers.cloudflare.com/realtime/sfu/platform/pricing/) on 2026-10-14 is 1,000 GB/month shared with SFU free, then $0.05/GB of egress. Metered also provides account-based managed TURN. Neither is silently configured here.
+The managed Cloudflare option above avoids operating a TURN server. Check the provider's [current pricing](https://developers.cloudflare.com/realtime/sfu/platform/pricing/) and account usage before activation. Neither a managed account nor self-hosted infrastructure is silently configured here.
 
 ## Local relay verification
 

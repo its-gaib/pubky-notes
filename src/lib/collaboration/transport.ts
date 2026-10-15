@@ -45,6 +45,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
   let presenceSupported = false
   let pending: Signal | undefined
   let state: CollaborationStatus['state'] = 'connecting'
+  let issue: CollaborationStatus['issue']
   let relayAvailable = false
   let configuration: RTCConfiguration = { iceServers: STUN, ...options.rtcConfiguration }
   let iceExpiresAt = 0
@@ -68,7 +69,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
 
   function status(next: CollaborationStatus['state']) {
     state = next
-    if (!disposed) callbacks.onStatus({ state, relayAvailable, presenceSupported, ...(peerFingerprint ? { peerFingerprint } : {}) })
+    if (!disposed) callbacks.onStatus({ state, relayAvailable, presenceSupported, ...(issue ? { issue } : {}), ...(peerFingerprint ? { peerFingerprint } : {}) })
   }
 
   function report(error: unknown) {
@@ -133,6 +134,12 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
     }, 1_500)
   }
 
+  function failedConnection() {
+    if (disposed) return
+    issue = relayAvailable ? 'connection-failed' : 'direct-connection-failed'
+    retryPeer()
+  }
+
   async function publish(kind: SignalKind, to: string, targetSession: string, payload = '') {
     const currentSocket = socket, session = localSession
     if (disposed || currentSocket?.readyState !== WebSocket.OPEN) throw new Error('Signaling is disconnected')
@@ -158,6 +165,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
     if (disposed || peer !== connection || channel !== next || next.readyState !== 'open') return
     clearTimeout(connectionTimeout)
     clearTimeout(peerRetryTimer)
+    issue = undefined
     if (state !== 'connected') status('connected')
   }
 
@@ -209,7 +217,8 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
     connection.ondatachannel = event => attachChannel(event.channel, connection)
     connection.onconnectionstatechange = () => {
       if (disposed || peer !== connection) return
-      if (connection.connectionState === 'failed' || connection.connectionState === 'closed') retryPeer()
+      if (connection.connectionState === 'failed') failedConnection()
+      else if (connection.connectionState === 'closed') retryPeer()
       else if (connection.connectionState === 'disconnected') {
         status('disconnected')
         clearTimeout(peerRetryTimer)
@@ -218,7 +227,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
         markConnected(channel, connection)
       }
     }
-    connectionTimeout = setTimeout(() => { if (peer === connection) retryPeer() }, 25_000)
+    connectionTimeout = setTimeout(() => { if (peer === connection) failedConnection() }, 25_000)
     status('connecting')
     return connection
   }
@@ -358,6 +367,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
   function reconnect() {
     if (disposed) return
     denied = false
+    issue = undefined
     retryPeer()
     if (!socket || socket.readyState === WebSocket.CLOSED) {
       clearTimeout(reconnectTimer)

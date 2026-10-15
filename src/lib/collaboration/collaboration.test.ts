@@ -238,16 +238,17 @@ describe('transport admission and lifetime', () => {
   const active: ReturnType<typeof startCollaboration>[] = []
   afterEach(() => {
     active.splice(0).forEach(transport => transport.dispose())
+    vi.useRealTimers()
     vi.unstubAllGlobals()
   })
 
-  function start(room: StoredRoom) {
+  function start(room: StoredRoom, iceServers: RTCIceServer[] = []) {
     vi.stubGlobal('WebSocket', FakeSocket)
     vi.stubGlobal('RTCPeerConnection', FakePeer)
     FakeSocket.instances = []
     FakePeer.instances = []
     const callbacks: CollaborationCallbacks = { onStatus: vi.fn(), onRequest: vi.fn(), onMessage: vi.fn(), onError: vi.fn() }
-    const transport = startCollaboration(room, callbacks, { signalingUrl: 'ws://127.0.0.1:4444', iceEndpoint: null, rtcConfiguration: { iceServers: [] } })
+    const transport = startCollaboration(room, callbacks, { signalingUrl: 'ws://127.0.0.1:4444', iceEndpoint: null, rtcConfiguration: { iceServers } })
     active.push(transport)
     return { transport, callbacks }
   }
@@ -289,6 +290,50 @@ describe('transport admission and lifetime', () => {
     expect(FakePeer.instances).toHaveLength(0)
     const reply = JSON.parse(ws.sent.find(packet => JSON.parse(packet).type === 'publish')!).data
     expect(await openSignal(reply, outsider, new ReplayGuard())).toMatchObject({ kind: 'reject' })
+  })
+
+  it.each([false, true])('keeps a failed connection explanation through automatic retries and clears it on success (relay=%s)', async relay => {
+    const { host, guest } = await pair()
+    const { transport, callbacks } = start(host, relay ? [{ urls: 'turn:relay.example:3478', username: 'test', credential: 'test' }] : [])
+    const ws = await socket()
+    ws.receive(await sealSignal(guest, helloFields(host)), host.room)
+    await vi.waitFor(() => expect(callbacks.onRequest).toHaveBeenCalledOnce())
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    await transport.approve(guest.identity.publicKey)
+    const first = FakePeer.instances[0]
+    first.connectionState = 'failed'
+    first.onconnectionstatechange!()
+    const issue = relay ? 'connection-failed' : 'direct-connection-failed'
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'disconnected', issue, relayAvailable: relay }))
+    await vi.advanceTimersByTimeAsync(1500)
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'waiting', issue }))
+    ws.receive(await sealSignal(guest, helloFields(host)), host.room)
+    await vi.waitFor(() => expect(FakePeer.instances).toHaveLength(2))
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'connecting', issue }))
+    FakePeer.instances[1].channel!.open()
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'connected' }))
+    expect(vi.mocked(callbacks.onStatus).mock.lastCall![0]).not.toHaveProperty('issue')
+    // Closing the obsolete connection cannot put its failure back into the UI.
+    first.onconnectionstatechange!()
+    expect(vi.mocked(callbacks.onStatus).mock.lastCall![0]).not.toHaveProperty('issue')
+  })
+
+  it('reports a timed-out direct connection and clears its explanation on an explicit retry', async () => {
+    const { host, guest } = await pair()
+    const { transport, callbacks } = start(host)
+    const ws = await socket()
+    ws.receive(await sealSignal(guest, helloFields(host)), host.room)
+    await vi.waitFor(() => expect(callbacks.onRequest).toHaveBeenCalledOnce())
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    await transport.approve(guest.identity.publicKey)
+    await vi.advanceTimersByTimeAsync(24_999)
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'connecting' }))
+    expect(vi.mocked(callbacks.onStatus).mock.lastCall![0]).not.toHaveProperty('issue')
+    await vi.advanceTimersByTimeAsync(1)
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'disconnected', issue: 'direct-connection-failed' }))
+    transport.reconnect()
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'disconnected' }))
+    expect(vi.mocked(callbacks.onStatus).mock.lastCall![0]).not.toHaveProperty('issue')
   })
 
   it('automatically reconnects the durable admitted identity without another approval', async () => {

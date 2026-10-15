@@ -307,11 +307,17 @@ export function useCollaboration(options: Options) {
     if (connection && view.request && current(connection)) connection.transport?.reject(view.request.peerId)
     setView(previous => ({ ...previous, request: undefined }))
   }
+  function reconnect() {
+    const connection = live.current
+    if (!connection || !current(connection)) return
+    setView(previous => ({ ...previous, error: undefined }))
+    connection.transport?.reconnect()
+  }
   const updateSelection = useCallback((noteId: string, selection: EditorSelection | null) => {
     const connection = live.current
     if (!connection || !current(connection) || connection.room.descriptor.id !== noteId || latest.current.activeId !== noteId) return
     connection.presence?.update(selection)
   }, [current])
   return { view, invitation, start, join, edit, approve, reject, stop, updateSelection, remoteSelection,
-    dismissInvitation: () => setInvitation(null), reconnect: () => live.current?.transport?.reconnect() }
+    dismissInvitation: () => setInvitation(null), reconnect }
 }

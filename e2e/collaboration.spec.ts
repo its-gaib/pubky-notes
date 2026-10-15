@@ -119,15 +119,22 @@ async function share(alice: Page, bob: Page) {
   await alice.getByRole('textbox', { name: 'Markdown content' }).fill('DELETED PRIVATE TEXT MUST NOT BE SHARED')
   await alice.getByRole('textbox', { name: 'Markdown content' }).fill(BODY)
   await alice.getByRole('button', { name: 'Collaborate', exact: true }).click()
+  await expect(alice.getByRole('region', { name: 'Collaboration', exact: true })).toBeVisible()
+  await expect(alice.getByRole('dialog')).toHaveCount(0)
   await alice.getByRole('button', { name: 'Create shared copy' }).click()
   const invitation = alice.getByRole('textbox', { name: 'Invitation link' })
   await expect(invitation).toBeVisible()
   const link = await invitation.inputValue()
   const encoded = new URL(link).hash.slice('#collaborate='.length)
   const id = JSON.parse(Buffer.from(decodeURIComponent(encoded), 'base64url').toString()).descriptor.id as string
+  await alice.getByRole('textbox', { name: 'Markdown content' }).focus()
   await bob.goto(link)
+  await expect(bob.getByRole('region', { name: 'Collaboration', exact: true })).toBeVisible()
+  await expect(bob.getByRole('dialog')).toHaveCount(0)
   await bob.getByRole('button', { name: 'Join collaboration', exact: true }).click()
   await expect(alice.getByRole('button', { name: 'Allow collaborator' })).toBeVisible()
+  await expect(alice.getByRole('textbox', { name: 'Markdown content' })).toBeFocused()
+  await expect(alice.getByRole('dialog')).toHaveCount(0)
   // Approval is an actual authorization boundary: no document or peer channel yet.
   expect(await notes(bob)).toEqual([])
   await expect(bob.getByRole('textbox', { name: 'Markdown content' })).toHaveCount(0)
@@ -136,7 +143,8 @@ async function share(alice: Page, bob: Page) {
   await alice.getByRole('button', { name: 'Allow collaborator' }).click()
   await Promise.all([connected(alice), connected(bob)])
   await Promise.all([alice, bob].map(async page => {
-    await page.getByRole('button', { name: 'Done', exact: true }).click()
+    await expect(page.getByRole('region', { name: 'Collaboration', exact: true })).toHaveCount(0)
+    await expect(page.getByRole('dialog')).toHaveCount(0)
     try { await expect(page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(BODY) }
     catch (error) {
       const diagnostics = await page.evaluate(async () => {

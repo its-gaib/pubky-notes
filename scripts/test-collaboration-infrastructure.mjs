@@ -220,3 +220,180 @@ test('TURN rate limits use Vercel-provided IP only on Vercel and ignore arbitrar
   assert.equal((await requestIce({ env: { ...configuredEnv, VERCEL: '1' } }, { headers })).status, 200)
   assert.equal((await requestIce({}, { headers, socket: {} })).status, 503)
 })
+
+const cloudflareEnv = {
+  COLLABORATION_TURN_PROVIDER: 'cloudflare',
+  CLOUDFLARE_TURN_KEY_ID: 'unit-test-turn-key',
+  CLOUDFLARE_TURN_API_TOKEN: 'unit-test-cloudflare-token-not-a-real-credential',
+  COLLABORATION_ALLOWED_ORIGINS: ORIGIN,
+  UPSTASH_REDIS_REST_URL: configuredEnv.UPSTASH_REDIS_REST_URL,
+  UPSTASH_REDIS_REST_TOKEN: configuredEnv.UPSTASH_REDIS_REST_TOKEN,
+}
+const cloudflareServers = [
+  { urls: ['stun:stun.cloudflare.com:3478'] },
+  {
+    urls: [
+      'turn:turn.cloudflare.com:3478?transport=udp',
+      'turn:turn.cloudflare.com:443?transport=udp',
+      'turn:turn.cloudflare.com:3478?transport=tcp',
+      'turn:turn.cloudflare.com:80?transport=tcp',
+      'turns:turn.cloudflare.com:5349?transport=tcp',
+      'turns:turn.cloudflare.com:443?transport=tcp',
+    ],
+    username: 'temporary-user',
+    credential: 'temporary-password',
+  },
+]
+const cloudflareResponse = (body = { iceServers: cloudflareServers }, options = {}) => new Response(JSON.stringify(body), { status: 201, headers: { 'content-type': 'application/json' }, ...options })
+const withCloudflareResponse = (response) => async (url) => url === `${cloudflareEnv.UPSTASH_REDIS_REST_URL}/`
+  ? { ok: true, json: async () => ({ result: 1 }) }
+  : response()
+
+test('managed TURN issues bounded temporary credentials only after the shared quota succeeds', async () => {
+  let clock = 1_700_000_000_000
+  const calls = []
+  const result = await requestIce({ env: cloudflareEnv, now: () => clock, fetchImpl: async (url, options) => {
+    calls.push(url)
+    assert.equal(options.redirect, 'error')
+    assert.equal(options.method, 'POST')
+    assert.equal(options.headers['Content-Type'], 'application/json')
+    assert.ok(options.signal)
+    if (calls.length === 1) {
+      assert.equal(url, `${cloudflareEnv.UPSTASH_REDIS_REST_URL}/`)
+      assert.equal(options.headers.Authorization, `Bearer ${cloudflareEnv.UPSTASH_REDIS_REST_TOKEN}`)
+      const command = JSON.parse(options.body)
+      const window = Math.floor(clock / 600_000)
+      const client = createHmac('sha256', cloudflareEnv.CLOUDFLARE_TURN_API_TOKEN).update(`${window}:198.51.100.23`).digest('hex')
+      assert.equal(command[4], `pubky-notes:turn:client:${client}`)
+      assert.equal(JSON.stringify(command).includes('198.51.100.23'), false)
+      return { ok: true, json: async () => ({ result: 1 }) }
+    }
+    assert.equal(url, 'https://rtc.live.cloudflare.com/v1/turn/keys/unit-test-turn-key/credentials/generate-ice-servers')
+    assert.equal(options.headers.Authorization, `Bearer ${cloudflareEnv.CLOUDFLARE_TURN_API_TOKEN}`)
+    assert.deepEqual(JSON.parse(options.body), { ttl: 600 })
+    clock += 4000
+    return cloudflareResponse({ iceServers: cloudflareServers.map((server) => ({ ...server, debug: cloudflareEnv.CLOUDFLARE_TURN_API_TOKEN })), debug: cloudflareEnv.UPSTASH_REDIS_REST_TOKEN })
+  } })
+  assert.equal(calls.length, 2)
+  assert.equal(result.status, 200)
+  assert.equal(result.body.relayAvailable, true)
+  assert.equal(result.body.expiresAt, 1_700_000_600_000)
+  assert.deepEqual(result.body.iceServers.slice(1), cloudflareServers)
+  assert.match(result.headers['Cache-Control'], /no-store/)
+  assert.equal(JSON.stringify(result.body).includes(cloudflareEnv.CLOUDFLARE_TURN_API_TOKEN), false)
+  assert.equal(JSON.stringify(result.body).includes(cloudflareEnv.UPSTASH_REDIS_REST_TOKEN), false)
+})
+
+test('managed TURN rejects mixed, incomplete, and unsafe provider configuration before any network request', async () => {
+  for (const env of [
+    { ...cloudflareEnv, COLLABORATION_TURN_PROVIDER: undefined },
+    { ...cloudflareEnv, COLLABORATION_TURN_PROVIDER: 'unknown' },
+    { ...cloudflareEnv, COLLABORATION_TURN_PROVIDER: 'coturn' },
+    { ...cloudflareEnv, CLOUDFLARE_TURN_KEY_ID: '' },
+    { ...cloudflareEnv, CLOUDFLARE_TURN_KEY_ID: '../different-path' },
+    { ...cloudflareEnv, CLOUDFLARE_TURN_KEY_ID: 'key?query=1' },
+    { ...cloudflareEnv, CLOUDFLARE_TURN_API_TOKEN: '' },
+    { ...cloudflareEnv, CLOUDFLARE_TURN_API_TOKEN: 'short' },
+    { ...cloudflareEnv, CLOUDFLARE_TURN_API_TOKEN: `${cloudflareEnv.CLOUDFLARE_TURN_API_TOKEN}\n` },
+    { ...cloudflareEnv, COLLABORATION_TURN_SECRET: configuredEnv.COLLABORATION_TURN_SECRET },
+    { ...cloudflareEnv, COLLABORATION_TURN_URLS: configuredEnv.COLLABORATION_TURN_URLS },
+    { ...cloudflareEnv, UPSTASH_REDIS_REST_TOKEN: '' },
+    { ...cloudflareEnv, COLLABORATION_ALLOWED_ORIGINS: '' },
+  ]) {
+    const result = await requestIce({ env, fetchImpl: () => assert.fail('Invalid config reached a provider') })
+    assert.equal(result.status, 503)
+    assert.equal(result.body.relayAvailable, false)
+  }
+  const coturn = await requestIce({ env: { ...configuredEnv, COLLABORATION_TURN_PROVIDER: 'coturn' } })
+  assert.equal(coturn.status, 200)
+  assert.equal(coturn.body.relayAvailable, true)
+})
+
+test('managed TURN admission and quota failures never request provider credentials', async () => {
+  const neverFetch = () => assert.fail('Rejected request reached a provider')
+  const rejected = await requestIce({ env: cloudflareEnv, fetchImpl: neverFetch }, { headers: { origin: 'https://attacker.example', 'content-type': 'application/json', 'x-pubky-notes-collaboration': '1' } })
+  assert.equal(rejected.status, 403)
+  assert.equal((await requestIce({ env: cloudflareEnv, fetchImpl: neverFetch }, { socket: {} })).status, 503)
+  for (const [quota, status] of [[0, 429], [undefined, 503]]) {
+    let calls = 0
+    const result = await requestIce({ env: cloudflareEnv, fetchImpl: async (url) => {
+      assert.equal(++calls, 1)
+      assert.equal(url, `${cloudflareEnv.UPSTASH_REDIS_REST_URL}/`)
+      return { ok: true, json: async () => ({ result: quota }) }
+    } })
+    assert.equal(result.status, status)
+    assert.equal(calls, 1)
+    assert.equal(result.body.expiresAt, undefined)
+    assert.equal(result.body.iceServers?.some((server) => server.credential) ?? false, false)
+  }
+})
+
+test('managed TURN rejects malformed responses, unknown destinations, and oversized credential payloads', async () => {
+  const relay = cloudflareServers[1]
+  for (const body of [
+    null,
+    {},
+    { iceServers: [] },
+    { iceServers: Array(9).fill(relay) },
+    { iceServers: [null] },
+    { iceServers: [cloudflareServers[0]] },
+    { iceServers: [{ ...relay, urls: [] }] },
+    { iceServers: [{ ...relay, urls: Array(17).fill(relay.urls[0]) }] },
+    { iceServers: [{ ...relay, urls: ['turn:127.0.0.1:3478?transport=udp'] }] },
+    { iceServers: [{ ...relay, urls: ['turn:turn.cloudflare.com.attacker.example:3478?transport=udp'] }] },
+    { iceServers: [{ ...relay, urls: ['turn:turn.cloudflare.com:53?transport=udp'] }] },
+    { iceServers: [{ ...relay, urls: ['turns:turn.cloudflare.com:443?transport=udp'] }] },
+    { iceServers: [{ ...relay, urls: [`${relay.urls[0]}&extra=1`] }] },
+    { iceServers: [{ ...relay, urls: [...relay.urls, cloudflareServers[0].urls[0]] }] },
+    { iceServers: [{ ...cloudflareServers[0], username: 'unexpected' }, relay] },
+    { iceServers: [{ ...relay, username: '' }] },
+    { iceServers: [{ ...relay, username: 'x'.repeat(1025) }] },
+    { iceServers: [{ ...relay, credential: 'x'.repeat(2049) }] },
+    { iceServers: [{ ...relay, credential: {} }] },
+    { iceServers: [{ ...relay, credential: 'line\nbreak' }] },
+    { iceServers: [{ ...relay, credential: cloudflareEnv.CLOUDFLARE_TURN_API_TOKEN }] },
+    { iceServers: [{ ...relay, username: cloudflareEnv.UPSTASH_REDIS_REST_TOKEN }] },
+  ]) {
+    const result = await requestIce({ env: cloudflareEnv, fetchImpl: withCloudflareResponse(() => cloudflareResponse(body)) })
+    assert.equal(result.status, 503)
+    assert.deepEqual(result.body, { error: 'Relay temporarily unavailable', iceServers: [{ urls: 'stun:stun.l.google.com:19302' }], relayAvailable: false })
+  }
+  for (const response of [
+    () => cloudflareResponse({ error: cloudflareEnv.CLOUDFLARE_TURN_API_TOKEN }, { status: 403 }),
+    () => cloudflareResponse(undefined, { status: 302, headers: { location: 'https://attacker.example' } }),
+    () => new Response('{', { status: 201, headers: { 'content-type': 'application/json' } }),
+    () => cloudflareResponse(undefined, { headers: { 'content-type': 'text/html' } }),
+    () => cloudflareResponse(undefined, { headers: { 'content-type': 'application/json', 'content-length': '16385' } }),
+    () => cloudflareResponse({ iceServers: cloudflareServers, oversized: 'x'.repeat(16385) }),
+    () => new Response(new ReadableStream({ start(controller) {
+      controller.enqueue(new TextEncoder().encode('{"oversized":"'))
+      controller.enqueue(new Uint8Array(16385))
+      controller.close()
+    } }), { status: 201, headers: { 'content-type': 'application/json' } }),
+    () => { throw new Error(`upstream secret ${cloudflareEnv.CLOUDFLARE_TURN_API_TOKEN}`) },
+  ]) {
+    const result = await requestIce({ env: cloudflareEnv, fetchImpl: withCloudflareResponse(response) })
+    assert.equal(result.status, 503)
+    assert.equal(result.body.relayAvailable, false)
+    assert.equal(result.body.expiresAt, undefined)
+    assert.equal(JSON.stringify(result.body).includes(cloudflareEnv.CLOUDFLARE_TURN_API_TOKEN), false)
+  }
+})
+
+test('managed TURN request aborts on its fixed deadline and returns no provider diagnostics', async (t) => {
+  const deadlines = []
+  t.mock.method(AbortSignal, 'timeout', (duration) => {
+    deadlines.push(duration)
+    const controller = new AbortController()
+    if (duration === 5000) queueMicrotask(() => controller.abort(new DOMException('Upstream timed out', 'TimeoutError')))
+    return controller.signal
+  })
+  const result = await requestIce({ env: cloudflareEnv, fetchImpl: async (url, options) => {
+    if (url === `${cloudflareEnv.UPSTASH_REDIS_REST_URL}/`) return { ok: true, json: async () => ({ result: 1 }) }
+    return new Promise((_resolve, reject) => options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true }))
+  } })
+  assert.deepEqual(deadlines, [3000, 5000])
+  assert.equal(result.status, 503)
+  assert.equal(result.body.relayAvailable, false)
+  assert.equal(JSON.stringify(result.body).includes('Upstream'), false)
+})

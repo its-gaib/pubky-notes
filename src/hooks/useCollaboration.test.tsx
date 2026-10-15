@@ -9,7 +9,7 @@ import type { CollaborationCallbacks, StoredRoom } from '../lib/collaboration'
 import { decodePresence } from '../lib/collaboration/presence'
 import type { CrdtNote } from '../lib/crdt'
 
-const mocks = vi.hoisted(() => ({ start: vi.fn(), load: vi.fn(), create: vi.fn(), send: vi.fn(), dispose: vi.fn() }))
+const mocks = vi.hoisted(() => ({ start: vi.fn(), load: vi.fn(), create: vi.fn(), send: vi.fn(), dispose: vi.fn(), reconnect: vi.fn() }))
 vi.mock('../lib/collaboration', () => ({
   startCollaboration: mocks.start, loadRoom: mocks.load, createHostRoom: mocks.create,
   fingerprint: async () => 'OWN FINGERPRINT', invitationUrl: () => 'https://example.com/#collaborate=test',
@@ -21,9 +21,10 @@ beforeEach(() => {
   vi.useFakeTimers(); vi.stubGlobal('crypto', webcrypto)
   mocks.send.mockReset().mockResolvedValue(undefined)
   mocks.dispose.mockReset(); mocks.load.mockReset().mockResolvedValue(null)
+  mocks.reconnect.mockReset()
   mocks.start.mockReset().mockImplementation((_room: StoredRoom, next: CollaborationCallbacks) => {
     callbacks = next
-    return { send: mocks.send, dispose: mocks.dispose, approve: vi.fn(), reject: vi.fn(), reconnect: vi.fn() }
+    return { send: mocks.send, dispose: mocks.dispose, approve: vi.fn(), reject: vi.fn(), reconnect: mocks.reconnect }
   })
 })
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
@@ -53,6 +54,19 @@ async function setup(presenceSupported = true, remapNotes = false) {
 }
 
 describe('collaboration cursor hook', () => {
+  it('clears a stale connection error on manual retry without restarting a stopped room', async () => {
+    const { result, peer } = await setup()
+    act(() => { callbacks.onError(new Error('Signaling is disconnected')) })
+    expect(result.current.view.error).toBe('Signaling is disconnected')
+    act(() => { result.current.reconnect() })
+    expect(result.current.view.error).toBeUndefined()
+    expect(mocks.reconnect).toHaveBeenCalledOnce()
+    act(() => { result.current.stop() })
+    act(() => { result.current.reconnect() })
+    expect(mocks.reconnect).toHaveBeenCalledOnce()
+    peer.destroy()
+  })
+
   it('keeps an unseen peer edit when a local input is based on the previous rendered note', async () => {
     const { result, peer, shared } = await setup()
     // The live Yjs document receives Bob's suffix before React commits that
