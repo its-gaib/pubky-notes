@@ -50,11 +50,21 @@ function readConfiguration(env) {
   if (!origins.length || origins.some((origin) => {
     try { const url = new URL(origin); return url.origin !== origin || (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname))) } catch { return true }
   })) throw new Error('Invalid allowed origins')
-  const redisUrl = new URL(env.UPSTASH_REDIS_REST_URL ?? '')
-  if (redisUrl.protocol !== 'https:' || !redisUrl.hostname.endsWith('.upstash.io') || redisUrl.username || redisUrl.password || redisUrl.search || redisUrl.hash || redisUrl.pathname !== '/') throw new Error('Invalid rate-limit store')
-  const redisToken = env.UPSTASH_REDIS_REST_TOKEN
-  if (!redisToken) throw new Error('Missing rate-limit store')
-  return { provider, ...relay, origins: new Set(origins), redisUrl: redisUrl.href, redisToken }
+  const rateLimit = env.COLLABORATION_TURN_RATE_LIMIT ?? 'redis'
+  let limiter
+  if (rateLimit === 'vercel') {
+    // This deployment mode requires a verified project WAF rule before activation.
+    // Never infer it from hosting alone or fall back to it after a Redis failure.
+    if (env.VERCEL !== '1' || env.UPSTASH_REDIS_REST_URL !== undefined || env.UPSTASH_REDIS_REST_TOKEN !== undefined) throw new Error('Invalid platform rate-limit configuration')
+    limiter = { rateLimit }
+  } else if (rateLimit === 'redis') {
+    const redisUrl = new URL(env.UPSTASH_REDIS_REST_URL ?? '')
+    if (redisUrl.protocol !== 'https:' || !redisUrl.hostname.endsWith('.upstash.io') || redisUrl.username || redisUrl.password || redisUrl.search || redisUrl.hash || redisUrl.pathname !== '/') throw new Error('Invalid rate-limit store')
+    const redisToken = env.UPSTASH_REDIS_REST_TOKEN
+    if (!redisToken) throw new Error('Missing rate-limit store')
+    limiter = { rateLimit, redisUrl: redisUrl.href, redisToken }
+  } else throw new Error('Invalid rate-limit mode')
+  return { provider, ...relay, origins: new Set(origins), ...limiter }
 }
 
 async function readProviderResponse(response) {
@@ -94,7 +104,8 @@ function cloudflareIceServers(value, config) {
       return { urls }
     }
     const { username, credential } = server
-    if (!visibleAscii(username, 1, 1024) || !visibleAscii(credential, 1, 2048) || [config.apiToken, config.redisToken].some((secret) => username.includes(secret) || credential.includes(secret))) throw new Error('Invalid managed relay credentials')
+    const secrets = [config.apiToken, config.redisToken].filter((secret) => typeof secret === 'string' && secret.length > 0)
+    if (!visibleAscii(username, 1, 1024) || !visibleAscii(credential, 1, 2048) || secrets.some((secret) => username.includes(secret) || credential.includes(secret))) throw new Error('Invalid managed relay credentials')
     hasTurn = true
     // Copy only WebRTC credentials; never forward arbitrary provider fields or errors.
     return { urls, username, credential }
@@ -103,7 +114,7 @@ function cloudflareIceServers(value, config) {
   return servers
 }
 
-/** Origin checks limit browser abuse; shared quotas, not Origin headers, bound anonymous credential issuance. */
+/** Origin checks limit browser abuse; the configured limiter bounds anonymous credential issuance. */
 export function createIceHandler({ env = process.env, fetchImpl = fetch, now = Date.now, nonce = () => randomBytes(12).toString('hex') } = {}) {
   return async function collaborationIce(req, res) {
     res.setHeader('Cache-Control', 'no-store, max-age=0')
@@ -119,28 +130,32 @@ export function createIceHandler({ env = process.env, fetchImpl = fetch, now = D
     let config
     try { config = readConfiguration(env) } catch { return send(503, { error: 'Relay configuration unavailable', iceServers: STUN, relayAvailable: false }) }
     if (!config) return send(200, { iceServers: STUN, relayAvailable: false })
+    // Match the WAF-protected route exactly, without decoding alternate paths.
+    if (config.rateLimit === 'vercel' && req.url !== '/api/collaboration-ice') return send(404, { error: 'Invalid relay endpoint' })
     if (!config.origins.has(req.headers.origin)) return send(403, { error: 'Origin not allowed' })
     // Vercel overwrites this header. Other hosts must use the socket address, never arbitrary X-Forwarded-For.
     const ip = env.VERCEL === '1' ? req.headers['x-vercel-forwarded-for'] : req.socket?.remoteAddress
     if (typeof ip !== 'string' || !isIP(ip)) return send(503, { error: 'Relay temporarily unavailable' })
-    const window = Math.floor(now() / (TTL_SECONDS * 1000))
-    const client = createHmac('sha256', config.secret).update(`${window}:${ip}`).digest('hex')
-    try {
-      const response = await fetchImpl(config.redisUrl, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${config.redisToken}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(['EVAL', RATE_SCRIPT, '2', `pubky-notes:turn:global:${window}`, `pubky-notes:turn:client:${client}`, String(TTL_SECONDS), '1000', '30']),
-        signal: AbortSignal.timeout(3000),
-        redirect: 'error',
-      })
-      if (!response.ok) throw new Error('Rate limiter unavailable')
-      const result = await response.json()
-      if (result?.result === 0) {
-        res.setHeader('Retry-After', String(TTL_SECONDS))
-        return send(429, { error: 'Relay request limit reached' })
-      }
-      if (result?.result !== 1) throw new Error('Rate limiter unavailable')
-    } catch { return send(503, { error: 'Relay temporarily unavailable', iceServers: STUN, relayAvailable: false }) }
+    if (config.rateLimit === 'redis') {
+      const window = Math.floor(now() / (TTL_SECONDS * 1000))
+      const client = createHmac('sha256', config.secret).update(`${window}:${ip}`).digest('hex')
+      try {
+        const response = await fetchImpl(config.redisUrl, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${config.redisToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(['EVAL', RATE_SCRIPT, '2', `pubky-notes:turn:global:${window}`, `pubky-notes:turn:client:${client}`, String(TTL_SECONDS), '1000', '30']),
+          signal: AbortSignal.timeout(3000),
+          redirect: 'error',
+        })
+        if (!response.ok) throw new Error('Rate limiter unavailable')
+        const result = await response.json()
+        if (result?.result === 0) {
+          res.setHeader('Retry-After', String(TTL_SECONDS))
+          return send(429, { error: 'Relay request limit reached' })
+        }
+        if (result?.result !== 1) throw new Error('Rate limiter unavailable')
+      } catch { return send(503, { error: 'Relay temporarily unavailable', iceServers: STUN, relayAvailable: false }) }
+    }
     const expiresAtSeconds = Math.floor(now() / 1000) + TTL_SECONDS
     if (config.provider === 'cloudflare') {
       try {

@@ -137,6 +137,7 @@ async function requestIce(options = {}, request = {}) {
   const res = { setHeader(name, value) { headers[name] = value }, end(value) { body = JSON.parse(value) }, statusCode: 0 }
   const req = {
     method: 'POST',
+    url: '/api/collaboration-ice',
     headers: { origin: ORIGIN, 'content-type': 'application/json', 'x-pubky-notes-collaboration': '1' },
     socket: { remoteAddress: '198.51.100.23' },
     ...request,
@@ -183,7 +184,7 @@ test('TURN admission rejects other origins and missing explicit JSON requests be
   assert.equal((await requestIce({ fetchImpl: neverFetch }, { headers: { origin: 'https://attacker.example', 'content-type': 'application/json', 'x-pubky-notes-collaboration': '1' } })).status, 403)
 })
 
-test('TURN cannot be enabled without shared rate limits or approved relay URL syntax', async () => {
+test('TURN defaults to Redis limits and rejects missing limits or unsafe relay configuration', async () => {
   for (const env of [
     { ...configuredEnv, UPSTASH_REDIS_REST_TOKEN: '' },
     { ...configuredEnv, UPSTASH_REDIS_REST_URL: 'http://unit-test.upstash.io' },
@@ -248,6 +249,113 @@ const cloudflareResponse = (body = { iceServers: cloudflareServers }, options = 
 const withCloudflareResponse = (response) => async (url) => url === `${cloudflareEnv.UPSTASH_REDIS_REST_URL}/`
   ? { ok: true, json: async () => ({ result: 1 }) }
   : response()
+const vercelCloudflareEnv = {
+  ...cloudflareEnv,
+  VERCEL: '1',
+  COLLABORATION_TURN_RATE_LIMIT: 'vercel',
+  UPSTASH_REDIS_REST_URL: undefined,
+  UPSTASH_REDIS_REST_TOKEN: undefined,
+}
+const vercelRequestHeaders = {
+  origin: ORIGIN,
+  'content-type': 'application/json',
+  'x-pubky-notes-collaboration': '1',
+  'x-vercel-forwarded-for': '203.0.113.2',
+}
+
+test('explicit Vercel limiter mode requests temporary Cloudflare credentials without a Redis database', async () => {
+  const calls = []
+  const result = await requestIce({ env: vercelCloudflareEnv, now: () => 1_700_000_000_000, fetchImpl: async (url, options) => {
+    calls.push(url)
+    assert.equal(url, 'https://rtc.live.cloudflare.com/v1/turn/keys/unit-test-turn-key/credentials/generate-ice-servers')
+    assert.equal(options.redirect, 'error')
+    assert.equal(options.method, 'POST')
+    assert.equal(options.headers.Authorization, `Bearer ${cloudflareEnv.CLOUDFLARE_TURN_API_TOKEN}`)
+    assert.deepEqual(JSON.parse(options.body), { ttl: 600 })
+    assert.ok(options.signal)
+    return cloudflareResponse()
+  } }, { headers: vercelRequestHeaders })
+  assert.equal(calls.length, 1)
+  assert.equal(result.status, 200)
+  assert.equal(result.body.relayAvailable, true)
+  assert.equal(result.body.expiresAt, 1_700_000_600_000)
+  assert.deepEqual(result.body.iceServers.slice(1), cloudflareServers)
+  assert.match(result.headers['Cache-Control'], /no-store/)
+  assert.equal(JSON.stringify(result.body).includes(cloudflareEnv.CLOUDFLARE_TURN_API_TOKEN), false)
+})
+
+test('Vercel limiter mode rejects invalid, missing, and mixed deployment configuration before contacting Cloudflare', async () => {
+  for (const env of [
+    { ...vercelCloudflareEnv, VERCEL: undefined },
+    { ...vercelCloudflareEnv, VERCEL: '0' },
+    { ...vercelCloudflareEnv, COLLABORATION_TURN_RATE_LIMIT: undefined },
+    { ...vercelCloudflareEnv, COLLABORATION_TURN_RATE_LIMIT: 'redis' },
+    { ...vercelCloudflareEnv, COLLABORATION_TURN_RATE_LIMIT: '' },
+    { ...vercelCloudflareEnv, COLLABORATION_TURN_RATE_LIMIT: 'disabled' },
+    { ...vercelCloudflareEnv, UPSTASH_REDIS_REST_URL: cloudflareEnv.UPSTASH_REDIS_REST_URL },
+    { ...vercelCloudflareEnv, UPSTASH_REDIS_REST_TOKEN: cloudflareEnv.UPSTASH_REDIS_REST_TOKEN },
+    { ...vercelCloudflareEnv, UPSTASH_REDIS_REST_TOKEN: '' },
+    { ...cloudflareEnv, VERCEL: '1', COLLABORATION_TURN_RATE_LIMIT: 'vercel' },
+  ]) {
+    const result = await requestIce({ env, fetchImpl: () => assert.fail('Invalid config reached Cloudflare') }, { headers: vercelRequestHeaders })
+    assert.equal(result.status, 503)
+    assert.equal(result.body.relayAvailable, false)
+  }
+})
+
+test('Vercel limiter mode only issues credentials on the exact WAF-protected route', async () => {
+  for (const url of [
+    undefined, '/', '/API/collaboration-ice', '/api/Collaboration-ice', '/api/collaboration-ice/',
+    '/api/collaboration-ice.mjs', '/api/collaboration-ice/extra', '/api/%63ollaboration-ice',
+    '/%61pi/collaboration-ice', '/api/./collaboration-ice', '//api/collaboration-ice',
+    '/api/collaboration-ice?unused=1',
+  ]) {
+    const result = await requestIce({ env: vercelCloudflareEnv, fetchImpl: () => assert.fail('Alternate path reached Cloudflare') }, { headers: vercelRequestHeaders, url })
+    assert.equal(result.status, 404)
+    assert.equal(result.body.iceServers, undefined)
+  }
+})
+
+test('Vercel limiter mode still rejects untrusted origins, ambiguous IP headers, and invalid requests', async () => {
+  for (const [request, status] of [
+    [{ method: 'GET', headers: vercelRequestHeaders }, 405],
+    [{ headers: { ...vercelRequestHeaders, 'x-pubky-notes-collaboration': undefined } }, 400],
+    [{ headers: { ...vercelRequestHeaders, origin: 'https://attacker.example' } }, 403],
+    [{ headers: { ...vercelRequestHeaders, 'content-length': '1025' } }, 413],
+    [{ headers: { ...vercelRequestHeaders, 'x-vercel-forwarded-for': undefined, 'x-forwarded-for': '203.0.113.2' } }, 503],
+    [{ headers: { ...vercelRequestHeaders, 'x-vercel-forwarded-for': '203.0.113.2, 203.0.113.3' } }, 503],
+    [{ headers: { ...vercelRequestHeaders, 'x-vercel-forwarded-for': ['203.0.113.2'] } }, 503],
+  ]) {
+    const result = await requestIce({ env: vercelCloudflareEnv, fetchImpl: () => assert.fail('Rejected request reached Cloudflare') }, request)
+    assert.equal(result.status, status)
+    assert.equal(result.body.iceServers?.some((server) => server.credential) ?? false, false)
+  }
+})
+
+test('optional Redis token does not falsely reject credentials, but configured secrets remain filtered in Vercel mode', async () => {
+  const relay = cloudflareServers[1]
+  for (const [server, status] of [
+    [{ ...relay, username: 'undefined-user', credential: 'temporary-undefined-password' }, 200],
+    [{ ...relay, username: cloudflareEnv.CLOUDFLARE_TURN_API_TOKEN }, 503],
+    [{ ...relay, credential: `prefix-${cloudflareEnv.CLOUDFLARE_TURN_API_TOKEN}` }, 503],
+  ]) {
+    const result = await requestIce({ env: vercelCloudflareEnv, fetchImpl: async () => cloudflareResponse({ iceServers: [server] }) }, { headers: vercelRequestHeaders })
+    assert.equal(result.status, status)
+    assert.equal(JSON.stringify(result.body).includes(cloudflareEnv.CLOUDFLARE_TURN_API_TOKEN), false)
+  }
+})
+
+test('Redis remains available explicitly and never falls back to native Vercel mode after a store failure', async () => {
+  let calls = 0
+  const result = await requestIce({ env: { ...cloudflareEnv, VERCEL: '1', COLLABORATION_TURN_RATE_LIMIT: 'redis' }, fetchImpl: async (url) => {
+    assert.equal(++calls, 1)
+    assert.equal(url, `${cloudflareEnv.UPSTASH_REDIS_REST_URL}/`)
+    throw new Error('Store unavailable')
+  } }, { headers: vercelRequestHeaders })
+  assert.equal(calls, 1)
+  assert.equal(result.status, 503)
+  assert.equal(result.body.relayAvailable, false)
+})
 
 test('managed TURN issues bounded temporary credentials only after the shared quota succeeds', async () => {
   let clock = 1_700_000_000_000

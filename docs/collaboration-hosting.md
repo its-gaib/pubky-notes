@@ -10,7 +10,7 @@ The first version requires overlapping online time to exchange edits. Each parti
 
 ## Current relay availability
 
-No managed TURN account or production coturn server has been provisioned by this change. The endpoint supports Cloudflare Realtime TURN and coturn, but neither is activated by deploying this code alone. With no server-side TURN configuration, `POST /api/collaboration-ice` returns STUN only and `relayAvailable: false`. Direct connections can work, but restrictive networks may fail to connect. The UI must not describe this configuration as having a working relay fallback.
+The endpoint supports Cloudflare Realtime TURN and coturn, but neither is activated by deploying this code alone. With no server-side TURN configuration, `POST /api/collaboration-ice` returns STUN only and `relayAvailable: false`. Direct connections can work, but restrictive networks may fail to connect. Verify the deployed endpoint and an actual relayed connection before describing a deployment as having a working relay fallback.
 
 The current [OpenRelay instructions](https://www.metered.ca/tools/openrelay/) require a free account for browser credentials. Their same page still documents a public static-auth endpoint; on 2026-10-14, our forced-relay Chromium check gathered no relay candidates from it, and TCP connections to ports 80 and 443 timed out from this development machine. This does not establish global service availability, but it does not justify configuring it as a working fallback. The identical browser check succeeded through the local coturn fixture, selecting a relay-to-relay candidate pair and delivering a synthetic message.
 
@@ -49,11 +49,11 @@ X-Pubky-Notes-Collaboration: 1
 {}
 ```
 
-The response is `{ iceServers: RTCIceServer[], relayAvailable: boolean, expiresAt?: number }`. `expiresAt` is Unix time in **milliseconds**. Clients refresh credentials before constructing a new connection after expiration. The response is never cacheable. If no relay is configured, it contains only a public STUN address.
+The response is `{ iceServers: RTCIceServer[], relayAvailable: boolean, expiresAt?: number }`. `expiresAt` is Unix time in **milliseconds**. While connected, the browser requests fresh credentials before expiration and reconnects with them to establish a fresh TURN allocation. This can briefly pause live sync; the pinned participant does not need approval again. Temporary refresh failures keep the existing connection while its credentials remain valid and retry with bounded delays. A new connection after expiration also requests fresh credentials. The response is never cacheable. If no relay is configured, it contains only a public STUN address.
 
 ### Managed Cloudflare TURN
 
-This option runs credential issuance on Vercel while Cloudflare carries the relayed traffic. Create a TURN key in your own Cloudflare account, following the [official credential instructions](https://developers.cloudflare.com/realtime/turn/generate-credentials/), and configure these **server-only Vercel environment variables**:
+This option runs credential issuance on Vercel while Cloudflare carries the relayed traffic. No database is needed when using the Vercel Firewall limiter below. Create a TURN key in your own Cloudflare account, following the [official credential instructions](https://developers.cloudflare.com/realtime/turn/generate-credentials/). Enable and verify the firewall rule **before** configuring these **server-only Vercel environment variables**:
 
 | Variable | Value |
 | --- | --- |
@@ -61,12 +61,11 @@ This option runs credential issuance on Vercel while Cloudflare carries the rela
 | `CLOUDFLARE_TURN_KEY_ID` | The Cloudflare TURN key ID |
 | `CLOUDFLARE_TURN_API_TOKEN` | The API token for that TURN key, not a browser credential |
 | `COLLABORATION_ALLOWED_ORIGINS` | `https://pubky-notes.vercel.app`, or exact comma-separated application origins without trailing slashes |
-| `UPSTASH_REDIS_REST_URL` | HTTPS REST URL for a shared Upstash Redis instance |
-| `UPSTASH_REDIS_REST_TOKEN` | Server-side Redis REST token with permission to execute the limiter script |
+| `COLLABORATION_TURN_RATE_LIMIT` | `vercel`, after enabling the project firewall rule below |
 
-Remove any `COLLABORATION_TURN_SECRET` and `COLLABORATION_TURN_URLS` values when selecting Cloudflare. Mixed or incomplete provider configurations fail closed. The provider selector must be explicit for Cloudflare. No account, key, Redis instance, or paid service is created automatically; these credentials and the shared quota store are still required to activate the fallback.
+Remove any `COLLABORATION_TURN_SECRET` and `COLLABORATION_TURN_URLS` values when selecting Cloudflare. Also remove both `UPSTASH_REDIS_REST_*` variables when selecting `vercel`; even an empty leftover Redis variable is rejected. Mixed or incomplete provider/limiter configurations fail closed. The provider selector must be explicit for Cloudflare. The endpoint requires Vercel's injected `VERCEL=1` marker for native firewall mode; do not set that marker manually on another host. The API cannot create or inspect the firewall rule, so configuring and verifying that rule is a deployment prerequisite.
 
-After the origin and shared quota checks succeed, the endpoint calls Cloudflare's fixed HTTPS credential API with a ten-minute TTL. It rejects redirects, times out after five seconds, bounds the response to 16 KiB, and accepts only the documented Cloudflare STUN/TURN addresses and transports on ports 3478, 443, 80, and 5349. It returns only validated temporary ICE credentials, with expiry measured conservatively from the request start. Provider errors and long-term secrets are not returned to browsers. Custom Cloudflare TURN domains are not supported by this adapter.
+After the configured limiter and origin checks, the endpoint calls Cloudflare's fixed HTTPS credential API with a ten-minute TTL. It rejects redirects, times out after five seconds, bounds the response to 16 KiB, and accepts only the documented Cloudflare STUN/TURN addresses and transports on ports 3478, 443, 80, and 5349. It returns only validated temporary ICE credentials, with expiry measured conservatively from the request start. Provider errors and long-term secrets are not returned to browsers. Custom Cloudflare TURN domains are not supported by this adapter.
 
 Redeploy after adding the variables, then verify the production endpoint returns `relayAvailable: true`. Finish activation by testing a real connection with `iceTransportPolicy: 'relay'` and confirming the selected candidate pair in `getStats()` uses a relay. A successful credential response alone does not prove traffic can traverse the relay.
 
@@ -80,14 +79,32 @@ To use your coturn server, set these **server-only Vercel environment variables*
 | `COLLABORATION_TURN_URLS` | Comma-separated `turn:turn.example.com:3478?transport=udp,turn:turn.example.com:3478?transport=tcp,turns:turn.example.com:5349?transport=tcp` |
 | `COLLABORATION_TURN_SECRET` | The same random shared secret configured in coturn; at least 32 characters |
 | `COLLABORATION_ALLOWED_ORIGINS` | Exact comma-separated application origins, with no trailing slash |
-| `UPSTASH_REDIS_REST_URL` | HTTPS REST URL for a shared Upstash Redis instance |
-| `UPSTASH_REDIS_REST_TOKEN` | Server-side Redis REST token with permission to execute the limiter script |
+| `COLLABORATION_TURN_RATE_LIMIT` | `vercel` after enabling the project firewall rule, or `redis` with the shared store below |
 
 Never place these secrets in `VITE_*` variables. Configure the SPA rewrite to leave `/api/` routes reachable.
 
 The endpoint creates ten-minute [coturn REST credentials](https://github.com/coturn/coturn/wiki/turnserver#turn-rest-api) using a timestamped username and HMAC-SHA1, as specified by coturn. The browser receives only the temporary username/password. An exact Origin check and explicit request header reduce cross-site browser abuse. They are not proof of user identity, and non-browser callers can imitate them.
 
-For either provider, one atomic [Redis REST EVAL](https://upstash.com/docs/redis/features/restapi) enforces a global limit of 1,000 issuances and a per-IP limit of 30 issuances per ten-minute window across all function instances, before generating credentials. IP addresses are HMAC-hashed with the selected provider's server-side secret and a rotating window before becoming Redis keys. On Vercel, the endpoint uses the [platform-supplied client IP](https://vercel.com/docs/headers/request-headers); elsewhere it uses the socket address. Missing configuration, unknown client IPs, and rate-store failures do not issue TURN credentials. These limits bound issuance, not all possible bandwidth; coturn also needs allocation and bandwidth quotas, and managed-provider usage should be monitored in its account.
+### Credential rate limits
+
+Both providers require one explicitly configured limiter or the default Redis limiter. There is no unthrottled fallback. Exact Origin checks and the explicit request header reduce browser abuse but are not authentication; non-browser clients can imitate them. On Vercel, the endpoint requires the [platform-supplied client IP](https://vercel.com/docs/headers/request-headers); elsewhere Redis mode uses the socket address. Missing or ambiguous client IPs never receive TURN credentials.
+
+For the database-free Vercel option:
+
+1. Create and enable a project [Vercel Firewall rate-limit rule](https://vercel.com/docs/vercel-firewall/vercel-waf/rate-limiting) for every pathname beginning `/api/`, on **all project domains and all request methods**. Use a fixed window of **30 requests per 600 seconds per client IP**, with the rate-limit action that returns HTTP 429 after the limit. Use the platform client IP, not a caller-provided header. Scope must include deployment URLs as well as the production alias.
+2. Verify the active rule actually returns HTTP 429 after repeated requests before enabling native mode. Check its coverage on production and deployment domains. Keep the rule enabled across deployments. Native mode accepts only the exact raw request URL `/api/collaboration-ice`, with no query, encoded path, case variation, extension, or trailing slash, so alternate function URLs cannot mint credentials outside that route.
+3. Set `COLLABORATION_TURN_RATE_LIMIT=vercel`, remove both Redis variables, and deploy. The function relies on the verified firewall rule; `VERCEL=1` alone does not prove a rule exists.
+
+Vercel's native limit is **per region and per IP**, not a globally shared issuance limit or a bandwidth cap. Requests from many addresses or regions can exceed 30 in aggregate. Requests to other `/api/` paths also count under this rule. Monitor Cloudflare usage and billing in the account. To roll back, first disable TURN issuance and redeploy, or switch to a working Redis configuration and redeploy; **only then remove the firewall rule**. Never remove the rule while a deployment still issues credentials in `vercel` mode.
+
+For an optional globally shared Redis limiter, leave `COLLABORATION_TURN_RATE_LIMIT` unset or set it to `redis` and configure:
+
+| Variable | Value |
+| --- | --- |
+| `UPSTASH_REDIS_REST_URL` | HTTPS REST URL for a shared Upstash Redis instance |
+| `UPSTASH_REDIS_REST_TOKEN` | Server-side Redis REST token with permission to execute the limiter script |
+
+One atomic [Redis REST EVAL](https://upstash.com/docs/redis/features/restapi) enforces a global limit of 1,000 issuances and a per-IP limit of 30 issuances per ten-minute window across all function instances, before generating credentials. IP addresses are HMAC-hashed with the selected provider's server-side secret and a rotating window before becoming Redis keys. Missing store configuration and store failures do not issue credentials, including on Vercel; the function never switches limiter modes automatically. These limits bound issuance, not all possible bandwidth; coturn also needs allocation and bandwidth quotas.
 
 ## Optional self-hosted TURN
 
@@ -131,6 +148,15 @@ For a forced-relay browser test, pass this `RTCConfiguration` through the collab
 ```
 
 Use independent browser contexts, exchange a synthetic edit, and assert via `RTCPeerConnection.getStats()` that the successful selected candidate pair has relay candidates. Merely including a TURN URL does not prove the relay carried traffic. For browser prerequisites, install Chromium with `npx playwright install chromium` and the Linux libraries with `npx playwright install-deps chromium` if needed. Do not use personal Pubky sessions or real notes in these tests.
+
+With the disposable local Pubky testnet running, the browser suite can use the deployed credential endpoint instead of local coturn:
+
+```sh
+COLLAB_E2E_ICE_ENDPOINT=https://pubky-notes.vercel.app/api/collaboration-ice \
+  npx playwright test e2e/collaboration.spec.ts --grep 'real TURN collaboration' --workers=1
+```
+
+These tests force relay candidates and check actual editing and replacement allocations after credential renewal. The renewal test shortens only the first response's advertised expiry to exercise the real timer quickly; it does not test Cloudflare's server-side expiry policy. Managed-credential traces are disabled, and errors omit credential responses. The tests use disposable local accounts and synthetic notes even when Cloudflare carries the encrypted traffic.
 
 The infrastructure regression suite runs with:
 

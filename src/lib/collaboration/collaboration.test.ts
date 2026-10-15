@@ -245,7 +245,7 @@ class FakePeer {
   onicecandidate?: (event: RTCPeerConnectionIceEvent) => void
   ondatachannel?: (event: { channel: FakeChannel }) => void
   onconnectionstatechange?: () => void
-  constructor() { FakePeer.instances.push(this) }
+  constructor(readonly configuration: RTCConfiguration) { FakePeer.instances.push(this) }
   createDataChannel() { this.channel = new FakeChannel(); return this.channel }
   async createOffer() { return { type: 'offer', sdp: 'v=0\r\n' } }
   async createAnswer() { return { type: 'answer', sdp: 'v=0\r\n' } }
@@ -263,13 +263,13 @@ describe('transport admission and lifetime', () => {
     vi.unstubAllGlobals()
   })
 
-  function start(room: StoredRoom, iceServers: RTCIceServer[] = []) {
+  function start(room: StoredRoom, iceServers: RTCIceServer[] | null = []) {
     vi.stubGlobal('WebSocket', FakeSocket)
     vi.stubGlobal('RTCPeerConnection', FakePeer)
     FakeSocket.instances = []
     FakePeer.instances = []
     const callbacks: CollaborationCallbacks = { onStatus: vi.fn(), onRequest: vi.fn(), onMessage: vi.fn(), onError: vi.fn() }
-    const transport = startCollaboration(room, callbacks, { identity: proofIdentity(room), signalingUrl: 'ws://127.0.0.1:4444', iceEndpoint: null, rtcConfiguration: { iceServers } })
+    const transport = startCollaboration(room, callbacks, { identity: proofIdentity(room), signalingUrl: 'ws://127.0.0.1:4444', ...(iceServers === null ? {} : { iceEndpoint: null, rtcConfiguration: { iceServers } }) })
     active.push(transport)
     return { transport, callbacks }
   }
@@ -324,6 +324,155 @@ describe('transport admission and lifetime', () => {
       targetSession: offer!.session, payload: 'v=0\r\n' }), host.room)
     await vi.waitFor(() => expect(FakePeer.instances.at(-1)?.remoteDescription?.type).toBe('answer'))
   }
+
+  function relayResponse(credential: string, expiresAt = Date.now() + 600_000) {
+    return new Response(JSON.stringify({ iceServers: [{ urls: 'turn:relay.example:3478', username: 'test', credential }], relayAvailable: true, expiresAt }))
+  }
+
+  async function startRelayedHost(fetch: typeof globalThis.fetch) {
+    const { host, guest } = await pair()
+    await admitPeer(host, guest.identity.publicKey, proofIdentity(guest).owner)
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] })
+    vi.stubGlobal('fetch', fetch)
+    const { transport, callbacks } = start(host, null)
+    const ws = await socket()
+    await authenticateGuest(ws, host, guest)
+    await vi.waitFor(() => expect(FakePeer.instances).toHaveLength(1))
+    const first = FakePeer.instances[0]
+    first.channel!.open()
+    return { host, guest, ws, first, transport, callbacks }
+  }
+
+  it('replaces a connected TURN allocation before expiry through a fresh pinned identity handshake', async () => {
+    const expirations: number[] = []
+    const fetch = vi.fn(async () => { expirations.push(Date.now() + 600_000); return relayResponse(`credential-${expirations.length}`, expirations.at(-1)) })
+    const { host, guest, ws, first, transport, callbacks } = await startRelayedHost(fetch)
+    await vi.advanceTimersByTimeAsync(expirations[0] - 120_000 - Date.now() - 1)
+    expect(fetch).toHaveBeenCalledOnce()
+    expect(first.channel!.readyState).toBe('open')
+    await vi.advanceTimersByTimeAsync(1)
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(first.connectionState).toBe('closed')
+    expect(first.channel!.readyState).toBe('closed')
+    await expect(transport.send(new Uint8Array([1]))).rejects.toThrow('not connected')
+    await authenticateGuest(ws, host, guest)
+    await vi.waitFor(() => expect(FakePeer.instances).toHaveLength(2))
+    expect(callbacks.onRequest).not.toHaveBeenCalled()
+    const second = FakePeer.instances[1]
+    expect(second.configuration.iceServers![0].credential).toBe('credential-2')
+    second.channel!.open()
+    await transport.send(new Uint8Array([2]))
+    expect(second.channel!.sent).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(expirations[1] - 120_000 - Date.now())
+    expect(fetch).toHaveBeenCalledTimes(3)
+    expect(second.connectionState).toBe('closed')
+  })
+
+  it.each(['http', 'fallback'] as const)('retains working relay credentials during %s failures, bounds retries, and reconnects at expiry', async failure => {
+    let expiresAt = 0
+    const fetch = vi.fn(async () => {
+      if (!expiresAt) { expiresAt = Date.now() + 600_000; return relayResponse('working', expiresAt) }
+      return failure === 'http' ? new Response('', { status: 503 }) : new Response(JSON.stringify({ iceServers: [], relayAvailable: false }))
+    })
+    const { first, transport, callbacks } = await startRelayedHost(fetch)
+    await vi.advanceTimersByTimeAsync(expiresAt - 120_000 - Date.now())
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(first.channel!.readyState).toBe('open')
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'connected', relayAvailable: true }))
+    await transport.send(new Uint8Array([1]))
+    await vi.advanceTimersByTimeAsync(95_000)
+    expect(fetch).toHaveBeenCalledTimes(7)
+    await vi.advanceTimersByTimeAsync(expiresAt - Date.now() - 1)
+    expect(fetch).toHaveBeenCalledTimes(7)
+    expect(first.channel!.readyState).toBe('open')
+    expect(first.configuration.iceServers![0].credential).toBe('working')
+    await vi.advanceTimersByTimeAsync(1)
+    expect(first.connectionState).toBe('closed')
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'disconnected' }))
+  })
+
+  it('recovers a transient renewal failure while retaining the connection until new credentials arrive', async () => {
+    let expiresAt = 0
+    const fetch = vi.fn(async () => {
+      if (!expiresAt) { expiresAt = Date.now() + 600_000; return relayResponse('first', expiresAt) }
+      if (fetch.mock.calls.length === 2) throw new Error('Temporary network failure')
+      return relayResponse('renewed')
+    })
+    const { first, callbacks } = await startRelayedHost(fetch)
+    await vi.advanceTimersByTimeAsync(expiresAt - 120_000 - Date.now())
+    expect(first.channel!.readyState).toBe('open')
+    await vi.advanceTimersByTimeAsync(4_999)
+    expect(fetch).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(fetch).toHaveBeenCalledTimes(3)
+    expect(first.connectionState).toBe('closed')
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'disconnected', relayAvailable: true }))
+  })
+
+  it('does not repeatedly reconnect for a cached response with the original expiry', async () => {
+    let expiresAt = 0
+    const fetch = vi.fn(async () => { expiresAt ||= Date.now() + 600_000; return relayResponse('unchanged', expiresAt) })
+    const { first, callbacks } = await startRelayedHost(fetch)
+    await vi.advanceTimersByTimeAsync(expiresAt - 120_000 - Date.now() + 95_000)
+    expect(fetch).toHaveBeenCalledTimes(7)
+    expect(first.channel!.readyState).toBe('open')
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'connected', relayAvailable: true }))
+  })
+
+  it.each(['success', 'failure'] as const)('ignores a stale renewal %s after manual reconnect without altering the replacement peer', async result => {
+    let expiresAt = 0, resolveRenewal!: (response: Response) => void, renewalSignal: AbortSignal | undefined
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (!expiresAt) { expiresAt = Date.now() + 600_000; return relayResponse('original', expiresAt) }
+      renewalSignal = init?.signal as AbortSignal
+      return new Promise<Response>(resolve => { resolveRenewal = resolve })
+    })
+    const { host, guest, ws, first, transport, callbacks } = await startRelayedHost(fetch)
+    await vi.advanceTimersByTimeAsync(expiresAt - 120_000 - Date.now())
+    expect(fetch).toHaveBeenCalledTimes(2)
+    // Repeated data callbacks must not arm duplicate renewal jobs while fetch waits.
+    first.channel!.onmessage!({ data: [...frameMessage(new Uint8Array([1]))][0] })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetch).toHaveBeenCalledTimes(2)
+    transport.reconnect()
+    expect(renewalSignal!.aborted).toBe(true)
+    await authenticateGuest(ws, host, guest)
+    await vi.waitFor(() => expect(FakePeer.instances).toHaveLength(2))
+    const second = FakePeer.instances[1]
+    const statusCount = vi.mocked(callbacks.onStatus).mock.calls.length
+    resolveRenewal(result === 'success' ? relayResponse('obsolete') : new Response('', { status: 503 }))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(second.connectionState).not.toBe('closed')
+    expect(callbacks.onStatus).toHaveBeenCalledTimes(statusCount)
+    // A later peer still uses the original unexpired credential, never the stale result.
+    transport.reconnect()
+    await authenticateGuest(ws, host, guest)
+    await vi.waitFor(() => expect(FakePeer.instances).toHaveLength(3))
+    expect(FakePeer.instances[2].configuration.iceServers![0].credential).toBe('original')
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('aborts pending renewal and cancels all its timers when disposed', async () => {
+    let expiresAt = 0, resolveRenewal!: (response: Response) => void, renewalSignal: AbortSignal | undefined
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (!expiresAt) { expiresAt = Date.now() + 600_000; return relayResponse('first', expiresAt) }
+      renewalSignal = init?.signal as AbortSignal
+      return new Promise<Response>(resolve => { resolveRenewal = resolve })
+    })
+    const { transport, callbacks } = await startRelayedHost(fetch)
+    await vi.advanceTimersByTimeAsync(expiresAt - 120_000 - Date.now())
+    expect(fetch).toHaveBeenCalledTimes(2)
+    transport.dispose()
+    expect(renewalSignal!.aborted).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+    const statusCount = vi.mocked(callbacks.onStatus).mock.calls.length
+    resolveRenewal(relayResponse('late'))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(600_000)
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(callbacks.onStatus).toHaveBeenCalledTimes(statusCount)
+    expect(callbacks.onError).not.toHaveBeenCalled()
+  })
 
   it('stops before any network work when WebRTC is unavailable and rechecks on retry', async () => {
     const { host } = await pair()

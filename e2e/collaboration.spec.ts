@@ -3,8 +3,10 @@ import type { Browser, BrowserContext, Page } from '@playwright/test'
 
 const BASE = 'http://127.0.0.1:4174'
 const BODY = '# Shared draft\n\nMiddle paragraph.\n\nLast paragraph.'
-type Peer = { context: BrowserContext; page: Page; owner: string; browserErrors: string[] }
+type Peer = { context: BrowserContext; page: Page; owner: string; browserErrors: string[]; iceRequests: () => number }
 type Note = { note: { id: string; title: string; content: string; folder?: string; crdt?: { version: number; update: string } }; published: unknown }
+type RelayFixture = { firstExpiryMs?: number }
+type IceResponse = { iceServers: RTCIceServer[]; relayAvailable: true; expiresAt: number }
 
 const test = base.extend<{ accounts: Peer[] }>({
   accounts: [async ({ browser }, use) => {
@@ -18,13 +20,76 @@ const test = base.extend<{ accounts: Peer[] }>({
   }, { timeout: 60_000 }],
 })
 
-async function peer(browser: Browser, relayOnly = false, beforeSignIn?: (page: Page) => Promise<void>): Promise<Peer> {
-  const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } })
-  context.setDefaultTimeout(15_000)
-  if (relayOnly) await context.route('**/api/collaboration-ice', route => route.fulfill({ json: {
+// Provider credentials are short-lived but still should not be captured in traces.
+if (process.env.COLLAB_E2E_ICE_ENDPOINT) test.use({ trace: 'off' })
+
+async function relayCredentials(): Promise<IceResponse> {
+  const endpoint = process.env.COLLAB_E2E_ICE_ENDPOINT
+  if (!endpoint) return {
     iceServers: [{ urls: 'turn:127.0.0.1:3479?transport=udp', username: 'pubky-notes-test', credential: 'local-relay-fixture-only' }],
     relayAvailable: true, expiresAt: Date.now() + 60 * 60 * 1000,
-  } }))
+  }
+  const fail = () => { throw new Error('Configured ICE endpoint did not return usable temporary TURN credentials.') }
+  let url: URL
+  try { url = new URL(endpoint) } catch { return fail() }
+  if (url.protocol !== 'https:' || url.username || url.password || url.pathname !== '/api/collaboration-ice'
+    || url.search || url.hash || endpoint !== url.href) return fail()
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10_000),
+      headers: { Origin: url.origin, 'Content-Type': 'application/json', 'X-Pubky-Notes-Collaboration': '1' },
+      body: '{}',
+    })
+    if (!response.ok || response.headers.get('content-type')?.split(';')[0].trim() !== 'application/json'
+      || Number(response.headers.get('content-length') ?? 0) > 16_384 || !response.body) {
+      await response.body?.cancel()
+      return fail()
+    }
+    const reader = response.body.getReader(), chunks: Uint8Array[] = []
+    let size = 0
+    try {
+      for (;;) {
+        const { value, done } = await reader.read()
+        if (done) break
+        size += value.byteLength
+        if (size > 16_384) { await reader.cancel(); return fail() }
+        chunks.push(value)
+      }
+    } finally { reader.releaseLock() }
+    const result = JSON.parse(Buffer.concat(chunks, size).toString('utf8')) as Partial<IceResponse>
+    if (result?.relayAvailable !== true || typeof result.expiresAt !== 'number' || !Number.isFinite(result.expiresAt)
+      || result.expiresAt <= Date.now() + 60_000 || !Array.isArray(result.iceServers)
+      || !result.iceServers.length || result.iceServers.length > 16) return fail()
+    let hasTurn = false
+    const iceServers = result.iceServers.map(server => {
+      if (!server || typeof server !== 'object' || Array.isArray(server)) return fail()
+      const urls = typeof server.urls === 'string' ? [server.urls] : server.urls
+      if (!Array.isArray(urls) || !urls.length || urls.length > 16
+        || urls.some(value => typeof value !== 'string' || value.length > 512 || !/^(?:stun|turn|turns):[^\s]+$/.test(value))) return fail()
+      const isTurn = urls.some(value => /^turns?:/.test(value))
+      if (!isTurn) return { urls }
+      const { username, credential } = server
+      if (typeof username !== 'string' || !username.length || username.length > 1024
+        || typeof credential !== 'string' || !credential.length || credential.length > 2048) return fail()
+      hasTurn = true
+      return { urls, username, credential }
+    })
+    if (!hasTurn) return fail()
+    return { iceServers, relayAvailable: true, expiresAt: result.expiresAt }
+  } catch { return fail() } // Never include provider bodies, headers, or credentials in diagnostics.
+}
+
+async function peer(browser: Browser, relayOnly = false, beforeSignIn?: (page: Page) => Promise<void>, relayFixture: RelayFixture = {}): Promise<Peer> {
+  const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } })
+  context.setDefaultTimeout(15_000)
+  let issued = 0
+  const iceRequests = () => issued
+  if (relayOnly) await context.route('**/api/collaboration-ice', async route => {
+    const response = await relayCredentials()
+    issued++
+    if (issued === 1 && relayFixture.firstExpiryMs) response.expiresAt = Math.min(response.expiresAt, Date.now() + relayFixture.firstExpiryMs)
+    await route.fulfill({ json: response })
+  })
   await context.addInitScript((forceRelay) => {
     const Native = window.RTCPeerConnection
     const connections: RTCPeerConnection[] = [], channels: RTCDataChannel[] = []
@@ -33,7 +98,7 @@ async function peer(browser: Browser, relayOnly = false, beforeSignIn?: (page: P
       const nativeSend = RTCDataChannel.prototype.send
       RTCDataChannel.prototype.send = function (data) {
         // Deliberately lose each browser's first handshake. Everything afterward
-        // uses the actual browser SCTP channel and the actual loopback TURN server.
+        // uses the actual browser SCTP channel and the configured TURN server.
         if (this.label === 'pubky-notes-v1' && state.__testDroppedHandshake === 0) {
           state.__testDroppedHandshake++
           return
@@ -69,9 +134,9 @@ async function peer(browser: Browser, relayOnly = false, beforeSignIn?: (page: P
     })
     await page.goto(BASE)
     await expect(page.getByRole('button', { name: 'Disconnect from Pubky' })).toBeVisible()
-    return { context, page, owner, browserErrors }
+    return { context, page, owner, browserErrors, iceRequests }
   } catch (error) {
-    await cleanup([{ context, page, owner: '', browserErrors }])
+    await cleanup([{ context, page, owner: '', browserErrors, iceRequests }])
     throw error
   }
 }
@@ -128,6 +193,22 @@ async function connected(page: Page) {
     return state.__testChannels.some(channel => channel.readyState === 'open')
       && state.__testConnections.some(connection => connection.connectionState === 'connected')
   }), { message: 'An actual WebRTC data channel must open' }).toBe(true)
+}
+
+async function relayed(page: Page, firstConnection = 0) {
+  await expect.poll(() => page.evaluate(async first => {
+    const state = window as typeof window & { __testConnections: RTCPeerConnection[] }
+    for (const connection of state.__testConnections.slice(first)) {
+      if (connection.connectionState !== 'connected') continue
+      const stats = await connection.getStats()
+      for (const report of stats.values()) {
+        if (report.type !== 'candidate-pair' || report.state !== 'succeeded' || !report.nominated) continue
+        if (stats.get(report.localCandidateId)?.candidateType === 'relay'
+          && stats.get(report.remoteCandidateId)?.candidateType === 'relay') return true
+      }
+    }
+    return false
+  }, firstConnection), { message: 'Both selected ICE candidates must be actual TURN relay allocations' }).toBe(true)
 }
 
 async function createInvitation(alice: Page) {
@@ -589,21 +670,46 @@ test('real TURN collaboration recovers a lost initial handshake when direct ICE 
     const id = await share(alice.page, bob.page)
     for (const { page } of peers) {
       expect(await page.evaluate(() => (window as typeof window & { __testDroppedHandshake: number }).__testDroppedHandshake)).toBe(1)
-      await expect.poll(() => page.evaluate(async () => {
-        const state = window as typeof window & { __testConnections: RTCPeerConnection[] }
-        for (const connection of state.__testConnections) {
-          if (connection.connectionState !== 'connected') continue
-          const stats = await connection.getStats()
-          for (const report of stats.values()) {
-            if (report.type !== 'candidate-pair' || report.state !== 'succeeded' || !report.nominated) continue
-            if (stats.get(report.localCandidateId)?.candidateType === 'relay'
-              && stats.get(report.remoteCandidateId)?.candidateType === 'relay') return true
-          }
-        }
-        return false
-      }), { message: 'Both selected ICE candidates must be actual TURN relay allocations' }).toBe(true)
+      await relayed(page)
     }
     await insert(alice.page, 'end', '\nDelivered through TURN')
     await expect(bob.page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(`${BODY}\nDelivered through TURN`)
     await Promise.all(peers.map(({ page }) => saved(page, id, `${BODY}\nDelivered through TURN`)))
+})
+
+test('real TURN collaboration renews credentials and replaces allocations without another approval', async ({ browser, accounts: peers }) => {
+  // Only the response metadata is shortened. The browser still uses real TURN
+  // credentials and allocations; this exercises renewal without a ten-minute wait.
+  const alice = await peer(browser, true, undefined, { firstExpiryMs: 90_000 }); peers.push(alice)
+  const bob = await peer(browser, true, undefined, { firstExpiryMs: 90_000 }); peers.push(bob)
+  const id = await share(alice.page, bob.page)
+  await Promise.all(peers.map(({ page }) => relayed(page)))
+  await insert(alice.page, 'end', '\nBefore credential renewal')
+  const before = `${BODY}\nBefore credential renewal`
+  await expect(bob.page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(before)
+  await Promise.all(peers.map(({ page }) => saved(page, id, before)))
+  const originalConnections = await Promise.all(peers.map(({ page }) => page.evaluate(() =>
+    (window as typeof window & { __testConnections: RTCPeerConnection[] }).__testConnections.length)))
+  expect(originalConnections.every(count => count > 0)).toBe(true)
+
+  // TTL90s renews60s early: allow the real timer to run, with no clock mocks.
+  await expect.poll(() => peers.every(account => account.iceRequests() >= 2), {
+    timeout: 45_000, message: 'Both peers must obtain fresh TURN credentials before the initial advertised expiry',
+  }).toBe(true)
+  await Promise.all(peers.map(async ({ page }, index) => {
+    await expect.poll(() => page.evaluate(count => {
+      const connections = (window as typeof window & { __testConnections: RTCPeerConnection[] }).__testConnections
+      return connections.length > count && connections.slice(0, count).every(connection => connection.connectionState === 'closed')
+    }, originalConnections[index]), { message: 'Renewal must close the old RTCPeerConnection and construct a replacement' }).toBe(true)
+    await connected(page)
+    await relayed(page, originalConnections[index])
+    await expect(page.getByRole('button', { name: 'Allow collaborator' })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Join collaboration', exact: true })).toHaveCount(0)
+    await expect(page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(before)
+  }))
+
+  await Promise.all([insert(alice.page, 'start', 'Alice after renewal\n'), insert(bob.page, 'end', '\nBob after renewal')])
+  const merged = `Alice after renewal\n${before}\nBob after renewal`
+  for (const { page } of peers) await expect(page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(merged)
+  await Promise.all(peers.map(({ page }) => saved(page, id, merged)))
 })

@@ -54,7 +54,7 @@ IndexedDB persistence protects reloads and temporary outages, but clearing site 
 
 ## Vercel
 
-`vercel.json` configures the Vite build, SPA routing, ICE configuration endpoint, and browser security headers. The default deployment needs no application database or server secrets: browsers connect to Pubky and use its public HTTP relay for encrypted collaboration introductions. A production TURN provider needs separate configuration as described below.
+`vercel.json` configures the Vite build, SPA routing, ICE configuration endpoint, and browser security headers. The default deployment needs no application database or server secrets: browsers connect to Pubky and use its public HTTP relay for encrypted collaboration introductions. Reliable connections across restrictive networks additionally use Cloudflare TURN with server-side credentials and a Vercel Firewall rate limit; this path needs no Redis database. Enable and verify the firewall rule before selecting `COLLABORATION_TURN_RATE_LIMIT=vercel`. An optional Redis limiter remains available for globally shared issuance limits. See [collaboration hosting](docs/collaboration-hosting.md) for setup and verification.
 
 ```sh
 vercel deploy --prod

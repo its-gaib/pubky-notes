@@ -13,6 +13,9 @@ import type { CollaborationCallbacks, CollaborationOptions, CollaborationStatus,
 const STUN: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }]
 const SIGNAL_URL = import.meta.env.VITE_COLLAB_SIGNAL_URL || 'https://httprelay.pubky.app/inbox/'
 const DEFAULT_ICE_POLICY: RTCIceTransportPolicy = import.meta.env.VITE_COLLAB_RELAY_ONLY === 'true' ? 'relay' : 'all'
+const ICE_RENEWAL_RETRIES = [5_000, 10_000, 20_000, 30_000, 30_000]
+type IceRefreshResult = 'updated' | 'cached' | 'failed' | 'cancelled'
+type IceRequest = { controller: AbortController; promise: Promise<IceRefreshResult>; timeout?: ReturnType<typeof setTimeout> }
 
 export const WEBRTC_UNAVAILABLE_MESSAGE = 'Live collaboration requires WebRTC, which is disabled or unavailable in this browser. Tor Browser does not support this connection method. You can keep editing your private copy.'
 export function webRtcAvailable(): boolean { return typeof globalThis.RTCPeerConnection === 'function' }
@@ -64,6 +67,11 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
   let relayAvailable = false
   let configuration: RTCConfiguration = { iceServers: STUN, ...options.rtcConfiguration }
   let iceExpiresAt = 0
+  let iceRenewAt = 0
+  let iceGeneration = 0
+  let iceRenewalTimer: ReturnType<typeof setTimeout> | undefined
+  let iceRenewalPeer: RTCPeerConnection | undefined
+  let iceRequest: IceRequest | undefined
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined
   let helloTimer: ReturnType<typeof setInterval> | undefined
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined
@@ -82,7 +90,6 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
   let denied = false
   const replay = new ReplayGuard()
   const earlyCandidates: RTCIceCandidateInit[] = []
-  let fetchAbort = new AbortController()
   let localCandidatesReady = false
   const localCandidates: RTCIceCandidateInit[] = []
 
@@ -140,35 +147,88 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
     return challenge
   }
 
-  async function refreshIce() {
+  async function refreshIce(force = false): Promise<IceRefreshResult> {
     if (options.iceEndpoint === null || options.rtcConfiguration?.iceServers) {
       relayAvailable = !!configuration.iceServers?.some(server => (typeof server.urls === 'string' ? [server.urls] : server.urls).some(url => /^turns?:/.test(url)))
-      return
+      return 'cached'
     }
-    if (iceExpiresAt > Date.now() + 60_000) return
-    fetchAbort = new AbortController()
-    const timeout = setTimeout(() => fetchAbort.abort(), 5_000)
-    try {
-      const response = await fetch(options.iceEndpoint ?? '/api/collaboration-ice', {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Pubky-Notes-Collaboration': '1' }, body: '{}', signal: fetchAbort.signal,
-      })
-      if (!response.ok) throw new Error('Relay configuration unavailable')
-      const result = await response.json() as { iceServers?: unknown; relayAvailable?: unknown; expiresAt?: unknown }
-      if (!validIceServers(result.iceServers) || typeof result.relayAvailable !== 'boolean') throw new Error('Invalid relay configuration')
-      configuration = { ...configuration, iceServers: result.iceServers }
-      relayAvailable = result.relayAvailable && result.iceServers.some(server => (typeof server.urls === 'string' ? [server.urls] : server.urls).some(url => /^turns?:/.test(url)))
-      iceExpiresAt = typeof result.expiresAt === 'number' && Number.isFinite(result.expiresAt) ? result.expiresAt : Date.now() + 5 * 60_000
-    } catch {
-      // A missing relay must be visible in status, while direct ICE remains usable.
-      relayAvailable = false
-      configuration = { ...configuration, iceServers: STUN }
-      iceExpiresAt = Date.now() + 30_000
-    } finally {
-      clearTimeout(timeout)
+    if (!force && iceExpiresAt > Date.now() + 60_000) return 'cached'
+    if (iceRequest) return iceRequest.promise
+    const generation = iceGeneration, startedAt = Date.now()
+    const request: IceRequest = { controller: new AbortController(), promise: Promise.resolve<IceRefreshResult>('cancelled') }
+    iceRequest = request
+    request.promise = (async (): Promise<IceRefreshResult> => {
+      request.timeout = setTimeout(() => request.controller.abort(), 5_000)
+      try {
+        const response = await fetch(options.iceEndpoint ?? '/api/collaboration-ice', {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Pubky-Notes-Collaboration': '1' }, body: '{}', signal: request.controller.signal,
+        })
+        if (!response.ok) throw new Error('Relay configuration unavailable')
+        const result = await response.json() as { iceServers?: unknown; relayAvailable?: unknown; expiresAt?: unknown }
+        if (disposed || generation !== iceGeneration) return 'cancelled'
+        if (request.controller.signal.aborted || !validIceServers(result.iceServers) || typeof result.relayAvailable !== 'boolean') throw new Error('Invalid relay configuration')
+        const available = result.relayAvailable && result.iceServers.some(server => (typeof server.urls === 'string' ? [server.urls] : server.urls).some(url => /^turns?:/.test(url)))
+        const expiresAt = typeof result.expiresAt === 'number' && Number.isFinite(result.expiresAt) ? result.expiresAt : startedAt + 5 * 60_000
+        // A temporary endpoint fallback must not discard a working allocation or
+        // credentials that are still valid. A relay needs time for a fresh ICE exchange.
+        if ((relayAvailable && !available) || (available && expiresAt <= Date.now() + 60_000)
+          || (force && relayAvailable && expiresAt <= iceExpiresAt)) throw new Error('Relay configuration unavailable')
+        configuration = { ...configuration, iceServers: result.iceServers }
+        relayAvailable = available
+        iceExpiresAt = expiresAt
+        iceRenewAt = expiresAt - Math.min(120_000, Math.max(60_000, (expiresAt - startedAt) / 5))
+        return 'updated'
+      } catch {
+        if (disposed || generation !== iceGeneration) return 'cancelled'
+        if (!relayAvailable || (iceExpiresAt <= Date.now() && !peer)) {
+          relayAvailable = false
+          configuration = { ...configuration, iceServers: STUN }
+          iceExpiresAt = Date.now() + 30_000
+        }
+        return 'failed'
+      } finally {
+        clearTimeout(request.timeout)
+        if (iceRequest === request) iceRequest = undefined
+      }
+    })()
+    return request.promise
+  }
+
+  function scheduleIceRenewal(connection: RTCPeerConnection) {
+    if (options.iceEndpoint === null || options.rtcConfiguration?.iceServers || !relayAvailable || iceRenewalPeer === connection) return
+    iceRenewalPeer = connection
+    const expiresAt = iceExpiresAt
+    let attempt = 0
+    const current = () => !disposed && peer === connection && channel?.readyState === 'open'
+    const renew = async () => {
+      iceRenewalTimer = undefined
+      if (!current()) return
+      const result = await refreshIce(true)
+      if (!current() || result === 'cancelled') return
+      if (result === 'updated') {
+        // Updating setConfiguration alone does not replace an existing TURN
+        // allocation. Rebuild through the pinned, mutually authenticated handshake.
+        retryPeer()
+        return
+      }
+      const remaining = expiresAt - Date.now()
+      if (remaining <= 0) { retryPeer(); return }
+      const delay = ICE_RENEWAL_RETRIES[attempt++]
+      iceRenewalTimer = delay === undefined
+        ? setTimeout(() => { iceRenewalTimer = undefined; if (current()) retryPeer() }, remaining)
+        : setTimeout(() => { void renew() }, Math.min(delay, remaining))
     }
+    iceRenewalTimer = setTimeout(() => { void renew() }, Math.max(0, iceRenewAt - Date.now()))
   }
 
   function closePeer() {
+    clearTimeout(iceRenewalTimer)
+    iceRenewalTimer = undefined
+    iceRenewalPeer = undefined
+    iceGeneration++
+    clearTimeout(iceRequest?.timeout)
+    iceRequest?.controller.abort()
+    iceRequest = undefined
     clearTimeout(connectionTimeout)
     clearTimeout(peerRetryTimer)
     connectionTimeout = undefined
@@ -233,6 +293,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
     clearTimeout(peerRetryTimer)
     issue = undefined
     if (state !== 'connected') status('connected')
+    scheduleIceRenewal(connection)
   }
 
   function attachChannel(next: RTCDataChannel, connection: RTCPeerConnection) {
@@ -532,7 +593,6 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
   function stopNetwork() {
     networkStarted = false
     startupGeneration++
-    fetchAbort.abort()
     clearInterval(helloTimer)
     clearInterval(heartbeatTimer)
     clearTimeout(reconnectTimer)
