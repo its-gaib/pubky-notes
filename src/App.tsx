@@ -18,6 +18,8 @@ import type { LocalNotebook } from './lib/local-notebook'
 import { GUEST_SCOPE, mergeRemoteNotebook, scopeForSession, synchronizeNotebook, uploadNotebook } from './lib/notebook-sync'
 import { useCollaboration } from './hooks/useCollaboration'
 import type { SharedNoteDocument } from './lib/shared-note'
+import { notePath, noteUrl, parseNoteRoute } from './lib/note-links'
+import type { NoteRoute } from './lib/note-links'
 
 const SAMPLE_MARKDOWN = [
   '## Heading',
@@ -55,7 +57,6 @@ function errorMessage(error: unknown) {
 function dateLabel(value: string) { return new Date(value).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) }
 function historyKey(scope: string, note: Note) { return JSON.stringify([scope, note.id, note.createdAt, note.crdt?.lineage]) }
 function sameHistory(left: Note, right: Note) { return left.id === right.id && left.createdAt === right.createdAt && left.crdt?.lineage === right.crdt?.lineage }
-function publicUrl(owner: string, id: string) { const url = new URL(window.location.origin); url.searchParams.set('owner', owner); url.searchParams.set('note', id); return url.href }
 function download(note: Note) {
   const blob = new Blob([`# ${note.title || 'Untitled note'}\n\n${note.content}`], { type: 'text/markdown;charset=utf-8' })
   const url = URL.createObjectURL(blob)
@@ -120,16 +121,31 @@ function PublicNote({ owner, id }: { owner: string; id: string }) {
 }
 
 export default function App() {
-  const params = new URLSearchParams(window.location.search)
-  if (params.has('owner') && params.has('note')) return <PublicNote owner={params.get('owner')!} id={params.get('note')!} />
-  return <Notebook />
+  const [route, setRoute] = useState(() => parseNoteRoute(window.location))
+  useEffect(() => {
+    const changed = () => setRoute(parseNoteRoute(window.location))
+    window.addEventListener('popstate', changed)
+    return () => window.removeEventListener('popstate', changed)
+  }, [])
+  const navigate = useCallback((path: string, replace = false) => {
+    // An invitation belongs to the collaboration hook; routing must not eat it.
+    const destination = path + window.location.hash
+    if (destination !== window.location.pathname + window.location.search + window.location.hash) {
+      window.history[replace ? 'replaceState' : 'pushState'](null, '', destination)
+    }
+    setRoute(parseNoteRoute(window.location))
+  }, [])
+  if (route.kind === 'public') return <PublicNote key={`${route.owner}/${route.id}`} owner={route.owner} id={route.id} />
+  return <Notebook route={route} navigate={navigate} />
 }
 
-function Notebook() {
+function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: string, replace?: boolean) => void }) {
   const [records, setRecords] = useState<NoteRecord[]>(() => [scratchpad()])
   const [activeId, setActiveId] = useState('')
   const [session, setSession] = useState<Session | null>(null)
   const [initializing, setInitializing] = useState(true)
+  const [restoringNotebook, setRestoringNotebook] = useState(true)
+  const [routeRefreshing, setRouteRefreshing] = useState(false)
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<'all' | 'private' | 'public' | 'trash'>('all')
   const [selectedFolder, setSelectedFolder] = useState<string | null>(null)
@@ -174,8 +190,25 @@ function Notebook() {
   const editor = useRef<HTMLTextAreaElement>(null)
   const titleEditor = useRef<HTMLInputElement>(null)
   const importer = useRef<HTMLInputElement>(null)
+  const routeRef = useRef(route); routeRef.current = route
+  const navigateRoute = useCallback((path: string, replace = false) => {
+    routeRef.current = parseNoteRoute(new URL(path, window.location.origin))
+    navigate(path, replace)
+  }, [navigate])
+  const navigateToNote = useCallback((id: string, capturedScope = scopeRef.current, replace = false) => {
+    // A remembered account's local cache remains editable while reconnecting.
+    // An incoming private URL still requires its actual authenticated owner.
+    if (capturedScope !== GUEST_SCOPE && !sessionRef.current && routeRef.current.kind === 'home') return
+    navigateRoute(notePath(capturedScope === GUEST_SCOPE ? null : capturedScope.split(':')[1], id), replace)
+  }, [navigateRoute])
   const visibleRecords = records.filter(row => (row.note.deleted === true) === (filter === 'trash'))
-  const active = visibleRecords.find(row => row.note.id === activeId) ?? visibleRecords[0]
+  const requestedNote = route.kind === 'private' || route.kind === 'local'
+  const ownsPrivateRoute = route.kind === 'private' && !!session && session.info.publicKey.z32() === route.owner && scope === scopeForSession(session)
+  const canOpenRoute = route.kind === 'local' ? scope === GUEST_SCOPE : ownsPrivateRoute
+  const routeLoading = requestedNote && (initializing || restoringNotebook || routeRefreshing)
+  const active = requestedNote
+    ? canOpenRoute && !routeLoading ? records.find(row => row.note.id === route.id && row.note.id !== exampleId.current) : undefined
+    : route.kind === 'home' ? visibleRecords.find(row => row.note.id === activeId) ?? visibleRecords[0] : undefined
   const note = active?.note
   const owner = session?.info.publicKey.z32() ?? (scope !== GUEST_SCOPE ? scope.split(':')[1] : '')
   const notice = useCallback((message: string, error = false) => setToast({ message, error }), [])
@@ -241,6 +274,8 @@ function Notebook() {
             replaceRecords([...recordsRef.current.filter(row => !sameHistory(row.note, record.note) && row.note.id !== recovered.note.id), recovered])
             if (activeIdRef.current === record.note.id) {
               activeIdRef.current = recovered.note.id; setActiveId(recovered.note.id)
+              const requested = routeRef.current
+              if (requested.kind === 'home' || (requested.kind === 'local' && capturedScope === GUEST_SCOPE && requested.id === record.note.id) || (requested.kind === 'private' && capturedScope !== GUEST_SCOPE && requested.owner === capturedScope.split(':')[1] && requested.id === record.note.id)) navigateToNote(recovered.note.id, capturedScope, true)
               void setLocalActiveId(capturedScope, recovered.note.id).catch(error => notice(errorMessage(error), true))
             }
           }
@@ -259,7 +294,7 @@ function Notebook() {
     const pending = localQueue.current.then(work, work)
     localQueue.current = pending.catch(() => undefined)
     return pending
-  }, [replaceRecords, notice])
+  }, [replaceRecords, notice, navigateToNote])
   const persistFolders = useCallback((folders: string[], capturedScope = scopeRef.current): Promise<void> => {
     const entry = { scope: capturedScope, folders }
     dirtyFolders.current = entry
@@ -284,10 +319,11 @@ function Notebook() {
     exampleId.current = null
     if (select) {
       activeIdRef.current = row.note.id; setActiveId(row.note.id); setMode('write'); setQuery(''); setFilter('all'); setSelectedFolder(null); setMobileList(false)
+      navigateToNote(row.note.id, capturedScope)
     }
     await persistRecord(row, capturedScope)
     if (select && scopeRef.current === capturedScope) await setLocalActiveId(capturedScope, row.note.id)
-  }, [persistRecord, replaceRecords])
+  }, [persistRecord, replaceRecords, navigateToNote])
   const beforeCollaborativeChange = useCallback((doc: SharedNoteDocument) => {
     if (activeIdRef.current !== doc.note.id) return
     const field = document.activeElement === editor.current ? 'content' : document.activeElement === titleEditor.current ? 'title' : null
@@ -347,15 +383,20 @@ function Notebook() {
     const selection = focused && editor.current ? [editor.current.selectionStart, editor.current.selectionEnd] : null
     replaceRecords(next)
     if (JSON.stringify(foldersRef.current) !== JSON.stringify(notebook.folders)) { foldersRef.current = notebook.folders; setExplicitFolders(notebook.folders) }
-    const selected = preferredId ?? recoveredActive ?? (replace ? notebook.activeId : activeIdRef.current) ?? ''
-    const nextId = next.some(row => row.note.id === selected) ? selected : notebook.activeId || next.find(row => !row.note.deleted)?.note.id || ''
+    const requested = routeRef.current
+    const requestedId = requested.kind === 'local' && capturedScope === GUEST_SCOPE ? requested.id
+      : requested.kind === 'private' && sessionRef.current?.info.publicKey.z32() === requested.owner && capturedScope === scopeForSession(sessionRef.current) ? requested.id : undefined
+    const selected = preferredId ?? recoveredActive ?? requestedId ?? (replace ? notebook.activeId : activeIdRef.current) ?? ''
+    // A requested link is exact: never silently substitute another cached note.
+    const nextId = requestedId && !preferredId && !recoveredActive ? requestedId : next.some(row => row.note.id === selected) ? selected : notebook.activeId || next.find(row => !row.note.deleted)?.note.id || ''
     activeIdRef.current = nextId; setActiveId(nextId)
+    if (recoveredActive && requestedId) navigateToNote(recoveredActive, capturedScope, true)
     if (selection) requestAnimationFrame(() => editor.current?.setSelectionRange(selection[0], selection[1]))
     const newerLocalEdits = next.some(row => row.note.id !== exampleId.current && snapshotRevisions.get(row.note.id) !== noteRevision(row.note))
     setNeedsSync(newerLocalEdits || !!notebook.pending.length || notebook.foldersPending || !!dirtyLocal.current.size || !!dirtyFolders.current)
     setStatus(dirtyLocal.current.size || dirtyFolders.current ? 'Saving on this device…' :
       sessionRef.current && !newerLocalEdits && !notebook.pending.length && !notebook.foldersPending ? 'Saved to Pubky' : next[0]?.note.id === exampleId.current ? 'Sample' : 'Saved on this device')
-  }, [replaceRecords, persistRecord])
+  }, [replaceRecords, persistRecord, navigateToNote])
   const sync = useCallback(async (pull = false, background = false) => {
     while (syncJob.current) {
       const previous = syncJob.current
@@ -404,14 +445,36 @@ function Notebook() {
         if (canceled) return
         scopeRef.current = accountScope; setScope(accountScope); sessionRef.current = saved; setSession(saved)
         try { localStorage.setItem(ACCOUNT_KEY, accountScope) } catch { /* Account isolation still uses the captured scope. */ }
+        const requested = routeRef.current
+        const adoptedId = remembered === GUEST_SCOPE && requested.kind === 'local' && 'idMap' in local ? (local.idMap as Record<string, string>)[requested.id] : undefined
+        if (adoptedId) navigateToNote(adoptedId, accountScope, true)
+        else if (remembered === GUEST_SCOPE && requested.kind === 'local') navigateRoute('/', true)
         displayNotebook(local, accountScope, true)
         setInitializing(false)
         await sync(true)
       } catch (error) { if (!canceled) notice(`${errorMessage(error)} Your local notes are retained.`, true) }
-      finally { if (!canceled) setInitializing(false) }
+      finally { if (!canceled) { setInitializing(false); setRestoringNotebook(false) } }
     })()
     return () => { canceled = true }
-  }, [displayNotebook, notice, sync])
+  }, [displayNotebook, notice, sync, navigateToNote, navigateRoute])
+  useEffect(() => {
+    if (initializing || restoringNotebook) return
+    if (route.kind === 'home') {
+      if (note && note.id !== exampleId.current) navigateToNote(note.id, scope, true)
+      return
+    }
+    if (route.kind !== 'private' && route.kind !== 'local') return
+    setMobileList(false); setMenuOpen(false)
+    if (!canOpenRoute) return
+    activeIdRef.current = route.id; setActiveId(route.id)
+    const target = recordsRef.current.find(row => row.note.id === route.id)
+    if (target) {
+      // Selecting a URL must not clear a folder or search chosen while the
+      // initial notebook load was finishing. Only Trash needs a view change.
+      setFilter(current => target.note.deleted ? 'trash' : current === 'trash' ? 'all' : current)
+      void setLocalActiveId(scopeRef.current, route.id).catch(error => notice(errorMessage(error), true))
+    }
+  }, [route, initializing, restoringNotebook, canOpenRoute, note?.id, note?.deleted, scope, navigateToNote, notice])
   useEffect(() => {
     if (initializing || busy || !session || !needsSync) return
     timer.current = setTimeout(() => { sync().catch(error => notice(`${errorMessage(error)} Changes remain on this device.`, true)) }, 900)
@@ -443,7 +506,7 @@ function Notebook() {
     try {
       const next = collaboration.edit(note, patch)
       const row = { ...active!, note: next }
-      if (exampleId.current === note.id) exampleId.current = null
+      if (exampleId.current === note.id) { exampleId.current = null; navigateToNote(next.id, scopeRef.current, true) }
       replaceRecords(recordsRef.current.map(current => current.note.id === next.id ? row : current))
       void persistRecord(row).catch(error => notice(errorMessage(error), true))
       void setLocalActiveId(scopeRef.current, next.id).catch(error => notice(errorMessage(error), true))
@@ -456,11 +519,12 @@ function Notebook() {
       const row = { note: draft, published: null }
       replaceRecords([row, ...recordsRef.current.filter(existing => existing.note.id !== exampleId.current)]); exampleId.current = null
       activeIdRef.current = draft.id; setActiveId(draft.id); setMode('write'); setQuery(''); setFilter('all'); setMobileList(false); setMenuOpen(false)
+      navigateToNote(draft.id)
       await persistRecord(row); await setLocalActiveId(scopeRef.current, draft.id)
     } catch (error) { notice(errorMessage(error), true) }
   }
   async function switchNote(id: string) {
-    try { await flushLocal(); activeIdRef.current = id; setActiveId(id); setMobileList(false); await setLocalActiveId(scopeRef.current, id) } catch (error) { notice(errorMessage(error), true) }
+    try { await flushLocal(); activeIdRef.current = id; setActiveId(id); setMobileList(false); if (id !== exampleId.current) navigateToNote(id); else navigateRoute('/'); await setLocalActiveId(scopeRef.current, id) } catch (error) { notice(errorMessage(error), true) }
   }
   function openFolder(path: string) {
     setSelectedFolder(path); setFilter('all'); setQuery(''); setMobileList(true); setMenuOpen(false)
@@ -604,7 +668,11 @@ function Notebook() {
       const adopted = previousScope === GUEST_SCOPE ? await adoptGuestNotebook(GUEST_SCOPE, accountScope) : await readLocalNotebook(accountScope)
       scopeRef.current = accountScope; setScope(accountScope); sessionRef.current = signedIn; setSession(signedIn)
       try { localStorage.setItem(ACCOUNT_KEY, accountScope) } catch { /* Account cache remains scoped in IndexedDB. */ }
-      const preferred = previousScope === GUEST_SCOPE && 'idMap' in adopted ? (adopted.idMap as Record<string, string>)[previousActive] : previousScope === accountScope ? previousActive : undefined
+      const requested = routeRef.current
+      const adoptedId = previousScope === GUEST_SCOPE && requested.kind === 'local' && 'idMap' in adopted ? (adopted.idMap as Record<string, string>)[requested.id] : undefined
+      if (adoptedId) navigateToNote(adoptedId, accountScope, true)
+      else if (previousScope === GUEST_SCOPE && requested.kind === 'local') navigateRoute('/', true)
+      const preferred = requested.kind === 'private' ? undefined : previousScope === GUEST_SCOPE && 'idMap' in adopted ? (adopted.idMap as Record<string, string>)[previousActive] : previousScope === accountScope ? previousActive : undefined
       displayNotebook(adopted, accountScope, true, preferred)
       candidate = null
       committing = false; busyRef.current = false; setBusy(false)
@@ -695,7 +763,7 @@ function Notebook() {
       if (note.id === exampleId.current) {
         exampleId.current = null; replaceRecords(recordsRef.current.filter(row => row.note.id !== note.id))
       } else await applyChangedNote(editNote(note, { deleted: true }))
-      activeIdRef.current = ''; setActiveId(''); setModal(null)
+      activeIdRef.current = ''; setActiveId(''); setModal(null); navigateRoute('/', true)
       notice(active?.published ? 'Moved to Trash. The public copy is removed when synchronization succeeds.' : 'Moved to Trash.')
     } catch (error) { notice(errorMessage(error), true) } finally { setBusy(false) }
   }
@@ -706,6 +774,7 @@ function Notebook() {
     try {
       await flushLocal(); await applyChangedNote(editNote(target, { deleted: false }))
       setFilter('all'); setSelectedFolder(null); activeIdRef.current = id; setActiveId(id)
+      if (routeRef.current.kind === 'home' || ('id' in routeRef.current && routeRef.current.id !== id)) navigateToNote(id)
       await setLocalActiveId(scopeRef.current, id); notice('Note restored.')
     } catch (error) { notice(errorMessage(error), true) } finally { setBusy(false) }
   }
@@ -725,15 +794,50 @@ function Notebook() {
     edit({ content: note.content.slice(0, start) + before + selection + after + note.content.slice(end) })
     requestAnimationFrame(() => { editor.current?.focus(); editor.current?.setSelectionRange(start + before.length, end + before.length) })
   }
-  async function copy(value: string) { try { await navigator.clipboard.writeText(value); notice('Copied to clipboard.') } catch { notice('Clipboard access was blocked. Select and copy the link instead.', true) } }
+  async function copy(value: string, message = 'Copied to clipboard.') { try { await navigator.clipboard.writeText(value); notice(message) } catch { notice('Clipboard access was blocked. Select and copy the link instead.', true) } }
+  async function copyNoteLink() {
+    if (!note || note.id === exampleId.current) return
+    const captured = note, capturedScope = scopeRef.current
+    try {
+      await flushLocal()
+      const destination = await resolveLocalNoteDestination(capturedScope, captured)
+      if (destination.scope !== capturedScope || scopeRef.current !== capturedScope) throw new Error('Your notebook changed. Open the note again to copy its link.')
+      const linkOwner = capturedScope === GUEST_SCOPE ? null : capturedScope.split(':')[1]
+      await copy(noteUrl(linkOwner, destination.id), linkOwner
+        ? 'Private note link copied. To share it with others, publish a public copy first.'
+        : 'Local note link copied. It opens only in this browser until you connect Pubky.')
+    } catch (error) { notice(errorMessage(error), true) }
+  }
+  async function retryNoteLink() {
+    setRouteRefreshing(true)
+    try {
+      if (sessionRef.current) await sync(true)
+      else {
+        const capturedScope = scopeRef.current
+        await flushLocal()
+        displayNotebook(await readLocalNotebook(capturedScope), capturedScope)
+      }
+    } catch (error) { notice(`${errorMessage(error)} Your local notes are retained.`, true) }
+    finally { setRouteRefreshing(false) }
+  }
+  function openNotebook() {
+    setFilter('all'); setSelectedFolder(null); setQuery(''); setMobileList(true)
+    navigateRoute('/')
+  }
   const paths = folderPaths(records.filter(row => !row.note.deleted), explicitFolders)
   const moveTarget = records.find(row => row.note.id === moveTargetId)?.note
   const searching = !!query.trim()
   const filtered = filterNotes(visibleRecords, query, filter === 'trash' ? 'all' : filter, selectedFolder).sort((a, b) => b.note.updatedAt.localeCompare(a.note.updatedAt))
   const listTitle = filter === 'trash' ? 'Trash' : searching ? 'Search results' : selectedFolder !== null ? folderLabel(selectedFolder) || 'Unfiled' : filter === 'all' ? 'All notes' : filter === 'private' ? 'Private notes' : 'Public notes'
   const words = note?.content.trim().split(/\s+/).filter(Boolean).length ?? 0
-  const publicChanged = active?.published && (active.published.content !== note?.content || active.published.title !== note?.title)
+  const publicChanged = active?.published && (active?.published.content !== note?.content || active?.published.title !== note?.title)
   const locked = busy || initializing
+  const routeIssue = route.kind === 'invalid' ? { title: 'Invalid note link', message: 'This note link is not valid.' }
+    : requestedNote && !routeLoading && !note ? route.kind === 'private' && !session ? { title: 'Private note', message: 'Connect the Pubky identity that owns this note to open it.' }
+      : route.kind === 'private' && !ownsPrivateRoute ? { title: 'Different Pubky identity', message: 'This private note belongs to another identity. Connect its owner to open it.' }
+        : route.kind === 'local' && scope !== GUEST_SCOPE ? { title: 'Local note', message: 'This link belongs to drafts saved in this browser before connecting Pubky. Open your notebook to find any drafts already uploaded.' }
+          : { title: 'Note not found', message: route.kind === 'local' ? 'This local note is not available in this browser.' : 'This private note could not be found in your notebook.' }
+      : null
   const navigationCollapsed = mobileViewport ? !menuOpen : layout.navigationCollapsed
   const notesCollapsed = mobileViewport ? !mobileList : layout.notesCollapsed
   const bothCollapsed = navigationCollapsed && notesCollapsed
@@ -780,7 +884,7 @@ function Notebook() {
       <div className="note-list">{filtered.map(row => <div key={row.note.id} className={`note-card note-entry ${row.note.id === note?.id ? 'selected' : ''}`}><button className="note-select" aria-label={`Open note ${row.note.title || 'Untitled note'}`} onClick={() => void switchNote(row.note.id)} disabled={locked}><div className="note-card-title"><FileText size={15} /><strong>{row.note.title || 'Untitled note'}</strong>{row.note.crdt?.version === 2 && <UsersRound size={13} aria-label="Collaborative note" />}{row.published ? <Globe2 size={13} /> : <LockKeyhole size={13} />}</div><p className="note-card-excerpt">{row.note.content.replace(/[#*>`_\[\]]/g, '').trim().slice(0, 115)}</p><div className="note-card-meta"><span>{dateLabel(row.note.updatedAt)}</span><span className="folder-path" title={row.note.folder || 'Unfiled'}><Folder size={11} /><span>{row.note.folder || 'Unfiled'}</span></span></div></button><SidebarActions label={`Note actions for ${row.note.title || 'Untitled note'}`} disabled={locked} items={row.note.deleted ? [{ label: 'Restore', action: () => void restoreNote(row.note.id) }] : [{ label: 'Move to…', action: () => openMove(row.note.id) }]} /></div>)}{!visibleRecords.length && filter !== 'trash' && !initializing && <button className="note-card selected" onClick={() => setMobileList(false)}><div className="note-card-title"><Code2 size={15} /><strong>Markdown basics</strong></div><div className="note-card-meta">Sample</div></button>}{!filtered.length && (records.length > 0 || filter === 'trash') && <div className="empty-state"><Search size={25} /><p>{filter === 'trash' ? 'Trash is empty.' : searching ? 'No notes match your search.' : 'No notes.'}</p><button className="button ghost small" onClick={() => { if (searching || filter !== 'all' || selectedFolder !== null) { setQuery(''); setFilter('all'); setSelectedFolder(null) } else void addNote() }}> {searching || filter !== 'all' || selectedFolder !== null ? 'Show all notes' : 'New note'}</button></div>}</div>
     </section>{!bothCollapsed && <button className="pane-toggle notes-edge" aria-label={notesCollapsed ? 'Expand notes' : 'Collapse notes'} title={notesCollapsed ? 'Expand notes' : 'Collapse notes'} aria-controls="notebook-notes" aria-expanded={!notesCollapsed} onClick={() => mobileViewport ? setMobileList(current => !current) : setLayout(current => ({ ...current, notesCollapsed: !current.notesCollapsed }))}>{notesCollapsed ? <ChevronRight size={17} /> : <ChevronLeft size={17} />}</button>}</div>
     <main className="editor-panel">
-      {note ? <><div className="editor-topbar"><div className="note-location"><div className="mode-switch"><button className={mode === 'write' ? 'active' : ''} onClick={() => setMode('write')}><PenLine size={14} /> Write</button><button className={mode === 'preview' ? 'active' : ''} onClick={() => setMode('preview')}><BookOpen size={14} /> Preview</button></div></div>{mode === 'write' && <div className="formatting-toolbar" aria-label="Markdown formatting">{[{ icon: Bold, title: 'Bold', before: '**', after: '**' }, { icon: Italic, title: 'Italic', before: '_', after: '_' }, { icon: Heading2, title: 'Heading', before: '\n## ', after: '' }, { icon: List, title: 'List', before: '\n- ', after: '' }, { icon: Quote, title: 'Quote', before: '\n> ', after: '' }, { icon: Code2, title: 'Code', before: '`', after: '`' }, { icon: Link, title: 'Link', before: '[', after: '](https://)' }].map(item => <button key={item.title} className="icon-button" aria-label={item.title} title={item.title} disabled={locked || note.deleted} onClick={() => format(item.before, item.after)}><item.icon size={16} /></button>)}</div>}<div className="editor-actions">{session && <span className={`visibility-badge ${active.published ? 'public' : ''}`}>{active.published ? <Globe2 size={13} /> : <LockKeyhole size={13} />}{active.published ? 'Public copy' : 'Private'}</span>}{note.content === SAMPLE_MARKDOWN && <button className="icon-button" onClick={() => void copy(SAMPLE_MARKDOWN)} aria-label="Copy Markdown" title="Copy Markdown"><Copy size={16} /></button>}<button className="button ghost small" onClick={() => download(note)} aria-label="Export Markdown" title="Export Markdown"><ArrowDownToLine size={16} /></button>{note.deleted && <button className="button secondary small" disabled={locked} onClick={() => void restoreNote(note.id)}>Restore</button>}<button className="button secondary small collaboration-button" onClick={() => setModal('collaborate')} disabled={locked || note.deleted} aria-label="Collaborate"><UsersRound size={15} /><span>Collaborate</span></button><button className="button secondary small" onClick={() => setModal('share')} disabled={locked || note.deleted}><Globe2 size={14} /> Share</button><button className="icon-button" onClick={() => setModal('delete')} disabled={locked || note.deleted} aria-label="Delete note"><Trash2 size={16} /></button></div></div>
+      {routeLoading ? <div className="empty-state editor-empty"><LoaderCircle className="spin" aria-label="Loading note" /><p>Opening note…</p></div> : routeIssue ? <div className="empty-state editor-empty"><LockKeyhole size={30} /><h2>{routeIssue.title}</h2><p>{routeIssue.message}</p><div className="modal-actions">{route.kind === 'private' && !ownsPrivateRoute && <button className="button primary" disabled={locked} onClick={() => void connect()}>Connect Pubky</button>}{requestedNote && canOpenRoute && <button className="button secondary" disabled={locked} onClick={() => void retryNoteLink()}>Retry</button>}<button className="button secondary" onClick={openNotebook}>Open your notebook</button></div></div> : note ? <><div className="editor-topbar"><div className="note-location"><div className="mode-switch"><button className={mode === 'write' ? 'active' : ''} onClick={() => setMode('write')}><PenLine size={14} /> Write</button><button className={mode === 'preview' ? 'active' : ''} onClick={() => setMode('preview')}><BookOpen size={14} /> Preview</button></div></div>{mode === 'write' && <div className="formatting-toolbar" aria-label="Markdown formatting">{[{ icon: Bold, title: 'Bold', before: '**', after: '**' }, { icon: Italic, title: 'Italic', before: '_', after: '_' }, { icon: Heading2, title: 'Heading', before: '\n## ', after: '' }, { icon: List, title: 'List', before: '\n- ', after: '' }, { icon: Quote, title: 'Quote', before: '\n> ', after: '' }, { icon: Code2, title: 'Code', before: '`', after: '`' }, { icon: Link, title: 'Link', before: '[', after: '](https://)' }].map(item => <button key={item.title} className="icon-button" aria-label={item.title} title={item.title} disabled={locked || note.deleted} onClick={() => format(item.before, item.after)}><item.icon size={16} /></button>)}</div>}<div className="editor-actions">{session && <span className={`visibility-badge ${active?.published ? 'public' : ''}`}>{active?.published ? <Globe2 size={13} /> : <LockKeyhole size={13} />}{active?.published ? 'Public copy' : 'Private'}</span>}{note.id !== exampleId.current && <button className="icon-button" onClick={() => void copyNoteLink()} disabled={locked} aria-label="Copy note link" title="Copy note link"><Link size={16} /></button>}{note.content === SAMPLE_MARKDOWN && <button className="icon-button" onClick={() => void copy(SAMPLE_MARKDOWN)} aria-label="Copy Markdown" title="Copy Markdown"><Copy size={16} /></button>}<button className="button ghost small" onClick={() => download(note)} aria-label="Export Markdown" title="Export Markdown"><ArrowDownToLine size={16} /></button>{note.deleted && <button className="button secondary small" disabled={locked} onClick={() => void restoreNote(note.id)}>Restore</button>}<button className="button secondary small collaboration-button" onClick={() => setModal('collaborate')} disabled={locked || note.deleted} aria-label="Collaborate"><UsersRound size={15} /><span>Collaborate</span></button><button className="button secondary small" onClick={() => setModal('share')} disabled={locked || note.deleted}><Globe2 size={14} /> Share</button><button className="icon-button" onClick={() => setModal('delete')} disabled={locked || note.deleted} aria-label="Delete note"><Trash2 size={16} /></button></div></div>
       <div className="editor-content"><input ref={titleEditor} className="note-title-input" aria-label="Note title" placeholder="Untitled note" value={note.title} maxLength={200} disabled={locked || note.deleted} onChange={event => edit({ title: event.target.value })} />{mode === 'write' ? <textarea ref={editor} className="markdown-editor" aria-label="Markdown content" placeholder="Write a note…" value={note.content} disabled={locked || note.deleted} onChange={event => edit({ content: event.target.value })} spellCheck /> : <Markdown content={note.content} />}</div>
       <footer className="editor-bottom"><button className={`save-status ${status === 'Not saved on this device' ? 'save-error' : ''}`} onClick={() => void flush().catch(error => notice(errorMessage(error), true))} title="Save changes">{status === 'Saving on this device…' || status === 'Syncing…' ? <LoaderCircle size={13} className="spin" /> : session ? <CheckCheck size={14} /> : <PenLine size={13} />}{status}</button>{collaboration.view.noteId && <button className="collaboration-status" onClick={() => setModal('collaborate')}><UsersRound size={13} />{collaboration.view.status?.state === 'connected' ? collaboration.view.peerReceived ? 'Peer received' : 'Connected' : collaboration.view.status?.state === 'approval' ? 'Approval needed' : collaboration.view.status?.state === 'waiting' ? 'Waiting for collaborator' : 'Collaborator offline'}</button>}<span>{words} words</span></footer></> : initializing ? <div className="empty-state editor-empty"><LoaderCircle className="spin" aria-label="Loading notes" /></div> : <><div className="editor-topbar"><div className="editor-actions"><button className="button ghost small" onClick={() => void copy(SAMPLE_MARKDOWN)}><Copy size={16} /> Copy Markdown</button><button className="button secondary small" onClick={() => void addNote()} disabled={locked}><Plus size={16} /> New note</button></div></div><div className="editor-content"><h1 className="note-title-input">Markdown basics</h1><textarea className="markdown-editor" aria-label="Sample Markdown" readOnly value={SAMPLE_MARKDOWN} /></div></>}
     </main>
@@ -815,10 +919,10 @@ function Notebook() {
       </>}
     </Modal>}
     {modal === 'auth' && <Modal title="Connect Pubky" close={closeModal}><p className="modal-intro">Sign in with your existing identity in <strong>Pubky Ring</strong>. Your keys stay in your wallet.</p>{qr ? <img className="qr-code" src={qr} alt="Scan with Pubky Ring to authorize this notebook" width={240} height={240} /> : !authError ? <div className="auth-loading"><LoaderCircle className="spin" /><p>Preparing your connection…</p></div> : null}{authUrl && <><a className="button primary auth-link" href={authUrl}>Open Pubky Ring <ExternalLink size={15} /></a><button className="button secondary auth-link" onClick={() => void copy(authUrl)}><Copy size={15} /> Copy authorization link</button><p className="auth-instructions">Scan the code in Ring, or open the link on your phone. Approve access to this app’s private and public note folders.</p></>}{authError && <p className="inline-error" role="alert">{authError}</p>}{(authError || authUrl) && <button className="button ghost small" disabled={authStarting} onClick={() => void connect()}>Generate a fresh link</button>}<p className="hint">{IS_TESTNET ? 'Local testnet' : 'Mainnet'} · Need an identity? <a href="https://pubky.org" target="_blank" rel="noreferrer">Get Pubky Ring</a>. Your local drafts will join your saved notes and upload privately after login.</p></Modal>}
-    {modal === 'share' && note && <Modal title="Share note" close={closeModal}>{!session ? <><p>Connect Pubky to save this note and publish a public copy. Local drafts are saved on this device and upload privately after login.</p><button className="button primary" onClick={() => void connect()}>Connect Pubky <ChevronRight size={15} /></button></> : <><div className="share-status"><span className={`visibility-badge ${active.published ? 'public' : ''}`}>{active.published ? <Globe2 size={14} /> : <LockKeyhole size={14} />}{active.published ? 'Public copy published' : 'Only in your private notebook'}</span></div><p>Your draft stays under <code>/priv</code>. Publishing puts a copy under <code>/pub</code>, where anyone can read, discover, and download it.</p>{active.published && <><label className="field-label" htmlFor="public-link">PUBLIC NOTE LINK</label><div className="copy-link"><input id="public-link" readOnly value={publicUrl(owner, note.id)} onFocus={event => event.target.select()} /><button className="icon-button" onClick={() => void copy(publicUrl(owner, note.id))} aria-label="Copy public note link"><Copy size={17} /></button></div><p className="hint">{publicChanged ? 'Your private draft has changes that are not public yet.' : 'Your public copy is up to date.'}</p></>}<p className="hint">Unpublishing removes the public copy from your homeserver. Copies already downloaded may remain elsewhere.</p><div className="modal-actions">{active.published && <button className="button secondary" disabled={busy} onClick={() => void sharing('unpublish')}>Unpublish</button>}<button className="button primary" disabled={busy || (!!active.published && !publicChanged)} onClick={() => void sharing('publish')}>{busy ? <LoaderCircle className="spin" size={15} /> : <Globe2 size={15} />}{active.published ? 'Update public copy' : 'Publish public copy'}</button></div></>}</Modal>}
+    {modal === 'share' && note && <Modal title="Share note" close={closeModal}>{!session ? <><p>Connect Pubky to save this note and publish a public copy. Local drafts are saved on this device and upload privately after login.</p><button className="button primary" onClick={() => void connect()}>Connect Pubky <ChevronRight size={15} /></button></> : <><div className="share-status"><span className={`visibility-badge ${active?.published ? 'public' : ''}`}>{active?.published ? <Globe2 size={14} /> : <LockKeyhole size={14} />}{active?.published ? 'Public copy published' : 'Only in your private notebook'}</span></div><p>Your draft stays under <code>/priv</code>. Publishing puts a copy under <code>/pub</code>, where anyone can read, discover, and download it.</p>{active?.published && <><label className="field-label" htmlFor="public-link">PUBLIC NOTE LINK</label><div className="copy-link"><input id="public-link" readOnly value={noteUrl(owner, note.id, 'pub')} onFocus={event => event.target.select()} /><button className="icon-button" onClick={() => void copy(noteUrl(owner, note.id, 'pub'))} aria-label="Copy public note link"><Copy size={17} /></button></div><p className="hint">{publicChanged ? 'Your private draft has changes that are not public yet.' : 'Your public copy is up to date.'}</p></>}<p className="hint">Unpublishing removes the public copy from your homeserver. Copies already downloaded may remain elsewhere.</p><div className="modal-actions">{active?.published && <button className="button secondary" disabled={busy} onClick={() => void sharing('unpublish')}>Unpublish</button>}<button className="button primary" disabled={busy || (!!active?.published && !publicChanged)} onClick={() => void sharing('publish')}>{busy ? <LoaderCircle className="spin" size={15} /> : <Globe2 size={15} />}{active?.published ? 'Update public copy' : 'Publish public copy'}</button></div></>}</Modal>}
     {modal === 'move' && moveTarget && <Modal title="Move note" close={closeModal}><form onSubmit={event => { event.preventDefault(); void moveNote() }}><p className="move-note-name">{moveTarget.title || 'Untitled note'}</p><label className="field-label" htmlFor="move-destination">Move to</label><select id="move-destination" value={paths.includes(folderInput) || !folderInput ? folderInput : '__new__'} disabled={busy} onChange={event => { if (event.target.value !== '__new__') setFolderInput(event.target.value); else setFolderInput('New folder'); setFolderError('') }}><option value="">Unfiled</option>{paths.map(path => <option key={path} value={path}>{path}</option>)}<option value="__new__">New folder…</option></select><label className="field-label" htmlFor="note-folder">Folder path</label><input id="note-folder" value={folderInput} onChange={event => { setFolderInput(event.target.value); setFolderError('') }} placeholder="Unfiled" maxLength={512} disabled={busy} aria-describedby="folder-hint" /><p className="hint" id="folder-hint">Choose a folder above, or type a new path such as Work/Ideas. Leave empty for Unfiled.</p>{folderError && <p className="inline-error" role="alert">{folderError}</p>}<div className="modal-actions"><button type="button" className="button secondary" onClick={closeModal} disabled={busy}>Cancel</button><button type="submit" className="button primary" disabled={busy}>{busy && <LoaderCircle size={15} className="spin" />}Move</button></div></form></Modal>}
     {modal === 'folder' && <Modal title={folderEditor.kind === 'create' ? 'New folder' : folderEditor.kind === 'rename' ? 'Rename folder' : 'Remove empty folder'} close={closeModal}><form onSubmit={event => { event.preventDefault(); void changeFolder() }}>{folderEditor.kind === 'remove' ? <p className="folder-context">Remove “{folderEditor.path}” and its empty subfolders?</p> : <>{folderEditor.kind === 'create' ? <><label className="field-label" htmlFor="folder-parent">Parent folder</label><select id="folder-parent" value={folderEditor.path} disabled={busy} onChange={event => setFolderEditor(current => ({ ...current, path: event.target.value }))}><option value="">No parent</option>{paths.map(path => <option key={path} value={path}>{path}</option>)}</select></> : <p className="folder-context">{folderEditor.path}</p>}<label className="field-label" htmlFor="folder-name">Folder name</label><input id="folder-name" value={folderInput} onChange={event => { setFolderInput(event.target.value); setFolderError('') }} maxLength={80} disabled={busy} autoFocus /></>}{folderError && <p className="inline-error" role="alert">{folderError}</p>}<div className="modal-actions"><button type="button" className="button secondary" onClick={closeModal} disabled={busy}>Cancel</button><button type="submit" className="button primary" disabled={busy}>{busy && <LoaderCircle size={15} className="spin" />}{folderEditor.kind === 'create' ? 'Create folder' : folderEditor.kind === 'rename' ? 'Rename folder' : 'Remove folder'}</button></div></form></Modal>}
-    {modal === 'delete' && note && <Modal title="Move note to Trash?" close={closeModal}><p>“{note.title || 'Untitled note'}” will move to Trash. Its private text and editing history remain recoverable{active.published ? '; the public copy is removed after synchronization' : ''}.</p><div className="modal-actions"><button className="button secondary" onClick={closeModal}>Keep note</button><button className="button danger" disabled={busy} onClick={() => void remove()}><Trash2 size={15} />Move to Trash</button></div></Modal>}
+    {modal === 'delete' && note && <Modal title="Move note to Trash?" close={closeModal}><p>“{note.title || 'Untitled note'}” will move to Trash. Its private text and editing history remain recoverable{active?.published ? '; the public copy is removed after synchronization' : ''}.</p><div className="modal-actions"><button className="button secondary" onClick={closeModal}>Keep note</button><button className="button danger" disabled={busy} onClick={() => void remove()}><Trash2 size={15} />Move to Trash</button></div></Modal>}
     {modal === 'help' && <Modal title="Help" close={closeModal}><div className="help-item"><LockKeyhole size={20} /><div><h3>Privacy</h3><p>Notes autosave to your Pubky homeserver under <code>/priv/notes/</code>. This restricts access, but is not end-to-end encryption: your homeserver operator can read the data.</p></div></div><div className="help-item"><Globe2 size={20} /><div><h3>Sharing</h3><p>Publish a public snapshot using Share. Later edits stay private until you choose Update public copy.</p></div></div><div className="help-item"><Code2 size={20} /><div><h3>Editing</h3><p>Write Markdown, preview as you go, and import or export <code>.md</code> files. Press Ctrl/⌘ + S to save immediately. Remote images are shown as text to protect reader privacy.</p></div></div><p className="hint">Drafts save on this device, then merge with your homeserver when connected. Local drafts upload privately after login. Trash retains private text and editing history. Clear browser data only after your notes have synced; overlapping edits may need cleanup.</p><a href="https://pubky.org/developer-guide.md" target="_blank" rel="noreferrer" className="button secondary small">Pubky documentation <ExternalLink size={14} /></a></Modal>}
   </div>
 }

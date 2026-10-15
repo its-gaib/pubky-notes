@@ -26,6 +26,7 @@ For a separately running local testnet, copy `.env.example` to `.env.local`, set
 - The account row reads your public name and avatar from `/pub/pubky.app/profile.json`, following [Pubky App Specs](https://github.com/pubky/pubky-app-specs/blob/main/SPEC.md#pubkyappuser). Click the abbreviated identifier to copy your complete `pubky…` identifier. Profile reads require no additional permissions; a missing profile or image falls back without blocking your notebook.
 - Edits save locally first, then synchronize to `/priv`. The app distinguishes device storage from verified homeserver storage. Publishing saves the private draft and writes the specific text reviewed when Publish was clicked; newly merged remote private text is not silently published. Later edits remain private until **Update public copy** is clicked.
 - A public link opens a read-only Markdown page without authentication. Public notes are publicly readable and discoverable, not secret links.
+- Each saved note has a stable editor URL, `/pubky<owner>/priv/notes/<id>.json`, even when it also has a published copy. Opening a private link requires that owner's connected account; the link does not grant access or publish the note. **Copy note link** copies it and briefly explains that sharing with other people requires publishing a public copy. Guest drafts use `/local/notes/<id>.json`, which works only with that browser's local notebook; signing in updates the address to the adopted note's private path.
 - Unpublish removes the public snapshot. Delete removes the public snapshot and records a private CRDT deletion marker. Trash retains the note and concurrent offline edits; Restore makes it visible again without republishing. This is recoverable deletion, not secure erasure. Unpublishing cannot retract copies already downloaded.
 - Pubky `/priv` restricts access but **is not end-to-end encrypted**. The homeserver operator can read it. See the [private storage contract](https://pubky.org/private-storage.md).
 
@@ -53,7 +54,7 @@ IndexedDB persistence protects reloads and temporary outages, but clearing site 
 vercel deploy --prod
 ```
 
-Public links use `/?owner=<z32-public-key>&note=<note-id>`.
+Public snapshot links use `/pubky<owner>/pub/notes/<id>.json`. Older `/?owner=<z32-public-key>&note=<note-id>` links still open the public snapshot. Note paths support direct visits, reloads, and browser Back/Forward navigation. Missing or inaccessible targets show an explicit state rather than opening a different note.
 
 ## Two-person collaboration
 
