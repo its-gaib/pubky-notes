@@ -171,10 +171,26 @@ async function insert(page: Page, edge: 'start' | 'end', text: string) {
 async function selectText(page: Page, start: number, end = start, direction: 'forward' | 'backward' | 'none' = 'forward') {
   const editor = page.getByRole('textbox', { name: 'Markdown content' })
   await editor.focus()
-  // Establish a native range, then release a modifier without changing it so
-  // React observes a real keyboard event. Presence still uses the genuine RTC channel.
-  await editor.evaluate((element, range) => (element as HTMLTextAreaElement).setSelectionRange(range.start, range.end, range.direction), { start, end, direction })
-  await editor.press('Shift')
+  const value = await editor.inputValue(), backward = direction === 'backward'
+  // Native keydown invalidates older restoration before the browser moves the
+  // selection. A direct setSelectionRange followed by a key event leaves a race.
+  if (start === 0 && end === value.length) {
+    await editor.press(backward ? 'Control+End' : 'Control+Home')
+    await page.keyboard.press(backward ? 'Control+Shift+Home' : 'Control+Shift+End')
+  } else {
+    await editor.press('Control+Home')
+    for (const _ of Array.from(value.slice(0, backward ? end : start))) await page.keyboard.press('ArrowRight')
+    if (start !== end) {
+      await page.keyboard.down('Shift')
+      try {
+        for (const _ of Array.from(value.slice(start, end))) await page.keyboard.press(backward ? 'ArrowLeft' : 'ArrowRight')
+      } finally { await page.keyboard.up('Shift') }
+    }
+  }
+  await expect.poll(() => editor.evaluate(element => {
+    const input = element as HTMLTextAreaElement
+    return [input.selectionStart, input.selectionEnd]
+  })).toEqual([start, end])
 }
 
 async function overlaysStayInsideEditor(page: Page) {
