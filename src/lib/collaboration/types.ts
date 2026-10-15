@@ -24,6 +24,8 @@ export interface CollaborationStatus {
   state: ConnectionState
   relayAvailable: boolean
   peerFingerprint?: string
+  /** Negotiated through authenticated SDP; absent for older app versions. */
+  presenceSupported?: boolean
 }
 
 export interface JoinRequest {

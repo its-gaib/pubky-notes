@@ -19,8 +19,10 @@ afterEach(cleanup)
 it('shows the profile name and photo, copies the complete identifier, and releases the image', async () => {
   mocks.profile.mockResolvedValue({ name: 'Ada Lovelace', image: 'avatar-reference' })
   mocks.avatar.mockResolvedValue(new Blob(['image'], { type: 'image/png' }))
-  const view = render(<AccountProfile {...props} />)
+  const onName = vi.fn()
+  const view = render(<AccountProfile {...props} onName={onName} />)
   await screen.findByText('Ada Lovelace')
+  expect(onName).toHaveBeenCalledExactlyOnceWith(owner, 'Ada Lovelace')
   await waitFor(() => expect(view.container.querySelector('img')?.src).toBe('blob:avatar'))
   fireEvent.click(screen.getByRole('button', { name: 'Copy Pubky identifier' }))
   expect(copy).toHaveBeenCalledExactlyOnceWith(`pubky${owner}`)
@@ -71,4 +73,16 @@ it('falls back to initials if the browser cannot decode the photo', async () => 
   fireEvent.error(view.container.querySelector('img')!)
   expect(screen.getByText('AL')).toBeTruthy()
   expect(screen.getByText('Ada Lovelace')).toBeTruthy()
+})
+
+it('does not share a late profile name from a previous account', async () => {
+  let resolve!: (profile: { name: string }) => void
+  mocks.profile.mockReturnValueOnce(new Promise(done => { resolve = done })).mockResolvedValueOnce({ name: 'Grace Hopper' })
+  const onName = vi.fn()
+  const view = render(<AccountProfile {...props} onName={onName} />)
+  const nextOwner = 'b'.repeat(52)
+  view.rerender(<AccountProfile {...props} owner={nextOwner} onName={onName} />)
+  await screen.findByText('Grace Hopper')
+  await act(async () => { resolve({ name: 'Ada Lovelace' }) })
+  expect(onName).toHaveBeenCalledExactlyOnceWith(nextOwner, 'Grace Hopper')
 })

@@ -1,15 +1,16 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Copy, LogOut } from 'lucide-react'
 import { loadAvatar, loadProfile } from '../lib/profile'
 
-interface Props { owner: string; disabled: boolean; copy: (value: string) => Promise<void>; disconnect: () => void }
+interface Props { owner: string; disabled: boolean; copy: (value: string) => Promise<void>; disconnect: () => void; onName?: (owner: string, name: string) => void }
 
 // Keying the inner component prevents a previous account flashing while effects reset.
 export default function AccountProfile(props: Props) { return <Identity key={props.owner} {...props} /> }
 
-function Identity({ owner, disabled, copy, disconnect }: Props) {
+function Identity({ owner, disabled, copy, disconnect, onName }: Props) {
   const [name, setName] = useState('')
   const [avatar, setAvatar] = useState('')
+  const onNameRef = useRef(onName); onNameRef.current = onName
   useEffect(() => {
     const controller = new AbortController()
     let objectUrl: string | undefined
@@ -18,6 +19,7 @@ function Identity({ owner, disabled, copy, disconnect }: Props) {
         const profile = await loadProfile(owner, controller.signal)
         if (controller.signal.aborted) return
         setName(profile.name)
+        onNameRef.current?.(owner, profile.name)
         if (profile.image) {
           const blob = await loadAvatar(profile.image, controller.signal)
           if (controller.signal.aborted) return

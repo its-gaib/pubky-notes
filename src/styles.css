@@ -63,6 +63,7 @@ button svg { pointer-events: none; }
 .pane-toggle svg { width: 17px; height: 17px; stroke-width: 1.8; }
 .pane-toggle:hover { color: #635c8f; }
 .pane-toggle:focus-visible { z-index: 3; outline-offset: -3px; }
+.app-shell:not(.navigation-collapsed) .navigation-edge { right: -10px; width: 20px; }
 .sidebar {
   display: flex;
   flex-direction: column;
@@ -86,7 +87,7 @@ button svg { pointer-events: none; }
 .folder-tree { min-height: 0; overflow-x: hidden; overflow-y: auto; padding: 3px; margin: 0 -3px; }
 .folder-tree button:focus-visible { outline-offset: -2px; }
 .new-folder-button { margin-bottom: 3px; }
-.folder-entry { display: grid; grid-template-columns: minmax(0, 1fr) 28px; align-items: start; min-width: 0; }
+.folder-entry { display: grid; grid-template-columns: minmax(0, 1fr) 24px 26px; align-items: start; min-width: 0; border-radius: 5px; }
 .sidebar-actions { display: contents; }
 .row-actions-button.icon-button { grid-column: 2; width: 28px; height: 32px; color: #767582; }
 .sidebar-actions-menu { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 2px; margin: 0 0 5px; padding: 4px; border: 1px solid #e0deea; border-radius: 6px; background: #fff; }
@@ -101,7 +102,26 @@ button svg { pointer-events: none; }
 .folder-select > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .folder-select:hover { background: #eaeae8; color: #444753; }
 .folder-select.active { background: #eae9f5; color: #6661af; font-weight: 550; }
-.folder-root.nav-item { min-height: 33px; margin-bottom: 2px; padding-top: 6px; padding-bottom: 6px; }
+.tree-note { display: flex; align-items: center; gap: 6px; width: 100%; min-width: 0; min-height: 30px; padding: 5px 4px; border: 0; border-radius: 5px; background: transparent; color: #666c79; text-align: left; font-size: 13px; line-height: 1.4; }
+.tree-note > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-note > svg { stroke-width: 1.7; }
+.tree-note:hover { color: #444753; background: #eaeae8; }
+.tree-note.active { color: #6661af; background: #eae9f5; }
+.folder-entry .row-actions-button.icon-button { grid-column: 3; width: 26px; }
+.folder-delete.icon-button { grid-column: 2; width: 24px; height: 32px; padding: 0; color: #767582; }
+.folder-delete.icon-button:disabled { opacity: .3; cursor: not-allowed; }
+.folder-delete.icon-button:hover:not(:disabled) { color: #b44949; background: #f8eaea; }
+.folder-select[draggable="true"], .note-select[draggable="true"], .tree-note[draggable="true"] { cursor: grab; }
+.folder-select[draggable="true"]:active, .note-select[draggable="true"]:active, .tree-note[draggable="true"]:active { cursor: grabbing; }
+.folder-entry.drop-target, .nav-item.drop-target { background: #e8e5f8; outline: 1px solid #9186c0; outline-offset: -1px; }
+.sidebar-inline-form { grid-column: 1 / -1; min-width: 0; margin: 3px 0 5px; }
+.folder-name-form { display: grid; grid-template-columns: minmax(0, 1fr) 26px 26px; align-items: center; gap: 1px; }
+.sidebar-inline-form input, .sidebar-inline-form select { width: 100%; min-width: 0; height: 32px; padding: 5px 6px; border: 1px solid #d7d3e5; border-radius: 5px; color: var(--text); background: #fff; font: inherit; font-size: 13px; }
+.folder-name-form .icon-button { width: 26px; height: 30px; padding: 0; }
+.sidebar-inline-form .inline-error { grid-column: 1 / -1; margin: 3px 0; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+.sidebar-inline-actions { display: flex; gap: 4px; margin-top: 4px; }
+.sidebar-inline-actions .button { min-height: 28px; padding: 4px 7px; }
+.note-entry .sidebar-inline-form { margin-right: 4px; }
 .sidebar-bottom { display: flex; flex-direction: column; gap: 8px; margin-top: auto; padding-top: 16px; }
 .repository-links { display: flex; align-items: center; gap: 8px; padding: 8px 10px 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .repository-links a { color: inherit; text-decoration: none; }
@@ -192,6 +212,7 @@ button svg { pointer-events: none; }
 .note-title-input:focus-visible { outline-offset: 7px; }
 .note-byline { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 0 0 30px; color: #8c8997; font-size: 12px; line-height: 1.5; }
 .note-byline svg { width: 12px; height: 12px; stroke-width: 1.6; }
+.collaborative-editor { position: relative; display: flex; flex: 1; min-width: 0; min-height: 280px; }
 .markdown-editor { display: block; width: 100%; min-height: 280px; flex: 1; padding: 0; resize: none; border: 0; border-radius: 0; background: transparent; color: #424958; font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; font-size: 15px; font-weight: 400; line-height: 1.8; tab-size: 2; }
 .markdown-editor::placeholder { color: #bab8c1; }
 .markdown-editor:focus-visible { outline: 0; }

@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useId, useRef, useState } from 'react'
-import type { ChangeEvent, ReactNode } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import type { ChangeEvent, DragEvent, ReactNode } from 'react'
 import type { Session } from '@synonymdev/pubky'
 import QRCode from 'qrcode'
 import { ArrowDownToLine, ArrowUpFromLine, BookOpen, CheckCheck, ChevronLeft, ChevronRight, CircleHelp, Code2, Copy, FileText, Folder, Globe2, Heading2, Link, List, LoaderCircle, LockKeyhole, PenLine, Plus, Search, RefreshCw, Trash2, X, MoreHorizontal, FolderPlus, Bold, Italic, Quote, ExternalLink, UsersRound } from 'lucide-react'
 import Markdown from './components/Markdown'
 import AccountProfile from './components/AccountProfile'
+import RemoteSelection from './components/RemoteSelection'
 import { IS_TESTNET } from './config'
 import { discardSession, persistSession, restoreSession, signOut, startSignIn } from './lib/pubky'
 import type { AuthFlow } from './lib/pubky'
@@ -12,12 +13,14 @@ import { createNote, listNotes, loadPublicNote, publishNote, unpublishNote } fro
 import type { Note, NoteRecord } from './lib/notes'
 import { filterNotes, folderContains, folderLabel, folderPaths, normalizeFolder, renameFolderPath } from './lib/folders'
 import { loadFolders, normalizeFolderPaths } from './lib/folder-store'
+import { folderMoveTarget, isEmptyFolder, planFolderRelocation } from './lib/folder-operations'
 import { editNote, initializeNote, LineageConflictError, mergeNotes, noteRevision } from './lib/crdt'
 import { adoptGuestNotebook, readLocalNotebook, resolveLocalNoteDestination, setLocalActiveId, writeLocalFolders, writeLocalNote } from './lib/local-notebook'
 import type { LocalNotebook } from './lib/local-notebook'
 import { GUEST_SCOPE, mergeRemoteNotebook, scopeForSession, synchronizeNotebook, uploadNotebook } from './lib/notebook-sync'
 import { useCollaboration } from './hooks/useCollaboration'
 import type { SharedNoteDocument } from './lib/shared-note'
+import { EditorSelectionKeeper } from './lib/editor-selection'
 import { notePath, noteUrl, parseNoteRoute } from './lib/note-links'
 import type { NoteRoute } from './lib/note-links'
 
@@ -151,17 +154,19 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   const [selectedFolder, setSelectedFolder] = useState<string | null>(null)
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(() => new Set())
   const [explicitFolders, setExplicitFolders] = useState<string[]>([])
-  const [folderEditor, setFolderEditor] = useState<{ kind: 'create' | 'rename' | 'remove'; path: string }>({ kind: 'create', path: '' })
-  const [moveTargetId, setMoveTargetId] = useState('')
+  const [folderEditor, setFolderEditor] = useState<{ kind: 'create' | 'rename'; path: string } | null>(null)
+  const [moveEditor, setMoveEditor] = useState<{ kind: 'note' | 'folder'; key: string; destination: string } | null>(null)
   const [folderInput, setFolderInput] = useState('')
   const [folderError, setFolderError] = useState('')
+  const [dropFolder, setDropFolder] = useState<string | null>(null)
   const [mode, setMode] = useState<'write' | 'preview'>('write')
   const [status, setStatus] = useState('Sample')
   const [scope, setScope] = useState(rememberedScope)
+  const [profileName, setProfileName] = useState<{ owner: string; name: string } | null>(null)
   const [needsSync, setNeedsSync] = useState(false)
   const [busy, setBusy] = useState(false)
   const [toast, setToast] = useState<{ message: string; error?: boolean } | null>(null)
-  const [modal, setModal] = useState<'auth' | 'share' | 'delete' | 'help' | 'move' | 'folder' | 'collaborate' | 'join' | null>(null)
+  const [modal, setModal] = useState<'auth' | 'share' | 'delete' | 'help' | 'collaborate' | 'join' | null>(null)
   const [authUrl, setAuthUrl] = useState('')
   const [qr, setQr] = useState('')
   const [authError, setAuthError] = useState('')
@@ -174,7 +179,10 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   const foldersRef = useRef(explicitFolders); foldersRef.current = explicitFolders
   const busyRef = useRef(busy); busyRef.current = busy
   const sessionRef = useRef(session); sessionRef.current = session
-  const renameAttempt = useRef<{ source: string; target: string } | null>(null)
+  const renameAttempt = useRef<{ source: string; target: string; scope: string } | null>(null)
+  const folderBusy = useRef(false)
+  const folderNameInput = useRef<HTMLInputElement>(null)
+  const dragSource = useRef<{ kind: 'note' | 'folder'; key: string; scope: string } | null>(null)
   const scopeRef = useRef(scope); scopeRef.current = scope
   const activeIdRef = useRef(activeId); activeIdRef.current = activeId
   const exampleId = useRef<string | null>(records[0]?.note.id ?? null)
@@ -211,12 +219,21 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     : route.kind === 'home' ? visibleRecords.find(row => row.note.id === activeId) ?? visibleRecords[0] : undefined
   const note = active?.note
   const owner = session?.info.publicKey.z32() ?? (scope !== GUEST_SCOPE ? scope.split(':')[1] : '')
+  const receiveProfileName = useCallback((profileOwner: string, name: string) => setProfileName({ owner: profileOwner, name }), [])
   const notice = useCallback((message: string, error = false) => setToast({ message, error }), [])
   const closeModal = useCallback(() => { if (busyRef.current) return; authEpoch.current++; authFlow.current?.cancel(); authFlow.current = null; setModal(null); setAuthStarting(false) }, [])
 
   useEffect(() => {
     try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout)) } catch { /* Layout still works when browser storage is unavailable. */ }
   }, [layout])
+  useEffect(() => {
+    folderNameInput.current?.focus()
+    folderNameInput.current?.select()
+  }, [folderEditor])
+  useEffect(() => {
+    setFolderEditor(null); setMoveEditor(null); setFolderError(''); setDropFolder(null)
+    dragSource.current = null; renameAttempt.current = null
+  }, [scope])
   useEffect(() => {
     const query = window.matchMedia?.('(max-width: 700px)')
     if (!query) return
@@ -324,22 +341,30 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     await persistRecord(row, capturedScope)
     if (select && scopeRef.current === capturedScope) await setLocalActiveId(capturedScope, row.note.id)
   }, [persistRecord, replaceRecords, navigateToNote])
-  const beforeCollaborativeChange = useCallback((doc: SharedNoteDocument) => {
-    if (activeIdRef.current !== doc.note.id) return
-    const field = document.activeElement === editor.current ? 'content' : document.activeElement === titleEditor.current ? 'title' : null
-    const element = field === 'content' ? editor.current : field === 'title' ? titleEditor.current : null
-    if (!field || !element) return
-    const selected = doc.captureSelection(field, element.selectionStart ?? 0, element.selectionEnd ?? 0)
-    const capturedScope = scopeRef.current, capturedId = doc.note.id
-    return () => {
-      const selection = doc.resolveSelection(selected)
-      if (selection) requestAnimationFrame(() => {
-        if (scopeRef.current === capturedScope && activeIdRef.current === capturedId && document.activeElement === element) element.setSelectionRange(selection.start, selection.end)
-      })
+  const selectionKeeper = useMemo(() => new EditorSelectionKeeper({ scope: () => scopeRef.current, activeId: () => activeIdRef.current,
+    content: () => editor.current, title: () => titleEditor.current }), [])
+  useEffect(() => { selectionKeeper.invalidate(); return () => selectionKeeper.invalidate() }, [selectionKeeper, scope, note?.id, mode])
+  useEffect(() => {
+    // A delayed remote update must never undo a newer keyboard, pointer, or input action.
+    const changed = (event: Event) => {
+      if (event.type === 'pointermove' && !(event as PointerEvent).buttons) return
+      if (event.target === editor.current || event.target === titleEditor.current) selectionKeeper.invalidate()
     }
-  }, [])
-  const collaboration = useCollaboration({ scope, enabled: !!session && !initializing, notes: records.map(row => row.note), activeId: note?.id,
+    const events = ['keydown', 'pointerdown', 'pointermove', 'beforeinput', 'input', 'focusin', 'focusout']
+    for (const event of events) window.addEventListener(event, changed, true)
+    return () => {
+      selectionKeeper.invalidate()
+      for (const event of events) window.removeEventListener(event, changed, true)
+    }
+  }, [selectionKeeper])
+  const beforeCollaborativeChange = useCallback((doc: SharedNoteDocument) => selectionKeeper.capture(doc), [selectionKeeper])
+  const collaborationNotes = useMemo(() => records.map(row => row.note), [records])
+  const collaboration = useCollaboration({ scope, enabled: !!session && !initializing, notes: collaborationNotes, activeId: note?.id,
+    displayName: profileName?.owner === owner ? profileName.name : undefined,
     persist: persistCollaborativeNote, beforeRemoteChange: beforeCollaborativeChange })
+  useEffect(() => {
+    if (note && (mode !== 'write' || note.deleted || busy || initializing || modal || (mobileViewport && mobileList))) collaboration.updateSelection(note.id, null)
+  }, [mode, note?.id, note?.deleted, busy, initializing, modal, mobileViewport, mobileList, collaboration.updateSelection])
   useEffect(() => { if (collaboration.invitation && !initializing) setModal('join') }, [collaboration.invitation, initializing, session])
   useEffect(() => { if (collaboration.view.request) setModal('collaborate') }, [collaboration.view.request])
   const flushLocal = useCallback(async () => {
@@ -512,6 +537,10 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
       void setLocalActiveId(scopeRef.current, next.id).catch(error => notice(errorMessage(error), true))
     } catch (error) { notice(errorMessage(error), true) }
   }
+  function shareEditorSelection(element: HTMLTextAreaElement) {
+    if (!note || note.deleted || busy || initializing || mode !== 'write' || document.activeElement !== element) return
+    collaboration.updateSelection(note.id, { field: 'content', start: element.selectionStart, end: element.selectionEnd, direction: element.selectionDirection })
+  }
   async function addNote(imported?: { title: string; content: string }) {
     try {
       await flushLocal()
@@ -527,6 +556,11 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     try { await flushLocal(); activeIdRef.current = id; setActiveId(id); setMobileList(false); if (id !== exampleId.current) navigateToNote(id); else navigateRoute('/'); await setLocalActiveId(scopeRef.current, id) } catch (error) { notice(errorMessage(error), true) }
   }
   function openFolder(path: string) {
+    if (path && selectedFolder === path && !busyRef.current && !initializing) {
+      manageFolder('rename', path)
+      return
+    }
+    setFolderEditor(null); setMoveEditor(null); setFolderError('')
     setSelectedFolder(path); setFilter('all'); setQuery(''); setMobileList(true); setMenuOpen(false)
   }
   function toggleFolder(path: string) {
@@ -537,106 +571,187 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
       return next
     })
   }
-  function openMove(id: string) {
-    const target = recordsRef.current.find(row => row.note.id === id)?.note
-    if (!target) return
-    setMoveTargetId(id); setFolderInput(target.folder || ''); setFolderError(''); setModal('move')
+  function openMove(key: string, kind: 'note' | 'folder' = 'note') {
+    if (busyRef.current || initializing) return
+    const target = kind === 'note' ? recordsRef.current.find(row => row.note.id === key)?.note : undefined
+    if (kind === 'note' && (!target || target.deleted)) return
+    setFolderEditor(null); setFolderError('')
+    setMoveEditor({ kind, key, destination: kind === 'note' ? target!.folder || '' : key.split('/').slice(0, -1).join('/') })
   }
-  function manageFolder(kind: 'create' | 'rename' | 'remove', path = '') {
-    renameAttempt.current = null
-    setFolderEditor({ kind, path }); setFolderInput(kind === 'rename' ? folderLabel(path) : ''); setFolderError(''); setModal('folder')
+  function manageFolder(kind: 'create' | 'rename', path = '') {
+    if (busyRef.current || initializing) return
+    setMoveEditor(null); setFolderEditor({ kind, path })
+    setFolderInput(kind === 'rename' ? folderLabel(path) : ''); setFolderError('')
+    if (path) setCollapsedFolders(current => new Set([...current].filter(folder => folder !== path && !path.startsWith(`${folder}/`))))
   }
-  async function writeFolders(paths: readonly string[]) {
+  function assertFolderScope(capturedScope: string) {
+    if (scopeRef.current !== capturedScope) throw new Error('Your account changed. Open the folder again to continue.')
+  }
+  async function writeFolders(paths: readonly string[], capturedScope = scopeRef.current) {
+    assertFolderScope(capturedScope)
     const normalized = normalizeFolderPaths(paths)
     foldersRef.current = normalized; setExplicitFolders(normalized)
-    await persistFolders(normalized)
+    await persistFolders(normalized, capturedScope)
+    assertFolderScope(capturedScope)
   }
-  async function applyChangedNote(changed: Note) {
+  async function applyChangedNote(changed: Note, capturedScope = scopeRef.current) {
+    assertFolderScope(capturedScope)
     const previous = recordsRef.current.find(row => row.note.id === changed.id)
     if (!previous) throw new Error('This note is no longer available.')
     const record = { ...previous, note: changed }
     if (exampleId.current === changed.id) exampleId.current = null
     replaceRecords(recordsRef.current.map(row => row.note.id === changed.id ? record : row))
-    await persistRecord(record)
+    await persistRecord(record, capturedScope)
+    assertFolderScope(capturedScope)
   }
   function revealFolder(folder: string) {
     setCollapsedFolders(current => new Set([...current].filter(path => !folder.startsWith(`${path}/`))))
   }
-  async function moveNote() {
-    if (!moveTargetId || busy) return
-    setFolderError('')
-    let folder: string
-    let nextFolders: string[]
+  async function folderOperation(action: (capturedScope: string) => Promise<void>, inline = false) {
+    if (folderBusy.current || busyRef.current || initializing) return
+    const capturedScope = scopeRef.current
+    folderBusy.current = true; busyRef.current = true; setBusy(true); setFolderError('')
     try {
-      folder = normalizeFolder(folderInput)
-      nextFolders = normalizeFolderPaths(folderPaths(recordsRef.current, [...foldersRef.current, folder]))
-    } catch (error) { setFolderError(errorMessage(error)); return }
-    setBusy(true)
+      await flushLocal(); assertFolderScope(capturedScope)
+      await action(capturedScope)
+      assertFolderScope(capturedScope)
+      setFolderEditor(null); setMoveEditor(null); setFolderError('')
+    } catch (error) {
+      if (scopeRef.current === capturedScope) {
+        const message = errorMessage(error)
+        if (inline) setFolderError(message)
+        else notice(message, true)
+      }
+    } finally {
+      folderBusy.current = false
+      if (scopeRef.current === capturedScope) { busyRef.current = false; setBusy(false) }
+    }
+  }
+  function currentFolderPaths() {
+    return folderPaths(recordsRef.current.filter(row => !row.note.deleted), foldersRef.current)
+  }
+  function requireDestination(folder: string) {
+    if (folder && !currentFolderPaths().includes(folder)) throw new Error('The destination folder is no longer available.')
+  }
+  async function moveNoteTo(id: string, destination: string, capturedScope: string) {
+    assertFolderScope(capturedScope)
+    const folder = normalizeFolder(destination)
+    requireDestination(folder)
+    let target = recordsRef.current.find(row => row.note.id === id)?.note
+    if (!target || target.deleted) throw new Error('This note is no longer available.')
+    if ((target.folder || '') === folder) return
+    // Preserve the source folder even when its last note leaves it.
+    await writeFolders(normalizeFolderPaths(folderPaths(recordsRef.current.filter(row => !row.note.deleted), foldersRef.current)), capturedScope)
+    assertFolderScope(capturedScope); requireDestination(folder)
+    target = recordsRef.current.find(row => row.note.id === id)?.note
+    if (!target || target.deleted) throw new Error('This note is no longer available.')
+    await applyChangedNote(collaboration.edit(target, { folder }), capturedScope)
+    revealFolder(folder)
+    notice(folder ? `Moved to ${folder}.` : 'Moved out of the folder.')
+  }
+  async function relocateFolder(source: string, target: string, capturedScope: string) {
+    assertFolderScope(capturedScope)
+    const retry = renameAttempt.current
+    const resume = retry?.scope === capturedScope && retry.source === source && retry.target === target
+    const plan = planFolderRelocation(recordsRef.current, foldersRef.current, source, target, { resume })
+    // Staging leaves completed moves discoverable if a later local write fails.
+    renameAttempt.current = { source, target, scope: capturedScope }
     try {
-      await flushLocal()
-      const target = recordsRef.current.find(row => row.note.id === moveTargetId)?.note
-      if (!target) throw new Error('This note is no longer available.')
-      // Keep the source and destination folders even when their last note moves.
-      await writeFolders(nextFolders)
-      const moved = editNote(target, { folder })
-      await applyChangedNote(moved)
-      revealFolder(folder); setModal(null)
-      notice(`Moved to ${folder || 'Unfiled'}.`)
-    } catch (error) { setFolderError(errorMessage(error)) } finally { setBusy(false) }
+      await writeFolders(plan.stagedFolders, capturedScope)
+      for (const move of plan.moves) {
+        assertFolderScope(capturedScope)
+        const latest = recordsRef.current.find(row => row.note.id === move.id)?.note
+        if (!latest || (latest.folder || '') !== move.from) continue
+        // Read each current note after the previous write, preserving live peer edits.
+        await applyChangedNote(collaboration.edit(latest, { folder: move.to }), capturedScope)
+      }
+      assertFolderScope(capturedScope)
+      // Preserve folders that arrived from synchronization while the writes ran.
+      const remaining = currentFolderPaths().filter(path => !folderContains(source, path) && !plan.stagedFolders.includes(path))
+      const stillInSource = recordsRef.current.filter(row => folderContains(source, row.note.folder || ''))
+      await writeFolders(normalizeFolderPaths(folderPaths(stillInSource, [...plan.folders, ...remaining])), capturedScope)
+      setSelectedFolder(current => current && folderContains(source, current) ? renameFolderPath(current, source, target) : current)
+      setCollapsedFolders(current => new Set([...current].map(path => renameFolderPath(path, source, target))))
+      revealFolder(target); renameAttempt.current = null
+    } catch (error) {
+      throw new Error(`Folder change stopped: ${errorMessage(error)} Completed moves have been kept; you can retry.`)
+    }
+  }
+  async function submitMove() {
+    if (!moveEditor) return
+    const { kind, key, destination } = moveEditor
+    await folderOperation(async capturedScope => {
+      if (kind === 'note') await moveNoteTo(key, destination, capturedScope)
+      else await relocateFolder(key, folderMoveTarget(key, destination), capturedScope)
+    }, true)
   }
   async function changeFolder() {
-    if (busy) return
-    setFolderError('')
-    const { kind, path } = folderEditor
-    const currentPaths = folderPaths(recordsRef.current.filter(row => !row.note.deleted), foldersRef.current)
-    let target = path
-    let staged: string[] = []
-    let finalFolders: string[] = []
-    let movedNotes: Note[] = []
-    try {
-      if (kind === 'remove') {
-        if (recordsRef.current.some(row => !row.note.deleted && folderContains(path, row.note.folder || ''))) throw new Error('Move the notes out of this folder and its subfolders first.')
-        finalFolders = normalizeFolderPaths(currentPaths.filter(folder => !folderContains(path, folder)))
-      } else {
-        if (!folderInput.trim() || folderInput.includes('/')) throw new Error('Enter one folder name. Use New subfolder to add another level.')
-        const name = normalizeFolder(folderInput)
-        const parent = kind === 'create' ? path : path.split('/').slice(0, -1).join('/')
-        target = normalizeFolder([parent, name].filter(Boolean).join('/'))
-        if (kind === 'rename' && target === path) { setModal(null); return }
-        if (currentPaths.includes(target) && !(kind === 'rename' && renameAttempt.current?.source === path && renameAttempt.current.target === target)) throw new Error('A folder with that name already exists here.')
-        if (kind === 'create') finalFolders = normalizeFolderPaths([...currentPaths, target])
-        else {
-          // Validate every descendant before the first write, including depth and length limits.
-          const renamedPaths = currentPaths.map(folder => renameFolderPath(folder, path, target))
-          finalFolders = normalizeFolderPaths(renamedPaths)
-          staged = normalizeFolderPaths([...currentPaths, ...renamedPaths])
-          movedNotes = recordsRef.current.filter(row => folderContains(path, row.note.folder || '')).map(row => editNote(row.note, { folder: renameFolderPath(row.note.folder || '', path, target) }))
-        }
-      }
-    } catch (error) { setFolderError(errorMessage(error)); return }
-    setBusy(true)
-    try {
-      await flushLocal()
+    if (!folderEditor) return
+    const { kind, path } = folderEditor, input = folderInput
+    await folderOperation(async capturedScope => {
+      if (!input.trim() || input.includes('/')) throw new Error('Enter one folder name. Use New subfolder to add another level.')
+      const name = normalizeFolder(input)
+      const parent = kind === 'create' ? path : path.split('/').slice(0, -1).join('/')
+      requireDestination(parent)
+      const target = normalizeFolder([parent, name].filter(Boolean).join('/'))
       if (kind === 'rename') {
-        // Registry staging makes a partially completed rename discoverable and retryable.
-        await writeFolders(staged)
-        renameAttempt.current = { source: path, target }
-        for (const moved of movedNotes) {
-          await applyChangedNote(moved)
-        }
-      }
-      await writeFolders(finalFolders)
-      if (kind === 'remove') {
-        if (selectedFolder && folderContains(path, selectedFolder)) setSelectedFolder(null)
+        if (target !== path) await relocateFolder(path, target, capturedScope)
       } else {
-        revealFolder(target)
-        if (kind === 'create') { setSelectedFolder(target); setFilter('all'); setQuery(''); setMobileList(true) }
-        else if (selectedFolder && folderContains(path, selectedFolder)) setSelectedFolder(renameFolderPath(selectedFolder, path, target))
+        const paths = currentFolderPaths()
+        if (paths.includes(target)) throw new Error('A folder with that name already exists here.')
+        await writeFolders(normalizeFolderPaths([...paths, target]), capturedScope)
+        revealFolder(target); setSelectedFolder(target); setFilter('all'); setQuery(''); setMobileList(true)
       }
-      renameAttempt.current = null; setModal(null)
-    } catch (error) {
-      setFolderError(kind === 'rename' ? `Rename stopped: ${errorMessage(error)} Completed moves have been kept; the sidebar shows the current folders.` : errorMessage(error))
-    } finally { setBusy(false) }
+    }, true)
+  }
+  async function deleteFolder(path: string) {
+    await folderOperation(async capturedScope => {
+      const paths = currentFolderPaths()
+      if (!paths.includes(path)) throw new Error('This folder is no longer available.')
+      if (!isEmptyFolder(path, recordsRef.current, foldersRef.current)) throw new Error('Only empty folders can be deleted. Move their notes and subfolders first.')
+      await writeFolders(paths.filter(folder => folder !== path), capturedScope)
+      setSelectedFolder(current => current === path ? null : current)
+      setCollapsedFolders(current => new Set([...current].filter(folder => folder !== path)))
+    })
+  }
+  function startDrag(event: DragEvent, kind: 'note' | 'folder', key: string) {
+    if (busyRef.current || folderBusy.current || initializing) { event.preventDefault(); return }
+    if (kind === 'note' && recordsRef.current.find(row => row.note.id === key)?.note.deleted) { event.preventDefault(); return }
+    dragSource.current = { kind, key, scope: scopeRef.current }
+    // The payload is only a browser drag marker. Sources are trusted solely from
+    // this tab's scoped ref; external data, paths and JSON are never consumed.
+    event.dataTransfer.setData('application/x-pubky-notes', 'internal')
+    event.dataTransfer.effectAllowed = 'move'
+  }
+  function endDrag() { dragSource.current = null; setDropFolder(null) }
+  function canDrop(folder: string) {
+    const source = dragSource.current
+    if (!source || source.scope !== scopeRef.current || busyRef.current || folderBusy.current || initializing) return false
+    try {
+      requireDestination(folder)
+      if (source.kind === 'note') {
+        const note = recordsRef.current.find(row => row.note.id === source.key)?.note
+        return !!note && !note.deleted && (note.folder || '') !== folder
+      }
+      const target = folderMoveTarget(source.key, folder)
+      return target !== source.key && currentFolderPaths().includes(source.key)
+    } catch { return false }
+  }
+  function dragOver(event: DragEvent, folder: string) {
+    if (!canDrop(folder)) { event.dataTransfer.dropEffect = 'none'; return }
+    event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'move'; setDropFolder(folder)
+  }
+  function dropInto(event: DragEvent, folder: string) {
+    const source = dragSource.current
+    const accepted = canDrop(folder)
+    endDrag()
+    if (!source || !accepted) return
+    event.preventDefault(); event.stopPropagation()
+    void folderOperation(async capturedScope => {
+      if (source.scope !== capturedScope) throw new Error('Your account changed. Drag the item again.')
+      if (source.kind === 'note') await moveNoteTo(source.key, folder, capturedScope)
+      else await relocateFolder(source.key, folderMoveTarget(source.key, folder), capturedScope)
+    })
   }
   async function connect() {
     setModal('auth'); setAuthStarting(true); setAuthError(''); setAuthUrl(''); setQr('')
@@ -825,10 +940,19 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     navigateRoute('/')
   }
   const paths = folderPaths(records.filter(row => !row.note.deleted), explicitFolders)
-  const moveTarget = records.find(row => row.note.id === moveTargetId)?.note
+  const childFolders = new Map<string, string[]>()
+  const childNotes = new Map<string, NoteRecord[]>()
+  for (const path of paths) {
+    const parent = path.split('/').slice(0, -1).join('/')
+    childFolders.set(parent, [...childFolders.get(parent) || [], path])
+  }
+  for (const row of records.filter(row => !row.note.deleted && row.note.id !== exampleId.current).sort((a, b) => a.note.title.localeCompare(b.note.title))) {
+    const folder = row.note.folder || ''
+    childNotes.set(folder, [...childNotes.get(folder) || [], row])
+  }
   const searching = !!query.trim()
   const filtered = filterNotes(visibleRecords, query, filter === 'trash' ? 'all' : filter, selectedFolder).sort((a, b) => b.note.updatedAt.localeCompare(a.note.updatedAt))
-  const listTitle = filter === 'trash' ? 'Trash' : searching ? 'Search results' : selectedFolder !== null ? folderLabel(selectedFolder) || 'Unfiled' : filter === 'all' ? 'All notes' : filter === 'private' ? 'Private notes' : 'Public notes'
+  const listTitle = filter === 'trash' ? 'Trash' : searching ? 'Search results' : selectedFolder !== null ? folderLabel(selectedFolder) || 'No folder' : filter === 'all' ? 'All notes' : filter === 'private' ? 'Private notes' : 'Public notes'
   const words = note?.content.trim().split(/\s+/).filter(Boolean).length ?? 0
   const publicChanged = active?.published && (active?.published.content !== note?.content || active?.published.title !== note?.title)
   const locked = busy || initializing
@@ -845,35 +969,74 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     if (mobileViewport) { setMenuOpen(true); setMobileList(true) }
     else setLayout({ navigationCollapsed: false, notesCollapsed: false })
   }
+  function folderNameForm() {
+    if (!folderEditor) return null
+    return <form className="sidebar-inline-form folder-name-form" onSubmit={event => { event.preventDefault(); void changeFolder() }} onKeyDown={event => {
+      if (event.key === 'Escape' && !busyRef.current) { event.preventDefault(); event.stopPropagation(); setFolderEditor(null); setFolderError('') }
+    }}>
+      <input ref={folderNameInput} aria-label="Folder name" value={folderInput} placeholder="Folder name" onChange={event => { setFolderInput(event.target.value); setFolderError('') }} maxLength={80} disabled={locked} />
+      <button type="submit" className="icon-button" aria-label={folderEditor.kind === 'create' ? 'Create folder' : 'Rename folder'} title={folderEditor.kind === 'create' ? 'Create folder' : 'Rename folder'} disabled={locked}><CheckCheck size={16} /></button>
+      <button type="button" className="icon-button" aria-label="Cancel" title="Cancel" disabled={locked} onClick={() => { setFolderEditor(null); setFolderError('') }}><X size={15} /></button>
+      {folderError && <p className="inline-error" role="alert">{folderError}</p>}
+    </form>
+  }
+  function moveControl(kind: 'note' | 'folder', key: string) {
+    if (!moveEditor || moveEditor.kind !== kind || moveEditor.key !== key) return null
+    const unchanged = kind === 'folder' ? moveEditor.destination === key.split('/').slice(0, -1).join('/') : moveEditor.destination === (records.find(row => row.note.id === key)?.note.folder || '')
+    return <form className="sidebar-inline-form sidebar-move-form" onSubmit={event => { event.preventDefault(); void submitMove() }} onKeyDown={event => {
+      if (event.key === 'Escape' && !busyRef.current) { event.preventDefault(); event.stopPropagation(); setMoveEditor(null); setFolderError('') }
+    }}>
+      <select aria-label={kind === 'note' ? 'Move note to' : 'Move folder to'} value={moveEditor.destination} autoFocus disabled={locked} onChange={event => { const destination = event.target.value; setMoveEditor(current => current ? { ...current, destination } : null); setFolderError('') }}>
+        <option value="">{kind === 'folder' ? 'Top level' : 'No folder'}</option>
+        {paths.filter(path => kind !== 'folder' || !folderContains(key, path)).map(path => <option key={path} value={path}>{path}</option>)}
+      </select>
+      <div className="sidebar-inline-actions"><button type="submit" className="button secondary small" disabled={locked || unchanged}>Move</button><button type="button" className="button ghost small" disabled={locked} onClick={() => { setMoveEditor(null); setFolderError('') }}>Cancel</button></div>
+      {folderError && <p className="inline-error" role="alert">{folderError}</p>}
+    </form>
+  }
+  function treeContents(parent: string, depth = 0): ReactNode {
+    return <>
+      {childFolders.get(parent)?.map(path => {
+        const expanded = !collapsedFolders.has(path)
+        const hasChildren = !!childFolders.get(path)?.length || !!childNotes.get(path)?.length
+        const empty = isEmptyFolder(path, records, explicitFolders)
+        const renaming = folderEditor?.kind === 'rename' && folderEditor.path === path
+        return <div className="folder-node" key={path} data-folder-path={path}>
+          <div className={`folder-entry ${dropFolder === path ? 'drop-target' : ''}`} onDragOver={event => dragOver(event, path)} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropFolder(null) }} onDrop={event => dropInto(event, path)}>
+            {renaming ? folderNameForm() : <><div className="folder-row" style={{ paddingLeft: Math.min(30, depth * 8) }}>
+              {hasChildren ? <button className="folder-toggle" disabled={locked} aria-label={`${expanded ? 'Collapse' : 'Expand'} folder ${path}`} aria-expanded={expanded} onClick={() => toggleFolder(path)}><ChevronRight size={13} style={{ transform: expanded ? 'rotate(90deg)' : undefined }} /></button> : <span className="folder-toggle" />}
+              <button className={`folder-select ${selectedFolder === path ? 'active' : ''}`} aria-label={`Open folder ${path}`} title={selectedFolder === path ? `${path} · click to rename` : path} disabled={locked} draggable={!locked} onDragStart={event => startDrag(event, 'folder', path)} onDragEnd={endDrag} onClick={() => openFolder(path)}><Folder size={15} /><span>{folderLabel(path)}</span></button>
+            </div><button className="icon-button folder-delete" aria-label={`Delete folder ${path}`} title={empty ? `Delete folder ${path}` : 'Only empty folders can be deleted'} disabled={locked || !empty} onClick={() => void deleteFolder(path)}><Trash2 size={14} /></button><SidebarActions label={`Folder actions for ${path}`} disabled={locked} items={[
+              { label: 'New subfolder', action: () => manageFolder('create', path) },
+              { label: 'Rename', action: () => manageFolder('rename', path) },
+              { label: 'Move to…', action: () => openMove(path, 'folder') },
+            ]} /></>}
+            {moveControl('folder', path)}
+          </div>
+          {folderEditor?.kind === 'create' && folderEditor.path === path && <div className="new-subfolder" style={{ paddingLeft: Math.min(30, (depth + 1) * 8) }}>{folderNameForm()}</div>}
+          {expanded && treeContents(path, depth + 1)}
+        </div>
+      })}
+      {childNotes.get(parent)?.map(row => <button key={row.note.id} data-tree-note-id={row.note.id} className={`tree-note ${row.note.id === note?.id ? 'active' : ''}`} style={{ paddingLeft: 24 + Math.min(30, depth * 8) }} aria-label={`Open note ${row.note.title || 'Untitled note'} in folder tree`} title={row.note.title || 'Untitled note'} disabled={locked} draggable={!locked} onDragStart={event => startDrag(event, 'note', row.note.id)} onDragEnd={endDrag} onClick={() => { setMenuOpen(false); void switchNote(row.note.id) }}><FileText size={14} /><span>{row.note.title || 'Untitled note'}</span></button>)}
+    </>
+  }
 
   return <div className={`app-shell ${menuOpen ? 'mobile-open' : ''} ${mobileList ? 'mobile-list' : ''} ${navigationCollapsed ? 'navigation-collapsed' : ''} ${notesCollapsed ? 'notes-collapsed' : ''} ${bothCollapsed ? 'both-collapsed' : ''}`}>
     {menuOpen && <button className="navigation-dismiss" aria-label="Close navigation" onClick={() => setMenuOpen(false)} />}
     <div className="navigation-pane"><aside className="sidebar" id="notebook-navigation">
       <a className="brand" href="/"><span className="brand-mark"><BookOpen size={22} /></span><strong>Pubky Notes</strong></a>
       <button className="new-note-button" onClick={() => void addNote()} disabled={locked}><Plus size={18} /> New note</button>
-      <nav className="nav-group" aria-label="Notebook filters">{([{ key: 'all', label: 'All notes', icon: FileText }, { key: 'private', label: 'Private', icon: LockKeyhole }, { key: 'public', label: 'Public', icon: Globe2 }, { key: 'trash', label: 'Trash', icon: Trash2 }] as const).map(item => <button key={item.key} className={`nav-item ${selectedFolder === null && filter === item.key ? 'active' : ''}`} onClick={() => { setFilter(item.key); setSelectedFolder(null); setQuery(''); setMobileList(true); setMenuOpen(false) }}><item.icon size={17} /><span>{item.label}</span></button>)}</nav>
+      <nav className="nav-group" aria-label="Notebook filters">{([{ key: 'all', label: 'All notes', icon: FileText }, { key: 'private', label: 'Private', icon: LockKeyhole }, { key: 'public', label: 'Public', icon: Globe2 }, { key: 'trash', label: 'Trash', icon: Trash2 }] as const).map(item => <button key={item.key} className={`nav-item ${selectedFolder === null && filter === item.key ? 'active' : ''} ${item.key === 'all' && dropFolder === '' ? 'drop-target' : ''}`} title={item.key === 'all' ? 'All notes · drop here to move items to the top level' : undefined} onDragOver={item.key === 'all' ? event => dragOver(event, '') : undefined} onDragLeave={item.key === 'all' ? () => setDropFolder(null) : undefined} onDrop={item.key === 'all' ? event => dropInto(event, '') : undefined} onClick={() => { setFilter(item.key); setSelectedFolder(null); setQuery(''); setMobileList(true); setMenuOpen(false) }}><item.icon size={17} /><span>{item.label}</span></button>)}</nav>
       <div className="folder-section">
         <button className="nav-item new-folder-button" disabled={locked} onClick={() => manageFolder('create')}><FolderPlus size={17} /><span>New folder</span></button>
-        <button className={`nav-item folder-root ${selectedFolder === '' ? 'active' : ''}`} onClick={() => openFolder('')}><Folder size={17} /><span>Unfiled</span></button>
-        <nav className="folder-tree" aria-label="Folders">{paths.map(path => {
-          const segments = path.split('/')
-          if (segments.some((_, index) => index > 0 && collapsedFolders.has(segments.slice(0, index).join('/')))) return null
-          const hasChildren = paths.some(other => other.startsWith(`${path}/`))
-          return <div className="folder-entry" key={path}><div className="folder-row" style={{ paddingLeft: Math.min(30, (segments.length - 1) * 8) }}>
-            {hasChildren ? <button className="folder-toggle" aria-label={`${collapsedFolders.has(path) ? 'Expand' : 'Collapse'} folder ${path}`} aria-expanded={!collapsedFolders.has(path)} onClick={() => toggleFolder(path)}><ChevronRight size={13} style={{ transform: collapsedFolders.has(path) ? undefined : 'rotate(90deg)' }} /></button> : <span className="folder-toggle" />}
-            <button className={`folder-select ${selectedFolder === path ? 'active' : ''}`} aria-label={`Open folder ${path}`} title={path} onClick={() => openFolder(path)}><Folder size={15} /><span>{folderLabel(path)}</span></button>
-          </div><SidebarActions label={`Folder actions for ${path}`} disabled={locked} items={[
-            { label: 'New subfolder', action: () => manageFolder('create', path) },
-            { label: 'Rename', action: () => manageFolder('rename', path) },
-            { label: 'Remove empty folder', disabled: records.some(row => !row.note.deleted && folderContains(path, row.note.folder || '')), action: () => manageFolder('remove', path) },
-          ]} /></div>
-        })}</nav>
+        {folderEditor?.kind === 'create' && !folderEditor.path && folderNameForm()}
+        <nav className="folder-tree" aria-label="Folders and notes">{treeContents('')}</nav>
       </div>
       <div className="sidebar-bottom">
         <button className="nav-item" onClick={() => importer.current?.click()} disabled={locked}><ArrowUpFromLine size={16} /><span>Import Markdown</span></button>
         <button className="nav-item" onClick={() => setModal('help')}><CircleHelp size={16} /><span>Help</span></button>
         {!session && <button className="button primary sidebar-connect" onClick={() => void connect()} disabled={initializing || authStarting} aria-busy={initializing}>Connect Pubky</button>}
-        {owner && <AccountProfile owner={owner} disabled={locked} copy={copy} disconnect={() => void disconnect()} />}
+        {owner && <AccountProfile owner={owner} disabled={locked} copy={copy} disconnect={() => void disconnect()} onName={receiveProfileName} />}
         {IS_TESTNET && <span className="network-label">Local testnet</span>}
         <footer className="repository-links"><a href="https://github.com/its-gaib/pubky-notes" target="_blank" rel="noopener noreferrer" title="Pubky Notes on GitHub">GitHub</a><span aria-hidden="true">·</span><a href="https://github.com/its-gaib/pubky-notes-cli" target="_blank" rel="noopener noreferrer" title="Pubky Notes CLI on GitHub">CLI</a></footer>
       </div>
@@ -881,11 +1044,11 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     <div className="notes-pane"><section className="notes-panel" id="notebook-notes" aria-label="Notes">
       <div className="notes-header"><h2 title={selectedFolder || undefined}><span className="notes-heading-label">{listTitle}</span><span className="count">{filtered.length}</span></h2><div className="notes-header-actions">{session && <button className="icon-button" aria-label="Refresh notes" title="Refresh notes" disabled={locked} onClick={() => void refresh()}><RefreshCw size={16} /></button>}<button className="icon-button" aria-label="Create a new note" disabled={locked} onClick={() => void addNote()}><PenLine size={18} /></button></div></div>
       <div className="search-box"><Search size={16} /><input type="search" placeholder="Search all notes…" aria-label="Search all notes" value={query} onChange={event => setQuery(event.target.value)} />{query && <button className="icon-button search-clear" aria-label="Clear search" onClick={() => setQuery('')}><X size={14} /></button>}</div>
-      <div className="note-list">{filtered.map(row => <div key={row.note.id} className={`note-card note-entry ${row.note.id === note?.id ? 'selected' : ''}`}><button className="note-select" aria-label={`Open note ${row.note.title || 'Untitled note'}`} onClick={() => void switchNote(row.note.id)} disabled={locked}><div className="note-card-title"><FileText size={15} /><strong>{row.note.title || 'Untitled note'}</strong>{row.note.crdt?.version === 2 && <UsersRound size={13} aria-label="Collaborative note" />}{row.published ? <Globe2 size={13} /> : <LockKeyhole size={13} />}</div><p className="note-card-excerpt">{row.note.content.replace(/[#*>`_\[\]]/g, '').trim().slice(0, 115)}</p><div className="note-card-meta"><span>{dateLabel(row.note.updatedAt)}</span><span className="folder-path" title={row.note.folder || 'Unfiled'}><Folder size={11} /><span>{row.note.folder || 'Unfiled'}</span></span></div></button><SidebarActions label={`Note actions for ${row.note.title || 'Untitled note'}`} disabled={locked} items={row.note.deleted ? [{ label: 'Restore', action: () => void restoreNote(row.note.id) }] : [{ label: 'Move to…', action: () => openMove(row.note.id) }]} /></div>)}{!visibleRecords.length && filter !== 'trash' && !initializing && <button className="note-card selected" onClick={() => setMobileList(false)}><div className="note-card-title"><Code2 size={15} /><strong>Markdown basics</strong></div><div className="note-card-meta">Sample</div></button>}{!filtered.length && (records.length > 0 || filter === 'trash') && <div className="empty-state"><Search size={25} /><p>{filter === 'trash' ? 'Trash is empty.' : searching ? 'No notes match your search.' : 'No notes.'}</p><button className="button ghost small" onClick={() => { if (searching || filter !== 'all' || selectedFolder !== null) { setQuery(''); setFilter('all'); setSelectedFolder(null) } else void addNote() }}> {searching || filter !== 'all' || selectedFolder !== null ? 'Show all notes' : 'New note'}</button></div>}</div>
+      <div className="note-list">{filtered.map(row => <div key={row.note.id} data-note-id={row.note.id} className={`note-card note-entry ${row.note.id === note?.id ? 'selected' : ''}`}><button className="note-select" aria-label={`Open note ${row.note.title || 'Untitled note'}`} onClick={() => void switchNote(row.note.id)} disabled={locked} draggable={!locked && !row.note.deleted} onDragStart={event => startDrag(event, 'note', row.note.id)} onDragEnd={endDrag}><div className="note-card-title"><FileText size={15} /><strong>{row.note.title || 'Untitled note'}</strong>{row.note.crdt?.version === 2 && <UsersRound size={13} aria-label="Collaborative note" />}{row.published ? <Globe2 size={13} /> : <LockKeyhole size={13} />}</div><p className="note-card-excerpt">{row.note.content.replace(/[#*>`_\[\]]/g, '').trim().slice(0, 115)}</p><div className="note-card-meta"><span>{dateLabel(row.note.updatedAt)}</span><span className="folder-path" title={row.note.folder || 'No folder'}><Folder size={11} /><span>{row.note.folder || 'No folder'}</span></span></div></button><SidebarActions label={`Note actions for ${row.note.title || 'Untitled note'}`} disabled={locked} items={row.note.deleted ? [{ label: 'Restore', action: () => void restoreNote(row.note.id) }] : [{ label: 'Move to…', action: () => openMove(row.note.id) }]} />{moveControl('note', row.note.id)}</div>)}{!visibleRecords.length && filter !== 'trash' && !initializing && <button className="note-card selected" onClick={() => setMobileList(false)}><div className="note-card-title"><Code2 size={15} /><strong>Markdown basics</strong></div><div className="note-card-meta">Sample</div></button>}{!filtered.length && (records.length > 0 || filter === 'trash') && <div className="empty-state"><Search size={25} /><p>{filter === 'trash' ? 'Trash is empty.' : searching ? 'No notes match your search.' : 'No notes.'}</p><button className="button ghost small" onClick={() => { if (searching || filter !== 'all' || selectedFolder !== null) { setQuery(''); setFilter('all'); setSelectedFolder(null) } else void addNote() }}> {searching || filter !== 'all' || selectedFolder !== null ? 'Show all notes' : 'New note'}</button></div>}</div>
     </section>{!bothCollapsed && <button className="pane-toggle notes-edge" aria-label={notesCollapsed ? 'Expand notes' : 'Collapse notes'} title={notesCollapsed ? 'Expand notes' : 'Collapse notes'} aria-controls="notebook-notes" aria-expanded={!notesCollapsed} onClick={() => mobileViewport ? setMobileList(current => !current) : setLayout(current => ({ ...current, notesCollapsed: !current.notesCollapsed }))}>{notesCollapsed ? <ChevronRight size={17} /> : <ChevronLeft size={17} />}</button>}</div>
     <main className="editor-panel">
       {routeLoading ? <div className="empty-state editor-empty"><LoaderCircle className="spin" aria-label="Loading note" /><p>Opening note…</p></div> : routeIssue ? <div className="empty-state editor-empty"><LockKeyhole size={30} /><h2>{routeIssue.title}</h2><p>{routeIssue.message}</p><div className="modal-actions">{route.kind === 'private' && !ownsPrivateRoute && <button className="button primary" disabled={locked} onClick={() => void connect()}>Connect Pubky</button>}{requestedNote && canOpenRoute && <button className="button secondary" disabled={locked} onClick={() => void retryNoteLink()}>Retry</button>}<button className="button secondary" onClick={openNotebook}>Open your notebook</button></div></div> : note ? <><div className="editor-topbar"><div className="note-location"><div className="mode-switch"><button className={mode === 'write' ? 'active' : ''} onClick={() => setMode('write')}><PenLine size={14} /> Write</button><button className={mode === 'preview' ? 'active' : ''} onClick={() => setMode('preview')}><BookOpen size={14} /> Preview</button></div></div>{mode === 'write' && <div className="formatting-toolbar" aria-label="Markdown formatting">{[{ icon: Bold, title: 'Bold', before: '**', after: '**' }, { icon: Italic, title: 'Italic', before: '_', after: '_' }, { icon: Heading2, title: 'Heading', before: '\n## ', after: '' }, { icon: List, title: 'List', before: '\n- ', after: '' }, { icon: Quote, title: 'Quote', before: '\n> ', after: '' }, { icon: Code2, title: 'Code', before: '`', after: '`' }, { icon: Link, title: 'Link', before: '[', after: '](https://)' }].map(item => <button key={item.title} className="icon-button" aria-label={item.title} title={item.title} disabled={locked || note.deleted} onClick={() => format(item.before, item.after)}><item.icon size={16} /></button>)}</div>}<div className="editor-actions">{session && <span className={`visibility-badge ${active?.published ? 'public' : ''}`}>{active?.published ? <Globe2 size={13} /> : <LockKeyhole size={13} />}{active?.published ? 'Public copy' : 'Private'}</span>}{note.id !== exampleId.current && <button className="icon-button" onClick={() => void copyNoteLink()} disabled={locked} aria-label="Copy note link" title="Copy note link"><Link size={16} /></button>}{note.content === SAMPLE_MARKDOWN && <button className="icon-button" onClick={() => void copy(SAMPLE_MARKDOWN)} aria-label="Copy Markdown" title="Copy Markdown"><Copy size={16} /></button>}<button className="button ghost small" onClick={() => download(note)} aria-label="Export Markdown" title="Export Markdown"><ArrowDownToLine size={16} /></button>{note.deleted && <button className="button secondary small" disabled={locked} onClick={() => void restoreNote(note.id)}>Restore</button>}<button className="button secondary small collaboration-button" onClick={() => setModal('collaborate')} disabled={locked || note.deleted} aria-label="Collaborate"><UsersRound size={15} /><span>Collaborate</span></button><button className="button secondary small" onClick={() => setModal('share')} disabled={locked || note.deleted}><Globe2 size={14} /> Share</button><button className="icon-button" onClick={() => setModal('delete')} disabled={locked || note.deleted} aria-label="Delete note"><Trash2 size={16} /></button></div></div>
-      <div className="editor-content"><input ref={titleEditor} className="note-title-input" aria-label="Note title" placeholder="Untitled note" value={note.title} maxLength={200} disabled={locked || note.deleted} onChange={event => edit({ title: event.target.value })} />{mode === 'write' ? <textarea ref={editor} className="markdown-editor" aria-label="Markdown content" placeholder="Write a note…" value={note.content} disabled={locked || note.deleted} onChange={event => edit({ content: event.target.value })} spellCheck /> : <Markdown content={note.content} />}</div>
+      <div className="editor-content"><input ref={titleEditor} className="note-title-input" aria-label="Note title" placeholder="Untitled note" value={note.title} maxLength={200} disabled={locked || note.deleted} onChange={event => edit({ title: event.target.value })} />{mode === 'write' ? <div className="collaborative-editor"><textarea ref={editor} className="markdown-editor" aria-label="Markdown content" placeholder="Write a note…" value={note.content} disabled={locked || note.deleted} onChange={event => { edit({ content: event.target.value }); shareEditorSelection(event.currentTarget) }} onFocus={event => shareEditorSelection(event.currentTarget)} onSelect={event => shareEditorSelection(event.currentTarget)} onKeyUp={event => shareEditorSelection(event.currentTarget)} onClick={event => shareEditorSelection(event.currentTarget)} onBlur={() => collaboration.updateSelection(note.id, null)} spellCheck /><RemoteSelection textarea={editor} content={note.content} selection={collaboration.remoteSelection?.noteId === note.id && !note.deleted ? { ...collaboration.remoteSelection, direction: collaboration.remoteSelection.direction ?? 'none' } : null} /></div> : <Markdown content={note.content} />}</div>
       <footer className="editor-bottom"><button className={`save-status ${status === 'Not saved on this device' ? 'save-error' : ''}`} onClick={() => void flush().catch(error => notice(errorMessage(error), true))} title="Save changes">{status === 'Saving on this device…' || status === 'Syncing…' ? <LoaderCircle size={13} className="spin" /> : session ? <CheckCheck size={14} /> : <PenLine size={13} />}{status}</button>{collaboration.view.noteId && <button className="collaboration-status" onClick={() => setModal('collaborate')}><UsersRound size={13} />{collaboration.view.status?.state === 'connected' ? collaboration.view.peerReceived ? 'Peer received' : 'Connected' : collaboration.view.status?.state === 'approval' ? 'Approval needed' : collaboration.view.status?.state === 'waiting' ? 'Waiting for collaborator' : 'Collaborator offline'}</button>}<span>{words} words</span></footer></> : initializing ? <div className="empty-state editor-empty"><LoaderCircle className="spin" aria-label="Loading notes" /></div> : <><div className="editor-topbar"><div className="editor-actions"><button className="button ghost small" onClick={() => void copy(SAMPLE_MARKDOWN)}><Copy size={16} /> Copy Markdown</button><button className="button secondary small" onClick={() => void addNote()} disabled={locked}><Plus size={16} /> New note</button></div></div><div className="editor-content"><h1 className="note-title-input">Markdown basics</h1><textarea className="markdown-editor" aria-label="Sample Markdown" readOnly value={SAMPLE_MARKDOWN} /></div></>}
     </main>
     <input type="file" accept=".md,.markdown,.txt,text/markdown,text/plain" ref={importer} hidden onChange={event => void importFile(event)} />
@@ -920,8 +1083,6 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     </Modal>}
     {modal === 'auth' && <Modal title="Connect Pubky" close={closeModal}><p className="modal-intro">Sign in with your existing identity in <strong>Pubky Ring</strong>. Your keys stay in your wallet.</p>{qr ? <img className="qr-code" src={qr} alt="Scan with Pubky Ring to authorize this notebook" width={240} height={240} /> : !authError ? <div className="auth-loading"><LoaderCircle className="spin" /><p>Preparing your connection…</p></div> : null}{authUrl && <><a className="button primary auth-link" href={authUrl}>Open Pubky Ring <ExternalLink size={15} /></a><button className="button secondary auth-link" onClick={() => void copy(authUrl)}><Copy size={15} /> Copy authorization link</button><p className="auth-instructions">Scan the code in Ring, or open the link on your phone. Approve access to this app’s private and public note folders.</p></>}{authError && <p className="inline-error" role="alert">{authError}</p>}{(authError || authUrl) && <button className="button ghost small" disabled={authStarting} onClick={() => void connect()}>Generate a fresh link</button>}<p className="hint">{IS_TESTNET ? 'Local testnet' : 'Mainnet'} · Need an identity? <a href="https://pubky.org" target="_blank" rel="noreferrer">Get Pubky Ring</a>. Your local drafts will join your saved notes and upload privately after login.</p></Modal>}
     {modal === 'share' && note && <Modal title="Share note" close={closeModal}>{!session ? <><p>Connect Pubky to save this note and publish a public copy. Local drafts are saved on this device and upload privately after login.</p><button className="button primary" onClick={() => void connect()}>Connect Pubky <ChevronRight size={15} /></button></> : <><div className="share-status"><span className={`visibility-badge ${active?.published ? 'public' : ''}`}>{active?.published ? <Globe2 size={14} /> : <LockKeyhole size={14} />}{active?.published ? 'Public copy published' : 'Only in your private notebook'}</span></div><p>Your draft stays under <code>/priv</code>. Publishing puts a copy under <code>/pub</code>, where anyone can read, discover, and download it.</p>{active?.published && <><label className="field-label" htmlFor="public-link">PUBLIC NOTE LINK</label><div className="copy-link"><input id="public-link" readOnly value={noteUrl(owner, note.id, 'pub')} onFocus={event => event.target.select()} /><button className="icon-button" onClick={() => void copy(noteUrl(owner, note.id, 'pub'))} aria-label="Copy public note link"><Copy size={17} /></button></div><p className="hint">{publicChanged ? 'Your private draft has changes that are not public yet.' : 'Your public copy is up to date.'}</p></>}<p className="hint">Unpublishing removes the public copy from your homeserver. Copies already downloaded may remain elsewhere.</p><div className="modal-actions">{active?.published && <button className="button secondary" disabled={busy} onClick={() => void sharing('unpublish')}>Unpublish</button>}<button className="button primary" disabled={busy || (!!active?.published && !publicChanged)} onClick={() => void sharing('publish')}>{busy ? <LoaderCircle className="spin" size={15} /> : <Globe2 size={15} />}{active?.published ? 'Update public copy' : 'Publish public copy'}</button></div></>}</Modal>}
-    {modal === 'move' && moveTarget && <Modal title="Move note" close={closeModal}><form onSubmit={event => { event.preventDefault(); void moveNote() }}><p className="move-note-name">{moveTarget.title || 'Untitled note'}</p><label className="field-label" htmlFor="move-destination">Move to</label><select id="move-destination" value={paths.includes(folderInput) || !folderInput ? folderInput : '__new__'} disabled={busy} onChange={event => { if (event.target.value !== '__new__') setFolderInput(event.target.value); else setFolderInput('New folder'); setFolderError('') }}><option value="">Unfiled</option>{paths.map(path => <option key={path} value={path}>{path}</option>)}<option value="__new__">New folder…</option></select><label className="field-label" htmlFor="note-folder">Folder path</label><input id="note-folder" value={folderInput} onChange={event => { setFolderInput(event.target.value); setFolderError('') }} placeholder="Unfiled" maxLength={512} disabled={busy} aria-describedby="folder-hint" /><p className="hint" id="folder-hint">Choose a folder above, or type a new path such as Work/Ideas. Leave empty for Unfiled.</p>{folderError && <p className="inline-error" role="alert">{folderError}</p>}<div className="modal-actions"><button type="button" className="button secondary" onClick={closeModal} disabled={busy}>Cancel</button><button type="submit" className="button primary" disabled={busy}>{busy && <LoaderCircle size={15} className="spin" />}Move</button></div></form></Modal>}
-    {modal === 'folder' && <Modal title={folderEditor.kind === 'create' ? 'New folder' : folderEditor.kind === 'rename' ? 'Rename folder' : 'Remove empty folder'} close={closeModal}><form onSubmit={event => { event.preventDefault(); void changeFolder() }}>{folderEditor.kind === 'remove' ? <p className="folder-context">Remove “{folderEditor.path}” and its empty subfolders?</p> : <>{folderEditor.kind === 'create' ? <><label className="field-label" htmlFor="folder-parent">Parent folder</label><select id="folder-parent" value={folderEditor.path} disabled={busy} onChange={event => setFolderEditor(current => ({ ...current, path: event.target.value }))}><option value="">No parent</option>{paths.map(path => <option key={path} value={path}>{path}</option>)}</select></> : <p className="folder-context">{folderEditor.path}</p>}<label className="field-label" htmlFor="folder-name">Folder name</label><input id="folder-name" value={folderInput} onChange={event => { setFolderInput(event.target.value); setFolderError('') }} maxLength={80} disabled={busy} autoFocus /></>}{folderError && <p className="inline-error" role="alert">{folderError}</p>}<div className="modal-actions"><button type="button" className="button secondary" onClick={closeModal} disabled={busy}>Cancel</button><button type="submit" className="button primary" disabled={busy}>{busy && <LoaderCircle size={15} className="spin" />}{folderEditor.kind === 'create' ? 'Create folder' : folderEditor.kind === 'rename' ? 'Rename folder' : 'Remove folder'}</button></div></form></Modal>}
     {modal === 'delete' && note && <Modal title="Move note to Trash?" close={closeModal}><p>“{note.title || 'Untitled note'}” will move to Trash. Its private text and editing history remain recoverable{active?.published ? '; the public copy is removed after synchronization' : ''}.</p><div className="modal-actions"><button className="button secondary" onClick={closeModal}>Keep note</button><button className="button danger" disabled={busy} onClick={() => void remove()}><Trash2 size={15} />Move to Trash</button></div></Modal>}
     {modal === 'help' && <Modal title="Help" close={closeModal}><div className="help-item"><LockKeyhole size={20} /><div><h3>Privacy</h3><p>Notes autosave to your Pubky homeserver under <code>/priv/notes/</code>. This restricts access, but is not end-to-end encryption: your homeserver operator can read the data.</p></div></div><div className="help-item"><Globe2 size={20} /><div><h3>Sharing</h3><p>Publish a public snapshot using Share. Later edits stay private until you choose Update public copy.</p></div></div><div className="help-item"><Code2 size={20} /><div><h3>Editing</h3><p>Write Markdown, preview as you go, and import or export <code>.md</code> files. Press Ctrl/⌘ + S to save immediately. Remote images are shown as text to protect reader privacy.</p></div></div><p className="hint">Drafts save on this device, then merge with your homeserver when connected. Local drafts upload privately after login. Trash retains private text and editing history. Clear browser data only after your notes have synced; overlapping edits may need cleanup.</p><a href="https://pubky.org/developer-guide.md" target="_blank" rel="noreferrer" className="button secondary small">Pubky documentation <ExternalLink size={14} /></a></Modal>}
   </div>

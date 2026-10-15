@@ -3,6 +3,7 @@ import { frameMessage, MAX_MESSAGE_BYTES, MessageAssembler } from './framing'
 import { HttpRelaySocket } from './http-relay'
 import type { SignalingSocket } from './http-relay'
 import { MAX_SIGNAL_BYTES, openSignal, ReplayGuard, sealSignal } from './signaling'
+import { advertisePresence, supportsPresence } from './presence'
 import type { Signal, SignalKind } from './signaling'
 import type { CollaborationCallbacks, CollaborationOptions, CollaborationStatus, CollaborationTransport, StoredRoom } from './types'
 
@@ -41,6 +42,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
   let remoteSession = ''
   let remoteKey = ''
   let peerFingerprint: string | undefined
+  let presenceSupported = false
   let pending: Signal | undefined
   let state: CollaborationStatus['state'] = 'connecting'
   let relayAvailable = false
@@ -66,7 +68,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
 
   function status(next: CollaborationStatus['state']) {
     state = next
-    if (!disposed) callbacks.onStatus({ state, relayAvailable, ...(peerFingerprint ? { peerFingerprint } : {}) })
+    if (!disposed) callbacks.onStatus({ state, relayAvailable, presenceSupported, ...(peerFingerprint ? { peerFingerprint } : {}) })
   }
 
   function report(error: unknown) {
@@ -111,6 +113,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
     channel = undefined
     remoteSession = ''
     remoteKey = ''
+    presenceSupported = false
     earlyCandidates.length = 0
     localCandidates.length = 0
     localCandidatesReady = false
@@ -245,7 +248,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
     if (disposed || peer !== connection) return
     await connection.setLocalDescription(description)
     if (disposed || peer !== connection) return
-    await publish('offer', signal.from, signal.session, description.sdp ?? '')
+    await publish('offer', signal.from, signal.session, advertisePresence(description.sdp ?? ''))
     await flushLocalCandidates(connection)
   }
 
@@ -288,18 +291,20 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
       if (disposed || signal.targetSession !== localSession) return
       peerFingerprint = await fingerprint(signal.from)
       const connection = newPeer(signal.from, signal.session)
+      presenceSupported = supportsPresence(signal.payload)
       await connection.setRemoteDescription({ type: 'offer', sdp: signal.payload })
       if (disposed || peer !== connection) return
       const answer = await connection.createAnswer()
       await connection.setLocalDescription(answer)
       if (disposed || peer !== connection) return
-      await publish('answer', signal.from, signal.session, answer.sdp ?? '')
+      await publish('answer', signal.from, signal.session, advertisePresence(answer.sdp ?? ''))
       await flushLocalCandidates(connection)
       return
     }
     const connection = peer
     if (!connection || signal.from !== remoteKey || signal.session !== remoteSession) return
     if (signal.kind === 'answer' && room.role === 'host' && connection.signalingState === 'have-local-offer') {
+      presenceSupported = supportsPresence(signal.payload)
       await connection.setRemoteDescription({ type: 'answer', sdp: signal.payload })
       for (const candidate of earlyCandidates.splice(0)) await connection.addIceCandidate(candidate)
     } else if (signal.kind === 'ice') {

@@ -4,6 +4,7 @@ import { admitPeer, createGuestRoom, createHostRoom, createIdentity, decodeBytes
 import { frameMessage, MAX_MESSAGE_BYTES, MessageAssembler } from './framing'
 import { openSignal, ReplayGuard, sealSignal } from './signaling'
 import { startCollaboration } from './transport'
+import { advertisePresence, supportsPresence } from './presence'
 import type { CollaborationCallbacks, Invitation, StoredRoom } from './types'
 
 const descriptor = () => ({ id: crypto.randomUUID(), createdAt: '2026-10-14T10:00:00.000Z', lineage: `shared:${crypto.randomUUID()}` })
@@ -298,6 +299,42 @@ describe('transport admission and lifetime', () => {
     ws.receive(await sealSignal(guest, helloFields(host)), host.room)
     await vi.waitFor(() => expect(FakePeer.instances).toHaveLength(1))
     expect(callbacks.onRequest).not.toHaveBeenCalled()
+  })
+
+  it.each([false, true])('negotiates host presence only from the signed guest answer (supported=%s)', async supported => {
+    const { host, guest } = await pair()
+    await admitPeer(host, guest.identity.publicKey)
+    const { callbacks, transport } = start(host)
+    const ws = await socket()
+    const hello = helloFields(host)
+    ws.receive(await sealSignal(guest, hello), host.room)
+    await vi.waitFor(() => expect(ws.sent.some(packet => JSON.parse(packet).type === 'publish')).toBe(true))
+    const offer = await openSignal(JSON.parse(ws.sent.find(packet => JSON.parse(packet).type === 'publish')!).data, guest, new ReplayGuard())
+    expect(offer?.kind).toBe('offer')
+    expect(supportsPresence(offer!.payload)).toBe(true)
+    ws.receive(await sealSignal(guest, { kind: 'answer', to: host.identity.publicKey, session: hello.session, targetSession: offer!.session, payload: supported ? advertisePresence('v=0\r\n') : 'v=0\r\n' }), host.room)
+    await vi.waitFor(() => expect(FakePeer.instances[0].remoteDescription?.type).toBe('answer'))
+    FakePeer.instances[0].channel!.open()
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'connected', presenceSupported: supported }))
+    transport.reconnect()
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'disconnected', presenceSupported: false }))
+  })
+
+  it.each([false, true])('negotiates guest presence only from the signed host offer (supported=%s)', async supported => {
+    const { host, guest } = await pair()
+    const { callbacks } = start(guest)
+    const ws = await socket()
+    await vi.waitFor(() => expect(ws.sent.some(packet => JSON.parse(packet).type === 'publish')).toBe(true))
+    const hello = await openSignal(JSON.parse(ws.sent.find(packet => JSON.parse(packet).type === 'publish')!).data, host, new ReplayGuard())
+    ws.receive(await sealSignal(host, { kind: 'offer', to: guest.identity.publicKey, session: randomToken(16), targetSession: hello!.session, payload: supported ? advertisePresence('v=0\r\n') : 'v=0\r\n' }), host.room)
+    await vi.waitFor(() => expect(ws.sent.filter(packet => JSON.parse(packet).type === 'publish')).toHaveLength(2))
+    const answer = await openSignal(JSON.parse(ws.sent.filter(packet => JSON.parse(packet).type === 'publish')[1]).data, host, new ReplayGuard())
+    expect(answer?.kind).toBe('answer')
+    expect(supportsPresence(answer!.payload)).toBe(true)
+    const channel = new FakeChannel()
+    FakePeer.instances[0].ondatachannel!({ channel })
+    channel.open()
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'connected', presenceSupported: supported }))
   })
 
   it('serializes complete received messages and stops old-account callbacks after disposal', async () => {

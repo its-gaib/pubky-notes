@@ -3,14 +3,18 @@ import type { Browser, BrowserContext, Page } from '@playwright/test'
 
 const BASE = 'http://127.0.0.1:4174'
 const BODY = '# Shared draft\n\nMiddle paragraph.\n\nLast paragraph.'
-type Peer = { context: BrowserContext; page: Page; owner: string }
+type Peer = { context: BrowserContext; page: Page; owner: string; browserErrors: string[] }
 type Note = { note: { id: string; title: string; content: string; folder?: string; crdt?: { version: number; update: string } }; published: unknown }
 
 const test = base.extend<{ accounts: Peer[] }>({
   accounts: [async ({ browser }, use) => {
     void browser // Keep cleanup ahead of browser teardown, including after test timeouts.
     const accounts: Peer[] = []
-    try { await use(accounts) } finally { await cleanup(accounts) }
+    try { await use(accounts) } finally {
+      const errors = accounts.flatMap(account => account.browserErrors)
+      await cleanup(accounts)
+      expect(errors, 'Collaboration must not cause uncaught browser errors or React render loops').toEqual([])
+    }
   }, { timeout: 60_000 }],
 })
 
@@ -51,6 +55,11 @@ async function peer(browser: Browser, relayOnly = false): Promise<Peer> {
     }
   }, relayOnly)
   const page = await context.newPage()
+  const browserErrors: string[] = []
+  page.on('pageerror', error => browserErrors.push(error.message))
+  page.on('console', message => {
+    if (message.type() === 'error' && message.text().includes('Maximum update depth exceeded')) browserErrors.push(message.text())
+  })
   try {
     await page.goto(`${BASE}/e2e/fixture.html`)
     const owner = await page.evaluate(async () => {
@@ -59,9 +68,9 @@ async function peer(browser: Browser, relayOnly = false): Promise<Peer> {
     })
     await page.goto(BASE)
     await expect(page.getByRole('button', { name: 'Disconnect from Pubky' })).toBeVisible()
-    return { context, page, owner }
+    return { context, page, owner, browserErrors }
   } catch (error) {
-    await cleanup([{ context, page, owner: '' }])
+    await cleanup([{ context, page, owner: '', browserErrors }])
     throw error
   }
 }
@@ -153,6 +162,29 @@ async function insert(page: Page, edge: 'start' | 'end', text: string) {
   await page.keyboard.insertText(text)
 }
 
+async function selectText(page: Page, start: number, end = start, direction: 'forward' | 'backward' | 'none' = 'forward') {
+  const editor = page.getByRole('textbox', { name: 'Markdown content' })
+  await editor.focus()
+  // Establish a native range, then release a modifier without changing it so
+  // React observes a real keyboard event. Presence still uses the genuine RTC channel.
+  await editor.evaluate((element, range) => (element as HTMLTextAreaElement).setSelectionRange(range.start, range.end, range.direction), { start, end, direction })
+  await editor.press('Shift')
+}
+
+async function overlaysStayInsideEditor(page: Page) {
+  await expect.poll(() => page.evaluate(() => {
+    const editor = document.querySelector<HTMLTextAreaElement>('[aria-label="Markdown content"]')!
+    const box = editor.getBoundingClientRect()
+    const overlays = [...document.querySelectorAll<HTMLElement>('.remote-selection-caret, .remote-selection-highlight, .remote-selection-name')]
+      .filter(element => getComputedStyle(element).visibility !== 'hidden')
+    return overlays.length > 0 && overlays.every(element => {
+      const rect = element.getBoundingClientRect()
+      return rect.width > 0 && rect.height > 0 && rect.left >= box.left - 1 && rect.top >= box.top - 1
+        && rect.right <= box.right + 1 && rect.bottom <= box.bottom + 1
+    })
+  }), { message: 'Remote cursor, name, and selection must remain clipped to the textarea' }).toBe(true)
+}
+
 test('approved browsers exchange real RTC edits, keep independent private files, and stop on logout', async ({ browser, accounts: peers }) => {
     const alice = await peer(browser); peers.push(alice)
     const bob = await peer(browser); peers.push(bob)
@@ -169,9 +201,18 @@ test('approved browsers exchange real RTC edits, keep independent private files,
       expect(Buffer.from(row.note.crdt!.update, 'base64').toString()).not.toContain('DELETED PRIVATE TEXT MUST NOT BE SHARED')
     }
 
+    await alice.page.getByRole('button', { name: 'New folder', exact: true }).click()
+    await alice.page.getByRole('textbox', { name: 'Folder name' }).fill('Alice only')
+    await alice.page.getByRole('button', { name: 'Create folder', exact: true }).click()
+    await alice.page.getByRole('button', { name: 'Folder actions for Alice only', exact: true }).click()
+    await alice.page.getByRole('menuitem', { name: 'New subfolder', exact: true }).click()
+    await alice.page.getByRole('textbox', { name: 'Folder name' }).fill('Research')
+    await alice.page.getByRole('button', { name: 'Create folder', exact: true }).click()
+    await alice.page.getByRole('button', { name: 'All notes', exact: true }).click()
     await alice.page.locator('.note-entry.selected').getByRole('button', { name: 'Note actions for E2E shared draft' }).click()
     await alice.page.getByRole('menuitem', { name: 'Move to…' }).click()
-    await alice.page.getByRole('textbox', { name: 'Folder path' }).fill('Alice only/Research')
+    await alice.page.getByRole('combobox', { name: 'Move note to', exact: true }).selectOption('Alice only/Research')
+    await expect(alice.page.getByRole('dialog')).toHaveCount(0)
     await alice.page.getByRole('button', { name: 'Move', exact: true }).click()
     await expect.poll(async () => (await notes(alice.page)).find(row => row.note.id === id)?.note.folder).toBe('Alice only/Research')
     expect((await notes(bob.page)).find(row => row.note.id === id)?.note.folder || '').toBe('')
@@ -182,7 +223,9 @@ test('approved browsers exchange real RTC edits, keep independent private files,
     await expect.poll(async () => (await notes(alice.page)).find(row => row.note.id === id)?.published).not.toBeNull()
     expect((await notes(bob.page)).find(row => row.note.id === id)?.published).toBeNull()
     await alice.page.getByRole('button', { name: 'Unpublish', exact: true }).click()
-    await expect.poll(async () => (await notes(alice.page)).find(row => row.note.id === id)?.published).toBeNull()
+    // A snapshot can list the public file just before Unpublish removes it.
+    // Retry the complete read, including that transient GET404, until it is absent.
+    await expect(async () => expect((await notes(alice.page)).find(row => row.note.id === id)?.published).toBeNull()).toPass({ timeout: 20_000 })
     await alice.page.getByRole('button', { name: 'Close dialog' }).click()
     await connected(bob.page)
 
@@ -225,6 +268,119 @@ test('offline branches merge on reconnection and reload reuses the approved brow
     await insert(bob.page, 'end', '\nAfter reload')
     await expect(alice.page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(`${merged}\nAfter reload`)
     await Promise.all(peers.map(({ page }) => saved(page, id, `${merged}\nAfter reload`)))
+})
+
+test('live collaborator cursors follow native selections, CRDT edits, wrapping, and scrolling without persisting presence', async ({ browser, accounts: peers }) => {
+  const alice = await peer(browser); peers.push(alice)
+  const bob = await peer(browser); peers.push(bob)
+  const id = await share(alice.page, bob.page)
+  await Promise.all([insert(alice.page, 'start', 'Alice\n'), insert(bob.page, 'end', '\nBob')])
+  const merged = `Alice\n${BODY}\nBob`
+  await Promise.all(peers.map(async ({ page }) => {
+    await expect(page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(merged)
+    await saved(page, id, merged)
+  }))
+  const beforePresence = await Promise.all(peers.map(async ({ page }) => (await notes(page)).find(row => row.note.id === id)))
+  const aliceEditor = alice.page.getByRole('textbox', { name: 'Markdown content' })
+  const bobEditor = bob.page.getByRole('textbox', { name: 'Markdown content' })
+  const caret = alice.page.locator('.remote-selection-caret')
+  const label = alice.page.locator('.remote-selection-name')
+  const highlights = alice.page.locator('.remote-selection-highlight')
+
+  await bobEditor.focus()
+  await bobEditor.press('Control+Home')
+  await bobEditor.press('ArrowRight')
+  await expect(caret).toBeVisible()
+  await expect(label).toBeVisible()
+  await expect(label).toHaveText(/^Collaborator /)
+  const firstCaret = (await caret.boundingBox())!
+  await bobEditor.press('ArrowRight')
+  await expect.poll(async () => (await caret.boundingBox())?.x ?? 0).toBeGreaterThan(firstCaret.x + 5)
+  await bobEditor.press('Shift+ArrowRight')
+  await expect(highlights).toHaveCount(1)
+  await overlaysStayInsideEditor(alice.page)
+  await expect(aliceEditor).toHaveValue(merged)
+  await expect(bobEditor).toHaveValue(merged)
+  const afterPresence = await Promise.all(peers.map(async ({ page }) => (await notes(page)).find(row => row.note.id === id)))
+  expect(afterPresence).toEqual(beforePresence)
+
+  const selectedStart = merged.indexOf('Middle')
+  await selectText(bob.page, selectedStart, selectedStart + 'Middle'.length)
+  await expect(highlights).toHaveCount(1)
+  // Wait for the selection to leave the first line before sampling its position.
+  await expect.poll(async () => (await highlights.first().boundingBox())?.y ?? 0).toBeGreaterThan(firstCaret.y + 30)
+  const beforeInsert = (await highlights.first().boundingBox())!
+  const prefix = 'Prefix '
+  const prefixWidth = await aliceEditor.evaluate((element, text) => {
+    const style = getComputedStyle(element), context = document.createElement('canvas').getContext('2d')!
+    context.font = `${style.fontSize} ${style.fontFamily}`
+    return context.measureText(text).width
+  }, prefix)
+  await selectText(alice.page, selectedStart)
+  await alice.page.keyboard.insertText(prefix)
+  const anchored = merged.slice(0, selectedStart) + prefix + merged.slice(selectedStart)
+  await expect(bobEditor).toHaveValue(anchored)
+  await expect.poll(() => bobEditor.evaluate(element => {
+    const editor = element as HTMLTextAreaElement
+    return editor.value.slice(editor.selectionStart, editor.selectionEnd)
+  })).toBe('Middle')
+  await expect.poll(async () => {
+    const box = await highlights.first().boundingBox()
+    return box ? Math.abs(box.x - beforeInsert.x - prefixWidth) : Infinity
+  }, { message: 'The remote selection must stay anchored to Middle after an insertion before it' }).toBeLessThan(3)
+  expect(Math.abs((await highlights.first().boundingBox())!.width - beforeInsert.width)).toBeLessThan(3)
+
+  const longText = `Wrapped ${'word '.repeat(110)}\n\n${Array.from({ length: 60 }, (_, index) => `Line ${index}: scrollable shared text.`).join('\n')}`
+  await aliceEditor.fill(longText)
+  await expect(bobEditor).toHaveValue(longText)
+  await aliceEditor.evaluate(element => { element.scrollTop = 0 })
+  await selectText(bob.page, 0, 450)
+  await expect.poll(() => highlights.count()).toBeGreaterThan(1)
+  await expect(caret).toBeVisible()
+  await overlaysStayInsideEditor(alice.page)
+  const beforeResize = (await caret.boundingBox())!
+  await alice.page.getByRole('button', { name: 'Collapse navigation', exact: true }).click()
+  await alice.page.getByRole('button', { name: 'Collapse notes', exact: true }).click()
+  await expect.poll(async () => {
+    const box = await caret.boundingBox()
+    return box ? Math.abs(box.x - beforeResize.x) + Math.abs(box.y - beforeResize.y) : 0
+  }).toBeGreaterThan(20)
+  await overlaysStayInsideEditor(alice.page)
+  await alice.page.screenshot({ path: '/tmp/pubky-notes-live-cursors-desktop.png' })
+  await alice.page.getByRole('button', { name: 'Expand sidebars', exact: true }).click()
+  await overlaysStayInsideEditor(alice.page)
+
+  await bobEditor.press('Control+End')
+  await aliceEditor.evaluate(element => { element.scrollTop = element.scrollHeight })
+  await expect(caret).toBeVisible()
+  await overlaysStayInsideEditor(alice.page)
+  await aliceEditor.evaluate(element => { element.scrollTop = 0 })
+  await expect(caret).toHaveCount(0)
+  await expect(label).toBeHidden()
+  await selectText(bob.page, 0, longText.length)
+  await aliceEditor.evaluate(element => { element.scrollTop = element.scrollHeight / 2 })
+  await expect.poll(() => highlights.count()).toBeGreaterThan(2)
+  await overlaysStayInsideEditor(alice.page)
+  await expect(caret).toHaveCount(0)
+
+  await bob.page.getByRole('textbox', { name: 'Note title' }).focus()
+  await expect(highlights).toHaveCount(0)
+  await expect(label).toBeHidden()
+  await aliceEditor.evaluate(element => { element.scrollTop = 0 })
+  await selectText(bob.page, 3)
+  await expect(caret).toBeVisible()
+  await bob.page.getByRole('button', { name: 'New note', exact: true }).first().click()
+  await expect(caret).toHaveCount(0)
+  await expect(label).toBeHidden()
+  await bob.page.getByRole('button', { name: 'Open note E2E shared draft', exact: true }).click()
+  await selectText(bob.page, 3)
+  await expect(caret).toBeVisible()
+  await Promise.all(peers.map(({ page }) => saved(page, id, longText)))
+  await bob.page.getByRole('button', { name: 'Disconnect from Pubky' }).click()
+  await expect(caret).toHaveCount(0)
+  await expect(highlights).toHaveCount(0)
+  await expect(label).toBeHidden()
+  await expect(aliceEditor).toHaveValue(longText)
 })
 
 test('real TURN collaboration recovers a lost initial handshake when direct ICE is disabled', async ({ browser, accounts: peers }) => {

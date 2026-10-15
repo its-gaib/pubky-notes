@@ -1,0 +1,7 @@
+.remote-selection-layer { position: absolute; inset: 0; z-index: 1; overflow: hidden; pointer-events: none; user-select: none; }
+.remote-selection-mirror { position: absolute; top: 0; left: 0; box-sizing: border-box; height: auto; margin: 0; border-style: solid; border-color: transparent; visibility: hidden; pointer-events: none; }
+.remote-selection-viewport { position: absolute; overflow: hidden; pointer-events: none; }
+.remote-selection-highlight, .remote-selection-caret, .remote-selection-name { position: absolute; display: block; pointer-events: none; }
+.remote-selection-highlight { opacity: .19; }
+.remote-selection-caret { border-radius: 1px; }
+.remote-selection-name { max-width: 100%; padding: 1px 5px; border-radius: 3px; color: #fff; font: 500 11px/17px system-ui, sans-serif; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }

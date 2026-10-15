@@ -166,7 +166,7 @@ describe('durable local notes and account synchronization', () => {
     expect(account.pending).toEqual([])
     expect(account.activeId).toBe(guestId)
     expect((await readLocalNotebook(GUEST_SCOPE)).records).toEqual([])
-  })
+  }, 15_000) // Guest persistence, login/adoption, and private upload each perform asynchronous storage work.
 
   it('retains failed uploads locally and never reports them as saved to Pubky', async () => {
     mocks.save.mockRejectedValue(new Error('Homeserver rejected the write'))

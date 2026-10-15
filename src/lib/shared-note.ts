@@ -115,9 +115,16 @@ export class SharedNoteDocument {
 
   resolveSelection(selection: SharedSelection): { start: number; end: number } | null {
     this.assertAlive()
+    // Relative positions may arrive from a peer. Never let a forged root name
+    // cause Yjs to create another shared type while merely resolving a cursor.
+    if (!selection || !['title', 'content'].includes(selection.field)) return null
+    const validPosition = (position: Y.RelativePosition) => position && position.type === null && position.tname === selection.field
+      && [-1, 0, 1].includes(position.assoc) && (position.item === null || (Number.isSafeInteger(position.item.client) && position.item.client >= 0 && position.item.client <= 0xffffffff && Number.isSafeInteger(position.item.clock) && position.item.clock >= 0))
+    if (!validPosition(selection.start) || !validPosition(selection.end)) return null
+    const text = this.doc.share.get(selection.field)
+    if (!(text instanceof Y.Text)) return null
     const start = Y.createAbsolutePositionFromRelativePosition(selection.start, this.doc)
     const end = Y.createAbsolutePositionFromRelativePosition(selection.end, this.doc)
-    const text = this.doc.getText(selection.field)
     return start?.type === text && end?.type === text ? { start: start.index, end: end.index } : null
   }
 

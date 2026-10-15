@@ -332,15 +332,29 @@ describe('folders and notebook-wide search', () => {
     expect(mocks.publishNote).not.toHaveBeenCalled()
   })
 
-  it('creates a nested folder by moving a note and saves its organization privately', async () => {
+  it('creates a nested folder and moves a note entirely within the sidebars, saving organization privately', async () => {
     const original = { ...savedNote }
     const session = await openNotebook([{ note: original, published: { ...original } }])
+    fireEvent.click(screen.getByRole('button', { name: 'New folder' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Folder name' }), { target: { value: 'Work' } })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Create folder' })) })
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Folder name' })).toBeNull())
+    await screen.findByRole('button', { name: 'Open folder Work' })
+    fireEvent.click(screen.getByRole('button', { name: 'Folder actions for Work' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'New subfolder' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Folder name' }), { target: { value: 'Project' } })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Create folder' })) })
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Folder name' })).toBeNull())
+    await screen.findByRole('button', { name: 'Open folder Work/Project' })
+    fireEvent.click(screen.getByRole('button', { name: /^All notes$/ }))
     fireEvent.click(screen.getByRole('button', { name: `Note actions for ${original.title}` }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'Move to…' }))
-    const dialog = within(screen.getByRole('dialog', { name: 'Move note' }))
-    fireEvent.change(dialog.getByRole('textbox', { name: 'Folder path' }), { target: { value: ' Work / Project ' } })
-    await act(async () => { fireEvent.click(dialog.getByRole('button', { name: /^Move$/ })) })
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Move note' })).toBeNull())
+    const destination = screen.getByRole('combobox', { name: 'Move note to' })
+    expect(destination.closest('#notebook-notes')).not.toBeNull()
+    expect(screen.queryByRole('dialog')).toBeNull()
+    fireEvent.change(destination, { target: { value: 'Work/Project' } })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /^Move$/ })) })
+    await waitFor(() => expect(screen.queryByRole('combobox', { name: 'Move note to' })).toBeNull())
     await act(async () => { fireEvent.keyDown(window, { key: 's', ctrlKey: true }) })
 
     await waitFor(() => expect(mocks.saveNote).toHaveBeenCalledWith(session, expect.objectContaining({
@@ -350,7 +364,7 @@ describe('folders and notebook-wide search', () => {
     expect(screen.getByRole('button', { name: 'Open folder Work/Project' })).toBeTruthy()
     expect(mocks.publishNote).not.toHaveBeenCalled()
     expect(mocks.unpublishNote).not.toHaveBeenCalled()
-  })
+  }, 15_000) // Includes three persisted sidebar operations alongside the parallel app suites.
 
   it('starts a new note in the selected nested folder with the Markdown template', async () => {
     const session = await openNotebook(organizedNotebook())
