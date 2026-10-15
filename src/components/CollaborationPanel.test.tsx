@@ -21,7 +21,7 @@ describe('inline collaboration', () => {
     render(<CollaborationPanel {...actions} />)
     expect(screen.getByRole('region', { name: 'Collaboration' })).toBeTruthy()
     expect(screen.queryByRole('dialog')).toBeNull()
-    expect(screen.getByText(/original stays private and unchanged/)).toBeTruthy()
+    expect(screen.getByText(/earlier editing history or deleted text.*original stays unchanged/)).toBeTruthy()
     expect(actions.start).not.toHaveBeenCalled()
     expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Done' })).toBeNull()
@@ -34,7 +34,7 @@ describe('inline collaboration', () => {
   it('keeps invitation consent after sign-in instead of automatically joining', () => {
     const actions = props({ invitation: true, signedIn: false })
     const { rerender } = render(<CollaborationPanel {...actions} />)
-    expect(screen.getByText(/copy saves privately.*both browsers must be online/)).toBeTruthy()
+    expect(screen.getByText(/shared note saves privately.*both browsers must be online/)).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Connect Pubky to join' }))
     expect(actions.connect).toHaveBeenCalledOnce()
     expect(actions.join).not.toHaveBeenCalled()

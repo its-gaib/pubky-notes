@@ -46,7 +46,7 @@ export default function CollaborationPanel(props: Props) {
   return <section id="collaboration-panel" className="collaboration-panel" aria-label="Collaboration">
     <header className="collaboration-panel-heading"><span><UsersRound size={15} />{invitation ? 'Join shared note' : active ? props.sharedTitle || 'Shared note' : 'Collaborate'}</span><button className="icon-button" aria-label="Close collaboration" title="Close collaboration" onClick={props.close}><X size={17} /></button></header>
     {invitation ? <>
-      <p>Edit together after the inviter approves. Your copy saves privately to your homeserver; both browsers must be online to sync.</p>
+      <p>Edit together after the inviter approves. The shared note saves privately to your homeserver; both browsers must be online to sync.</p>
       {view.error && <p className="inline-error" role="alert">{view.error}</p>}
       <div className="collaboration-panel-actions"><button className="button primary small" disabled={disabled || view.working} onClick={signedIn ? props.join : props.connect}>{signedIn ? view.working ? 'Joining…' : 'Join collaboration' : 'Connect Pubky to join'}</button></div>
     </> : active ? <>
@@ -60,14 +60,14 @@ export default function CollaborationPanel(props: Props) {
       {view.role === 'guest' && view.ownFingerprint && view.status?.state !== 'connected' && <p className="hint">Your connection code: <strong>{view.ownFingerprint}</strong>. Share it with the inviter.</p>}
       {failed && <div className="collaboration-panel-actions"><button className="button secondary small" onClick={props.retry}>Retry connection</button></div>}
       <details className="collaboration-details"><summary>Details</summary>
-        <p>Each person saves a private copy. Folders and Trash stay personal. Both browsers must be online to sync.</p>
+        <p>Each person saves the shared note privately. Folders and Trash stay personal. Both browsers must be online to sync.</p>
         {view.status && <p>{view.status.relayAvailable ? 'TURN relay fallback for syncing edits is configured.' : 'Direct connections only: the TURN relay for syncing edits is unavailable.'}</p>}
         {view.error && view.error !== connectionMessage && <p>{view.error}</p>}
         <button className="button ghost small" onClick={props.disconnect}>Disconnect collaboration</button>
       </details>
     </> : <>
-      <p>{note?.crdt?.version === 2 ? 'Resume editing this shared note. Your copy stays private.' : 'Creates a shared copy of the current text; your original stays private and unchanged.'}</p>
-      <p className="hint">Invite one person. Each keeps a private copy; both browsers must be online to sync.</p>
+      <p>{note?.crdt?.version === 2 ? 'Resume editing this shared note. It saves privately to your homeserver.' : 'Creates a shared copy of the current text, without your earlier editing history or deleted text. Your original stays unchanged.'}</p>
+      <p className="hint">Invite one person. Each of you saves the shared note privately; both browsers must be online to sync.</p>
       {view.error && <p className="inline-error" role="alert">{view.error}</p>}
       <div className="collaboration-panel-actions"><button className="button primary small" disabled={disabled || view.working || (signedIn && !note)} onClick={signedIn ? props.start : props.connect}>{!signedIn ? 'Connect Pubky' : view.working ? 'Preparing…' : note?.crdt?.version === 2 ? 'Resume collaboration' : 'Create shared copy'}</button></div>
     </>}
