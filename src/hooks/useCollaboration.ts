@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { CrdtNote, NotePatch } from '../lib/crdt'
-import { editNote } from '../lib/crdt'
+import { editNote, mergeNotes } from '../lib/crdt'
 import { createSharedNote, joinSharedNote, SharedNoteDocument, sharedNoteDescriptor } from '../lib/shared-note'
 import {
   createGuestRoom, createHostRoom, fingerprint, invitationUrl, loadRoom, parseInvitation, startCollaboration,
@@ -16,7 +16,7 @@ interface Options {
   activeId?: string
   displayName?: string
   persist(note: CrdtNote, scope: string, select?: boolean): Promise<void>
-  beforeRemoteChange(doc: SharedNoteDocument): (() => void) | undefined
+  beforeRemoteChange(doc: SharedNoteDocument, rendered?: SharedNoteDocument): (() => void) | undefined
 }
 interface LiveRoom {
   room: StoredRoom
@@ -273,7 +273,25 @@ export function useCollaboration(options: Options) {
     if (!connection || !current(connection) || connection.doc?.note.id !== note.id) return editNote(note, patch)
     connection.doc.mergeLocal(note)
     const before = connection.doc.getStateVector(), previous = connection.doc.note.crdt!.update
-    const next = connection.doc.edit(patch)
+    let next: CrdtNote
+    if (note.crdt?.update !== previous) {
+      // Native input can arrive before React commits a just-received update.
+      // Apply its intent to the snapshot the user actually edited, then merge
+      // those operations; diffing this full string against the advanced live
+      // document would turn unseen peer insertions into local deletions.
+      const { folder, deleted, ...textPatch } = patch
+      const edited = editNote(note, textPatch), merged = mergeNotes(connection.doc.note, edited)
+      // Stage explicit private changes against the latest personal map, and
+      // validate the complete result before committing to the live document.
+      const candidate = 'folder' in patch || 'deleted' in patch
+        ? editNote(merged, { ...('folder' in patch ? { folder } : {}), ...('deleted' in patch ? { deleted } : {}), updatedAt: patch.updatedAt }) : merged
+      const rendered = new SharedNoteDocument(edited)
+      try {
+        const restoreSelection = latest.current.beforeRemoteChange(connection.doc, rendered)
+        next = connection.doc.mergeLocal(candidate)
+        restoreSelection?.()
+      } finally { rendered.destroy() }
+    } else next = connection.doc.edit(patch)
     connection.presence?.refresh()
     if (previous !== next.crdt!.update) sendDifference(connection, before)
     return next

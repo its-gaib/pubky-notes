@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createElement, useLayoutEffect } from 'react'
 import { cleanup as cleanupReact, render } from '@testing-library/react'
-import { initializeNote } from './crdt'
+import { editNote, initializeNote } from './crdt'
 import { createSharedNote, joinSharedNote, SharedNoteDocument } from './shared-note'
 import { EditorSelectionKeeper } from './editor-selection'
 
@@ -38,6 +38,21 @@ function setup(field: 'content' | 'title' = 'content') {
 }
 
 describe('local editor selection restoration', () => {
+  it('anchors local input in its rendered snapshot while resolving against the newer live document', () => {
+    const { alice, bob, element, keeper } = setup()
+    const renderedBeforeInput = alice.note
+    bob.edit({ content: `Unseen ${bob.note.content}` }); alice.applyPeerUpdate(bob.getUpdate())
+    const edited = editNote(renderedBeforeInput, { content: `${renderedBeforeInput.content}!` })
+    element.value = edited.content; element.setSelectionRange(edited.content.length, edited.content.length, 'forward')
+    const source = new SharedNoteDocument(edited)
+    const restore = keeper.capture(alice, source)!
+    alice.mergeLocal(edited); source.destroy()
+    restore(); element.value = alice.note.content; keeper.flush()
+    expect(element.selectionStart).toBe(alice.note.content.length)
+    expect(element.selectionDirection).toBe('forward')
+    expect(frames.size).toBe(0)
+  })
+
   it('restores inside the React value commit before a following input task, without waiting for an animation frame', () => {
     const { alice, bob, state, keeper } = setup()
     function Editor({ value }: { value: string }) {

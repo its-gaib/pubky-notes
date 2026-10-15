@@ -4,7 +4,7 @@ import { act, cleanup, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useCollaboration } from './useCollaboration'
 import { initializeNote } from '../lib/crdt'
-import { createSharedNote, SharedNoteDocument } from '../lib/shared-note'
+import { createSharedNote, joinSharedNote, SharedNoteDocument } from '../lib/shared-note'
 import type { CollaborationCallbacks, StoredRoom } from '../lib/collaboration'
 import { decodePresence } from '../lib/collaboration/presence'
 import type { CrdtNote } from '../lib/crdt'
@@ -33,7 +33,7 @@ async function setup(presenceSupported = true, remapNotes = false) {
   const room = { scope: 'alice', role: 'host', descriptor: { id: shared.id, lineage: shared.crdt!.lineage, createdAt: shared.createdAt }, identity: { publicKey: 'key' } } as StoredRoom
   mocks.create.mockResolvedValue(room)
   const persist = vi.fn(async (_note: CrdtNote, _scope: string, _select?: boolean) => {})
-  const beforeRemoteChange = vi.fn<(_doc: SharedNoteDocument) => (() => void) | undefined>(() => undefined)
+  const beforeRemoteChange = vi.fn<(_doc: SharedNoteDocument, _rendered?: SharedNoteDocument) => (() => void) | undefined>(() => undefined)
   const props = { scope: 'alice', enabled: true, notes: [shared], activeId: shared.id, displayName: 'Alice', persist, beforeRemoteChange }
   let renders = 0
   const hook = renderHook(options => {
@@ -53,6 +53,81 @@ async function setup(presenceSupported = true, remapNotes = false) {
 }
 
 describe('collaboration cursor hook', () => {
+  it('keeps an unseen peer edit when a local input is based on the previous rendered note', async () => {
+    const { result, peer, shared } = await setup()
+    // The live Yjs document receives Bob's suffix before React commits that
+    // updated value. Alice's native input still edits the previous DOM value.
+    peer.edit({ content: `${shared.content}\nBob` })
+    await act(async () => { await callbacks.onMessage(new Uint8Array([1, ...peer.getUpdate()])) })
+    let changed = shared
+    act(() => { changed = result.current.edit(shared, { content: `Alice\n${shared.content}` }) })
+    expect(changed.content).toBe(`Alice\n${shared.content}\nBob`)
+    const update = mocks.send.mock.calls.findLast(([message]) => message[0] === 1)![0].subarray(1)
+    peer.applyPeerUpdate(update)
+    expect(peer.note.content).toBe(changed.content)
+    peer.destroy()
+  })
+
+  it('rebases local deletions and title edits without deleting unseen peer additions', async () => {
+    const { result, peer, shared } = await setup()
+    peer.edit({ content: `${shared.content}\nBob`, title: `${shared.title} Bob` })
+    await act(async () => { await callbacks.onMessage(new Uint8Array([1, ...peer.getUpdate()])) })
+    let changed = shared
+    act(() => { changed = result.current.edit(shared, { content: 'Hello ', title: `Alice ${shared.title}` }) })
+    expect(changed).toMatchObject({ content: 'Hello \nBob', title: 'Alice Meeting Bob' })
+    peer.destroy()
+  })
+
+  it('retains latest personal metadata, applies explicit personal patches causally, and never sends it to a peer', async () => {
+    const { result, peer, shared } = await setup()
+    act(() => { result.current.edit(shared, { folder: 'Latest/private', deleted: true }) })
+    peer.edit({ content: `${shared.content}\nBob` })
+    await act(async () => { await callbacks.onMessage(new Uint8Array([1, ...peer.getUpdate()])) })
+    let changed = shared
+    act(() => { changed = result.current.edit(shared, { content: `Alice\n${shared.content}` }) })
+    expect(changed).toMatchObject({ folder: 'Latest/private', deleted: true, content: `Alice\n${shared.content}\nBob` })
+    act(() => { changed = result.current.edit(shared, { folder: 'Requested/folder', deleted: false }) })
+    expect(changed).toMatchObject({ folder: 'Requested/folder', content: `Alice\n${shared.content}\nBob` })
+    expect(changed.deleted).not.toBe(true)
+    const publicDoc = new SharedNoteDocument(changed)
+    const joined = joinSharedNote(publicDoc.descriptor, publicDoc.getUpdate())
+    expect(joined.folder).toBeUndefined(); expect(joined.deleted).not.toBe(true)
+    publicDoc.destroy(); peer.destroy()
+  })
+
+  it('maps a local post-input caret from its rendered snapshot into the advanced document and publishes that position', async () => {
+    const { result, peer, shared, beforeRemoteChange } = await setup()
+    peer.edit({ content: `Bob ${shared.content}` })
+    await act(async () => { await callbacks.onMessage(new Uint8Array([1, ...peer.getUpdate()])) })
+    let resolved: { start: number; end: number } | null = null
+    beforeRemoteChange.mockImplementation((live, rendered) => {
+      if (!rendered) return
+      const anchor = rendered.captureSelection('content', shared.content.length + 1)
+      return () => { resolved = live.resolveSelection(anchor) }
+    })
+    let changed = shared
+    act(() => { changed = result.current.edit(shared, { content: `${shared.content}!` }) })
+    expect(changed.content).toBe(`Bob ${shared.content}!`)
+    expect(resolved).toEqual({ start: changed.content.length, end: changed.content.length })
+    await act(async () => { result.current.updateSelection(shared.id, { field: 'content', ...resolved! }); await vi.advanceTimersByTimeAsync(50) })
+    const packet = mocks.send.mock.calls.findLast(([message]) => message[0] === 3)![0]
+    const selection = decodePresence(packet.subarray(1))!.selection!
+    const document = new SharedNoteDocument(changed)
+    expect(document.resolveSelection(selection)).toEqual(resolved)
+    document.destroy(); peer.destroy()
+  })
+
+  it('rejects an invalid rebased personal patch before committing its shared text changes', async () => {
+    const { result, peer, shared } = await setup()
+    peer.edit({ content: `${shared.content}\nBob` })
+    await act(async () => { await callbacks.onMessage(new Uint8Array([1, ...peer.getUpdate()])) })
+    expect(() => result.current.edit(shared, { content: 'Must not commit', folder: '../invalid' })).toThrow()
+    let unchanged = shared
+    act(() => { unchanged = result.current.edit(shared, {}) })
+    expect(unchanged.content).toBe(`${shared.content}\nBob`)
+    peer.destroy()
+  })
+
   it('updates the editor and schedules restoration before yielding, then acknowledges the exact saved snapshot', async () => {
     const { result, peer, persist, beforeRemoteChange } = await setup()
     const restore = vi.fn()

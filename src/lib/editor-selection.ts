@@ -35,18 +35,22 @@ export class EditorSelectionKeeper {
     this.frame = undefined
   }
 
-  capture(doc: SharedNoteDocument): (() => void) | undefined {
+  capture(doc: SharedNoteDocument, rendered = doc): (() => void) | undefined {
     const focused = document.activeElement
     const field = focused && focused === this.options.content() ? 'content' : focused && focused === this.options.title() ? 'title' : undefined
     const element = field === 'content' ? this.options.content() : field === 'title' ? this.options.title() : null
     let id: string
-    try { id = doc.descriptor.id } catch { this.invalidate(); return }
+    try {
+      const live = doc.descriptor, source = rendered.descriptor
+      id = live.id
+      if (source.id !== id || source.createdAt !== live.createdAt || source.lineage !== live.lineage) { this.invalidate(); return }
+    } catch { this.invalidate(); return }
     if (!element || !field || this.options.activeId() !== id) { this.invalidate(); return }
     const scope = this.options.scope()
     let pending = this.pending
-    if (!pending || pending.epoch !== this.epoch || !('doc' in pending.anchor) || pending.anchor.doc !== doc || pending.element !== element || pending.scope !== scope || pending.id !== id) {
+    if (rendered !== doc || !pending || pending.epoch !== this.epoch || !('doc' in pending.anchor) || pending.anchor.doc !== doc || pending.element !== element || pending.scope !== scope || pending.id !== id) {
       pending = { element, field, scope, id, epoch: this.epoch, ticket: 0, ready: false,
-        anchor: { doc, selection: doc.captureSelection(field, element.selectionStart ?? 0, element.selectionEnd ?? 0) }, direction: element.selectionDirection ?? 'none' }
+        anchor: { doc, selection: rendered.captureSelection(field, element.selectionStart ?? 0, element.selectionEnd ?? 0) }, direction: element.selectionDirection ?? 'none' }
       this.pending = pending
     }
     // Reuse the relative anchor when another peer change arrives before the
