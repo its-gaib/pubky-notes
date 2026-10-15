@@ -7,7 +7,7 @@ interface Options {
   title(): HTMLInputElement | null
 }
 interface PendingSelection {
-  anchor: { doc: SharedNoteDocument; selection: SharedSelection } | { start: number; end: number }
+  anchor: { doc: SharedNoteDocument; selection: SharedSelection } | { start: number; end: number; value: string }
   field: 'content' | 'title'
   element: HTMLTextAreaElement | HTMLInputElement
   scope: string
@@ -59,15 +59,18 @@ export class EditorSelectionKeeper {
   }
 
   /** Guard a normal notebook refresh, giving an existing relative anchor priority. */
-  captureOffsets(): (() => void) | undefined {
-    if (this.pending && this.current(this.pending, this.pending.ticket)) return this.prepare(this.pending)
+  captureOffsets(value: string): (() => void) | undefined {
+    if (this.pending && this.current(this.pending, this.pending.ticket)) {
+      if (!('doc' in this.pending.anchor)) this.pending.anchor.value = value
+      return this.prepare(this.pending)
+    }
     const focused = document.activeElement
     const field = focused && focused === this.options.content() ? 'content' : focused && focused === this.options.title() ? 'title' : undefined
     const element = field === 'content' ? this.options.content() : field === 'title' ? this.options.title() : null
     const id = this.options.activeId()
     if (!element || !field || !id) return
     const pending: PendingSelection = { element, field, id, scope: this.options.scope(), epoch: this.epoch, ticket: 0, ready: false,
-      anchor: { start: element.selectionStart ?? 0, end: element.selectionEnd ?? 0 }, direction: element.selectionDirection ?? 'none' }
+      anchor: { start: element.selectionStart ?? 0, end: element.selectionEnd ?? 0, value }, direction: element.selectionDirection ?? 'none' }
     this.pending = pending
     return this.prepare(pending)
   }
@@ -78,6 +81,13 @@ export class EditorSelectionKeeper {
     if (!pending?.ready || !this.current(pending, pending.ticket)) return
     if (this.frame !== undefined) cancelAnimationFrame(this.frame)
     this.frame = undefined
+    // A browser frame can run before React commits a concurrent value update.
+    // Keep the anchor until its text is actually displayed; a later layout
+    // effect will flush it without a polling loop or another scheduled frame.
+    let value: string
+    try { value = 'doc' in pending.anchor ? pending.anchor.doc.note[pending.field] : pending.anchor.value }
+    catch { if (this.pending === pending) this.pending = undefined; return }
+    if (pending.element.value !== value) return
     try {
       const selection = 'doc' in pending.anchor ? pending.anchor.doc.resolveSelection(pending.anchor.selection) : pending.anchor
       if (selection) pending.element.setSelectionRange(Math.min(selection.start, selection.end), Math.max(selection.start, selection.end), pending.direction)

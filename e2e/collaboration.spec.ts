@@ -303,6 +303,17 @@ test('live collaborator cursors follow native selections, CRDT edits, wrapping, 
   await expect(caret).toBeVisible()
   await expect(label).toBeVisible()
   await expect(label).toHaveText(/^Collaborator /)
+  // The preceding edit already left a visible cursor at the end of "Bob".
+  // Wait for Home + Right to propagate before sampling its new position.
+  const firstCharacterX = await aliceEditor.evaluate(element => {
+    const editor = element as HTMLTextAreaElement
+    const style = getComputedStyle(editor), context = document.createElement('canvas').getContext('2d')!
+    context.font = `${style.fontSize} ${style.fontFamily}`
+    return editor.getBoundingClientRect().left + parseFloat(style.borderLeftWidth) + parseFloat(style.paddingLeft)
+      - editor.scrollLeft + context.measureText(editor.value.slice(0, 1)).width
+  })
+  await expect.poll(async () => Math.abs(((await caret.boundingBox())?.x ?? Infinity) - firstCharacterX),
+    { message: 'The remote caret must reach the first character before measuring movement' }).toBeLessThan(2)
   const firstCaret = (await caret.boundingBox())!
   await bobEditor.press('ArrowRight')
   await expect.poll(async () => (await caret.boundingBox())?.x ?? 0).toBeGreaterThan(firstCaret.x + 5)

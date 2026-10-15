@@ -422,7 +422,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     // An unchanged refresh must not queue an absolute cursor position that can
     // overwrite a peer's relative restoration or the user's next interaction.
     const restoreSelection = field && previousActive && incomingActive && previousActive[field] !== incomingActive[field]
-      ? selectionKeeper.captureOffsets() : undefined
+      ? selectionKeeper.captureOffsets(incomingActive[field]) : undefined
     replaceRecords(next)
     if (JSON.stringify(foldersRef.current) !== JSON.stringify(notebook.folders)) { foldersRef.current = notebook.folders; setExplicitFolders(notebook.folders) }
     const requested = routeRef.current

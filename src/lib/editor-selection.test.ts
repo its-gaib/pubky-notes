@@ -38,6 +38,61 @@ function setup(field: 'content' | 'title' = 'content') {
 }
 
 describe('local editor selection restoration', () => {
+  it('keeps the relative anchor when an animation frame runs before React commits the new value', () => {
+    const { alice, bob, element, keeper } = setup()
+    const restore = keeper.capture(alice)!
+    bob.edit({ content: `Prefix ${bob.note.content}` }); alice.applyPeerUpdate(bob.getUpdate())
+    restore(); flushFrames()
+    // The browser can paint while React is still rendering a concurrent update.
+    // Only the live document has advanced; the textarea still has the old text.
+    expect([element.selectionStart, element.selectionEnd]).toEqual([6, 10])
+    expect(frames.size).toBe(0)
+    element.value = alice.note.content
+    keeper.flush()
+    expect([element.selectionStart, element.selectionEnd, element.selectionDirection]).toEqual([13, 17, 'backward'])
+  })
+
+  it('retains the original anchor through newer peer updates and intermediate DOM commits', () => {
+    const { alice, bob, element, keeper } = setup()
+    const first = keeper.capture(alice)!
+    bob.edit({ content: `First ${bob.note.content}` }); alice.applyPeerUpdate(bob.getUpdate())
+    const intermediate = alice.note.content
+    first(); flushFrames()
+    const second = keeper.capture(alice)!
+    bob.edit({ content: `Second ${bob.note.content}` }); alice.applyPeerUpdate(bob.getUpdate())
+    second()
+    element.value = intermediate
+    keeper.flush()
+    element.value = alice.note.content
+    keeper.flush()
+    expect([element.selectionStart, element.selectionEnd, element.selectionDirection]).toEqual([19, 23, 'backward'])
+    expect(frames.size).toBe(0)
+  })
+
+  it('also defers an offset restoration until the notebook refresh value is committed', () => {
+    const { element, keeper } = setup()
+    const value = `Changed ${element.value}`
+    const restore = keeper.captureOffsets(value)!
+    restore(); flushFrames()
+    expect(frames.size).toBe(0)
+    element.value = value
+    keeper.flush()
+    expect([element.selectionStart, element.selectionEnd, element.selectionDirection]).toEqual([6, 10, 'backward'])
+  })
+
+  it('updates the target value while retaining original offsets across consecutive notebook refreshes', () => {
+    const { element, keeper } = setup()
+    const firstValue = `First ${element.value}`, latestValue = `Latest ${element.value}`
+    keeper.captureOffsets(firstValue)!()
+    element.value = firstValue
+    // A newer refresh arrives before the first value's layout restoration.
+    keeper.captureOffsets(latestValue)!()
+    element.value = latestValue
+    keeper.flush(); flushFrames()
+    expect([element.selectionStart, element.selectionEnd, element.selectionDirection]).toEqual([6, 10, 'backward'])
+    expect(frames.size).toBe(0)
+  })
+
   it('anchors local input in its rendered snapshot while resolving against the newer live document', () => {
     const { alice, bob, element, keeper } = setup()
     const renderedBeforeInput = alice.note
@@ -78,11 +133,11 @@ describe('local editor selection restoration', () => {
 
   it('guards changed-text notebook refreshes against newer input and preserves selection direction', () => {
     const { element, keeper } = setup()
-    const restore = keeper.captureOffsets()!
+    const restore = keeper.captureOffsets(`Changed ${element.value}`)!
     element.value = `Changed ${element.value}`
     restore(); keeper.flush()
     expect([element.selectionStart, element.selectionEnd, element.selectionDirection]).toEqual([6, 10, 'backward'])
-    const stale = keeper.captureOffsets()!
+    const stale = keeper.captureOffsets(`${element.value}!`)!
     element.value = `${element.value}!`
     stale(); keeper.invalidate(); element.setSelectionRange(element.value.length, element.value.length)
     flushFrames()
@@ -93,7 +148,7 @@ describe('local editor selection restoration', () => {
     const { alice, element, keeper, change } = setup()
     const remoteRestore = keeper.capture(alice)!
     change('Prefix '); remoteRestore()
-    const notebookRestore = keeper.captureOffsets()!
+    const notebookRestore = keeper.captureOffsets(alice.note.content)!
     notebookRestore(); keeper.flush(); flushFrames()
     expect([element.selectionStart, element.selectionEnd, element.selectionDirection]).toEqual([13, 17, 'backward'])
   })
