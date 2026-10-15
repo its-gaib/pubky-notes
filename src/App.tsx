@@ -2,7 +2,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import type { ChangeEvent, CSSProperties, DragEvent, ReactNode } from 'react'
 import type { Session } from '@synonymdev/pubky'
 import QRCode from 'qrcode'
-import { ArrowDownToLine, BookOpen, CheckCheck, ChevronLeft, ChevronRight, Code2, Copy, FileText, Folder, Globe2, Heading2, Link, List, LoaderCircle, LockKeyhole, PenLine, Plus, Search, Trash2, X, MoreHorizontal, FolderPlus, Bold, Italic, Quote, ExternalLink, UsersRound } from 'lucide-react'
+import { ArrowDownToLine, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight, Code2, Copy, FileText, Folder, Globe2, Heading2, Link, List, LoaderCircle, LockKeyhole, PenLine, Plus, Search, Trash2, X, MoreHorizontal, FolderPlus, Bold, Italic, Quote, ExternalLink, UsersRound } from 'lucide-react'
 import Markdown from './components/Markdown'
 import AccountProfile from './components/AccountProfile'
 import RemoteSelection from './components/RemoteSelection'
@@ -1008,7 +1008,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
       if (event.key === 'Escape' && !busyRef.current) { event.preventDefault(); event.stopPropagation(); setFolderEditor(null); setFolderError('') }
     }}>
       <input ref={folderNameInput} aria-label="Folder name" value={folderInput} placeholder="Folder name" onChange={event => { setFolderInput(event.target.value); setFolderError('') }} maxLength={80} disabled={locked} />
-      <button type="submit" className="icon-button" aria-label={folderEditor.kind === 'create' ? 'Create folder' : 'Rename folder'} title={folderEditor.kind === 'create' ? 'Create folder' : 'Rename folder'} disabled={locked}><CheckCheck size={16} /></button>
+      <button type="submit" className="icon-button" aria-label={folderEditor.kind === 'create' ? 'Create folder' : 'Rename folder'} title={folderEditor.kind === 'create' ? 'Create folder' : 'Rename folder'} disabled={locked}><Check size={16} /></button>
       <button type="button" className="icon-button" aria-label="Cancel" title="Cancel" disabled={locked} onClick={() => { setFolderEditor(null); setFolderError('') }}><X size={15} /></button>
       {folderError && <p className="inline-error" role="alert">{folderError}</p>}
     </form>
