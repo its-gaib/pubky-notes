@@ -346,6 +346,13 @@ test('live collaborator cursors follow native selections, CRDT edits, wrapping, 
   await expect(highlights).toHaveCount(1)
   // Wait for the selection to leave the first line before sampling its position.
   await expect.poll(async () => (await highlights.first().boundingBox())?.y ?? 0).toBeGreaterThan(firstCaret.y + 30)
+  const selectedWidth = await aliceEditor.evaluate(element => {
+    const style = getComputedStyle(element), context = document.createElement('canvas').getContext('2d')!
+    context.font = `${style.fontSize} ${style.fontFamily}`
+    return context.measureText('Middle').width
+  })
+  // Native Shift+Right emits intermediate ranges; sample only the complete word.
+  await expect.poll(async () => Math.abs(((await highlights.first().boundingBox())?.width ?? 0) - selectedWidth)).toBeLessThan(2)
   const beforeInsert = (await highlights.first().boundingBox())!
   const prefix = 'Prefix '
   const prefixWidth = await aliceEditor.evaluate((element, text) => {
