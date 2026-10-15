@@ -91,7 +91,13 @@ async function cleanup(peers: Peer[]) {
       await page.goto(`${BASE}/e2e/fixture.html`)
       await page.evaluate(async () => {
         const path = '/e2e/browser-account.ts'
-        await (await import(/* @vite-ignore */ path)).cleanAccount()
+        try { await (await import(/* @vite-ignore */ path)).cleanAccount() }
+        catch (error) {
+          const describe = (value: unknown): string => value instanceof AggregateError
+            ? `${value.message}: ${value.errors.map(describe).join('; ')}`
+            : value instanceof Error ? `${value.name}: ${value.message}` : String(value)
+          throw new Error(describe(error))
+        }
       })
     } catch (error) { failures.push(error) }
     finally { await context.close() }

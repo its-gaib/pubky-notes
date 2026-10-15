@@ -7,13 +7,14 @@ interface Options {
   title(): HTMLInputElement | null
 }
 interface PendingSelection {
-  doc: SharedNoteDocument
+  anchor: { doc: SharedNoteDocument; selection: SharedSelection } | { start: number; end: number }
+  field: 'content' | 'title'
   element: HTMLTextAreaElement | HTMLInputElement
   scope: string
   id: string
   epoch: number
   ticket: number
-  selection: SharedSelection
+  ready: boolean
   direction: 'forward' | 'backward' | 'none'
 }
 
@@ -43,29 +44,56 @@ export class EditorSelectionKeeper {
     if (!element || !field || this.options.activeId() !== id) { this.invalidate(); return }
     const scope = this.options.scope()
     let pending = this.pending
-    if (!pending || pending.epoch !== this.epoch || pending.doc !== doc || pending.element !== element || pending.scope !== scope || pending.id !== id) {
-      pending = { doc, element, scope, id, epoch: this.epoch, ticket: 0,
-        selection: doc.captureSelection(field, element.selectionStart ?? 0, element.selectionEnd ?? 0), direction: element.selectionDirection ?? 'none' }
+    if (!pending || pending.epoch !== this.epoch || !('doc' in pending.anchor) || pending.anchor.doc !== doc || pending.element !== element || pending.scope !== scope || pending.id !== id) {
+      pending = { element, field, scope, id, epoch: this.epoch, ticket: 0, ready: false,
+        anchor: { doc, selection: doc.captureSelection(field, element.selectionStart ?? 0, element.selectionEnd ?? 0) }, direction: element.selectionDirection ?? 'none' }
       this.pending = pending
     }
     // Reuse the relative anchor when another peer change arrives before the
     // browser has restored the DOM selection from the preceding change.
+    return this.prepare(pending)
+  }
+
+  /** Guard a normal notebook refresh, giving an existing relative anchor priority. */
+  captureOffsets(): (() => void) | undefined {
+    if (this.pending && this.current(this.pending, this.pending.ticket)) return this.prepare(this.pending)
+    const focused = document.activeElement
+    const field = focused && focused === this.options.content() ? 'content' : focused && focused === this.options.title() ? 'title' : undefined
+    const element = field === 'content' ? this.options.content() : field === 'title' ? this.options.title() : null
+    const id = this.options.activeId()
+    if (!element || !field || !id) return
+    const pending: PendingSelection = { element, field, id, scope: this.options.scope(), epoch: this.epoch, ticket: 0, ready: false,
+      anchor: { start: element.selectionStart ?? 0, end: element.selectionEnd ?? 0 }, direction: element.selectionDirection ?? 'none' }
+    this.pending = pending
+    return this.prepare(pending)
+  }
+
+  /** Run in a layout effect after a controlled value commit, before another input task can run. */
+  flush(): void {
+    const pending = this.pending
+    if (!pending?.ready || !this.current(pending, pending.ticket)) return
+    if (this.frame !== undefined) cancelAnimationFrame(this.frame)
+    this.frame = undefined
+    try {
+      const selection = 'doc' in pending.anchor ? pending.anchor.doc.resolveSelection(pending.anchor.selection) : pending.anchor
+      if (selection) pending.element.setSelectionRange(Math.min(selection.start, selection.end), Math.max(selection.start, selection.end), pending.direction)
+    } catch { /* A room can close while restoration is pending. */ }
+    finally { if (this.pending === pending) this.pending = undefined }
+  }
+
+  private prepare(pending: PendingSelection): () => void {
     const ticket = ++this.ticket
     pending.ticket = ticket
+    pending.ready = false
     const captured = pending
     return () => {
       if (!this.current(captured, ticket)) return
+      captured.ready = true
       if (this.frame !== undefined) cancelAnimationFrame(this.frame)
       this.frame = requestAnimationFrame(() => {
         this.frame = undefined
         if (!this.current(captured, ticket)) return
-        try {
-          // Resolve against the latest live document, including changes made
-          // while persistence or the animation frame was pending.
-          const selection = captured.doc.resolveSelection(captured.selection)
-          if (selection) captured.element.setSelectionRange(Math.min(selection.start, selection.end), Math.max(selection.start, selection.end), captured.direction)
-        } catch { /* A room can close while this animation frame is pending. */ }
-        finally { if (this.pending === captured) this.pending = undefined }
+        this.flush()
       })
     }
   }
@@ -73,6 +101,6 @@ export class EditorSelectionKeeper {
   private current(pending: PendingSelection, ticket: number): boolean {
     return this.pending === pending && pending.epoch === this.epoch && pending.ticket === ticket &&
       this.options.scope() === pending.scope && this.options.activeId() === pending.id && document.activeElement === pending.element &&
-      (pending.selection.field === 'content' ? this.options.content() : this.options.title()) === pending.element
+      (pending.field === 'content' ? this.options.content() : this.options.title()) === pending.element
   }
 }

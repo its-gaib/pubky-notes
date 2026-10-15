@@ -230,6 +230,30 @@ describe('durable local notes and account synchronization', () => {
     expect((await readLocalNotebook(scopeForSession(alice))).pending).toEqual([])
   })
 
+  it('does not let an unchanged notebook refresh overwrite a newer editor selection', async () => {
+    mocks.restore.mockResolvedValue(alice)
+    mocks.list.mockResolvedValue([row('Stable selection', 'First line\nMiddle line\nLast line')])
+    render(<App />)
+    await screen.findByText('Saved to Pubky')
+    const editor = screen.getByRole('textbox', { name: 'Markdown content' }) as HTMLTextAreaElement
+    editor.focus(); editor.setSelectionRange(11, 17, 'backward')
+    const frames = new Map<number, FrameRequestCallback>()
+    let frameId = 0
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => { frames.set(++frameId, callback); return frameId })
+    vi.stubGlobal('cancelAnimationFrame', (id: number) => frames.delete(id))
+    fireEvent.click(screen.getByRole('button', { name: 'Notebook options' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Refresh notes' }))
+    editor.focus(); editor.setSelectionRange(11, 17, 'backward')
+    await waitFor(() => expect(mocks.list).toHaveBeenCalledTimes(2))
+    await screen.findByText('Saved to Pubky')
+    // A keyboard action after the refresh finishes must win over any pending
+    // frame, including when a peer update has also changed the DOM selection.
+    fireEvent.keyDown(editor, { key: 'End', ctrlKey: true })
+    editor.setSelectionRange(editor.value.length, editor.value.length)
+    act(() => { [...frames.values()].forEach(callback => callback(0)); frames.clear() })
+    expect([editor.selectionStart, editor.selectionEnd]).toEqual([editor.value.length, editor.value.length])
+  }, 15_000)
+
   it('keeps an account cache and subsequent edits in that account when session restoration fails', async () => {
     const cached = row('Alice private', 'Only Alice should receive this')
     await writeLocalNote(scopeForSession(alice), cached)

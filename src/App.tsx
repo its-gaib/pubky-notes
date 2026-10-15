@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, CSSProperties, DragEvent, ReactNode } from 'react'
 import type { Session } from '@synonymdev/pubky'
 import QRCode from 'qrcode'
@@ -348,6 +348,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   }, [persistRecord, replaceRecords, navigateToNote])
   const selectionKeeper = useMemo(() => new EditorSelectionKeeper({ scope: () => scopeRef.current, activeId: () => activeIdRef.current,
     content: () => editor.current, title: () => titleEditor.current }), [])
+  useLayoutEffect(() => { selectionKeeper.flush() }, [selectionKeeper, note?.content, note?.title])
   useEffect(() => { selectionKeeper.invalidate(); return () => selectionKeeper.invalidate() }, [selectionKeeper, scope, note?.id, mode])
   useEffect(() => {
     // A delayed remote update must never undo a newer keyboard, pointer, or input action.
@@ -409,8 +410,13 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
       const sample = recordsRef.current.find(row => row.note.id === exampleId.current) ?? scratchpad()
       exampleId.current = sample.note.id; next = [sample]
     } else exampleId.current = null
-    const focused = document.activeElement === editor.current
-    const selection = focused && editor.current ? [editor.current.selectionStart, editor.current.selectionEnd] : null
+    const field = document.activeElement === editor.current ? 'content' : document.activeElement === titleEditor.current ? 'title' : undefined
+    const previousActive = recordsRef.current.find(row => row.note.id === activeIdRef.current)?.note
+    const incomingActive = next.find(row => row.note.id === activeIdRef.current)?.note
+    // An unchanged refresh must not queue an absolute cursor position that can
+    // overwrite a peer's relative restoration or the user's next interaction.
+    const restoreSelection = field && previousActive && incomingActive && previousActive[field] !== incomingActive[field]
+      ? selectionKeeper.captureOffsets() : undefined
     replaceRecords(next)
     if (JSON.stringify(foldersRef.current) !== JSON.stringify(notebook.folders)) { foldersRef.current = notebook.folders; setExplicitFolders(notebook.folders) }
     const requested = routeRef.current
@@ -421,12 +427,12 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     const nextId = requestedId && !preferredId && !recoveredActive ? requestedId : next.some(row => row.note.id === selected) ? selected : notebook.activeId || next.find(row => !row.note.deleted)?.note.id || ''
     activeIdRef.current = nextId; setActiveId(nextId)
     if (recoveredActive && requestedId) navigateToNote(recoveredActive, capturedScope, true)
-    if (selection) requestAnimationFrame(() => editor.current?.setSelectionRange(selection[0], selection[1]))
+    restoreSelection?.()
     const newerLocalEdits = next.some(row => row.note.id !== exampleId.current && snapshotRevisions.get(row.note.id) !== noteRevision(row.note))
     setNeedsSync(newerLocalEdits || !!notebook.pending.length || notebook.foldersPending || !!dirtyLocal.current.size || !!dirtyFolders.current)
     setStatus(dirtyLocal.current.size || dirtyFolders.current ? 'Saving on this device…' :
       sessionRef.current && !newerLocalEdits && !notebook.pending.length && !notebook.foldersPending ? 'Saved to Pubky' : next[0]?.note.id === exampleId.current ? 'Sample' : 'Saved on this device')
-  }, [replaceRecords, persistRecord, navigateToNote])
+  }, [replaceRecords, persistRecord, navigateToNote, selectionKeeper])
   const sync = useCallback(async (pull = false, background = false) => {
     while (syncJob.current) {
       const previous = syncJob.current

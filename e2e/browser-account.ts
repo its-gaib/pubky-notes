@@ -58,6 +58,19 @@ async function removeStored(id: string) {
   if ((await store.list()).some(record => record.id === id)) await store.remove(id)
 }
 
+async function removeTestFile(session: Session, path: Path) {
+  for (let attempt = 0; ; attempt++) {
+    try { await session.storage.delete(path); return }
+    catch (error) {
+      const locked = !!error && typeof error === 'object' && 'data' in error
+        && (error.data as { statusCode?: number })?.statusCode === 423
+      // A final in-flight save can briefly lock the file after the page unloads.
+      if (!locked || attempt >= 4) throw error
+      await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)))
+    }
+  }
+}
+
 /** The context owns a freshly generated account; no user session is read or touched. */
 export async function cleanAccount(): Promise<void> {
   requireLocalTestnet()
@@ -73,7 +86,7 @@ export async function cleanAccount(): Promise<void> {
       for (const entry of entries) {
         const path = new URL(entry).pathname as Path
         if (!path.startsWith(directory) || path.endsWith('/')) throw new Error('Unexpected test account file path.')
-        await session.storage.delete(path)
+        await removeTestFile(session, path)
         if (await session.storage.exists(path)) throw new Error('Generated test file survived cleanup.')
       }
     }

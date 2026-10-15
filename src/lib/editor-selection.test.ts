@@ -1,5 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createElement, useLayoutEffect } from 'react'
+import { cleanup as cleanupReact, render } from '@testing-library/react'
 import { initializeNote } from './crdt'
 import { createSharedNote, joinSharedNote, SharedNoteDocument } from './shared-note'
 import { EditorSelectionKeeper } from './editor-selection'
@@ -11,7 +13,7 @@ beforeEach(() => {
   vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => { frames.set(++nextFrame, callback); return nextFrame })
   vi.stubGlobal('cancelAnimationFrame', (id: number) => { frames.delete(id) })
 })
-afterEach(() => { cleanup.splice(0).forEach(dispose => dispose()); document.body.replaceChildren(); vi.unstubAllGlobals() })
+afterEach(() => { cleanupReact(); cleanup.splice(0).forEach(dispose => dispose()); document.body.replaceChildren(); vi.unstubAllGlobals() })
 function flushFrames() {
   const callbacks = [...frames.values()]; frames.clear()
   callbacks.forEach(callback => callback(0))
@@ -36,6 +38,51 @@ function setup(field: 'content' | 'title' = 'content') {
 }
 
 describe('local editor selection restoration', () => {
+  it('restores inside the React value commit before a following input task, without waiting for an animation frame', () => {
+    const { alice, bob, state, keeper } = setup()
+    function Editor({ value }: { value: string }) {
+      useLayoutEffect(() => { keeper.flush() }, [value])
+      return createElement('textarea', { value, readOnly: true, ref: (element: HTMLTextAreaElement | null) => { if (element) state.content = element } })
+    }
+    const view = render(createElement(Editor, { value: alice.note.content }))
+    const editor = state.content
+    editor.focus(); editor.setSelectionRange(0, 0)
+    const restore = keeper.capture(alice)!
+    bob.edit({ content: `${bob.note.content}\nBob` }); alice.applyPeerUpdate(bob.getUpdate())
+    restore()
+    expect(frames.size).toBe(1)
+    view.rerender(createElement(Editor, { value: alice.note.content }))
+    // React just changed the controlled value. The next native input must use
+    // the restored start position even though no browser frame has run yet.
+    expect([editor.selectionStart, editor.selectionEnd]).toEqual([0, 0])
+    expect(frames.size).toBe(0)
+    keeper.invalidate()
+    const next = editor.value.slice(0, editor.selectionStart) + 'Alice\n' + editor.value.slice(editor.selectionEnd)
+    expect(next).toBe(`Alice\n${bob.note.content}`)
+  })
+
+  it('guards changed-text notebook refreshes against newer input and preserves selection direction', () => {
+    const { element, keeper } = setup()
+    const restore = keeper.captureOffsets()!
+    element.value = `Changed ${element.value}`
+    restore(); keeper.flush()
+    expect([element.selectionStart, element.selectionEnd, element.selectionDirection]).toEqual([6, 10, 'backward'])
+    const stale = keeper.captureOffsets()!
+    element.value = `${element.value}!`
+    stale(); keeper.invalidate(); element.setSelectionRange(element.value.length, element.value.length)
+    flushFrames()
+    expect(element.selectionStart).toBe(element.value.length)
+  })
+
+  it('retains a pending relative anchor when a notebook refresh also requests restoration', () => {
+    const { alice, element, keeper, change } = setup()
+    const remoteRestore = keeper.capture(alice)!
+    change('Prefix '); remoteRestore()
+    const notebookRestore = keeper.captureOffsets()!
+    notebookRestore(); keeper.flush(); flushFrames()
+    expect([element.selectionStart, element.selectionEnd, element.selectionDirection]).toEqual([13, 17, 'backward'])
+  })
+
   it.each(['content', 'title'] as const)('restores the %s selection after peer changes and preserves backwards selection direction', field => {
     const { alice, element, keeper, change } = setup(field)
     const restore = keeper.capture(alice)!
