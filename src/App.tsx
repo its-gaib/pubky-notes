@@ -2,7 +2,7 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, CSSProperties, DragEvent, ReactNode } from 'react'
 import type { Session } from '@synonymdev/pubky'
 import QRCode from 'qrcode'
-import { ArrowDownToLine, ArrowUpFromLine, BookOpen, CheckCheck, ChevronLeft, ChevronRight, CircleHelp, Code2, Copy, FileText, Folder, Globe2, Heading2, Link, List, LoaderCircle, LockKeyhole, PenLine, Plus, Search, RefreshCw, Trash2, X, MoreHorizontal, FolderPlus, Bold, Italic, Quote, ExternalLink, UsersRound } from 'lucide-react'
+import { ArrowDownToLine, BookOpen, CheckCheck, ChevronLeft, ChevronRight, Code2, Copy, FileText, Folder, Globe2, Heading2, Link, List, LoaderCircle, LockKeyhole, PenLine, Plus, Search, Trash2, X, MoreHorizontal, FolderPlus, Bold, Italic, Quote, ExternalLink, UsersRound } from 'lucide-react'
 import Markdown from './components/Markdown'
 import AccountProfile from './components/AccountProfile'
 import RemoteSelection from './components/RemoteSelection'
@@ -150,7 +150,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   const [restoringNotebook, setRestoringNotebook] = useState(true)
   const [routeRefreshing, setRouteRefreshing] = useState(false)
   const [query, setQuery] = useState('')
-  const [filter, setFilter] = useState<'all' | 'private' | 'public' | 'trash'>('all')
+  const [notebookView, setNotebookView] = useState<'notes' | 'trash'>('notes')
   const [selectedFolder, setSelectedFolder] = useState<string | null>(null)
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(() => new Set())
   const [explicitFolders, setExplicitFolders] = useState<string[]>([])
@@ -159,6 +159,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   const [folderInput, setFolderInput] = useState('')
   const [folderError, setFolderError] = useState('')
   const [dropFolder, setDropFolder] = useState<string | null>(null)
+  const [dragging, setDragging] = useState(false)
   const [mode, setMode] = useState<'write' | 'preview'>('write')
   const [status, setStatus] = useState('Sample')
   const [scope, setScope] = useState(rememberedScope)
@@ -172,7 +173,6 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   const [authError, setAuthError] = useState('')
   const [authStarting, setAuthStarting] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
-  const [mobileList, setMobileList] = useState(true)
   const [mobileViewport, setMobileViewport] = useState(() => window.matchMedia?.('(max-width: 700px)')?.matches ?? false)
   const [layout, setLayout] = useState(savedLayout)
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth)
@@ -210,14 +210,13 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     if (capturedScope !== GUEST_SCOPE && !sessionRef.current && routeRef.current.kind === 'home') return
     navigateRoute(notePath(capturedScope === GUEST_SCOPE ? null : capturedScope.split(':')[1], id), replace)
   }, [navigateRoute])
-  const visibleRecords = records.filter(row => (row.note.deleted === true) === (filter === 'trash'))
   const requestedNote = route.kind === 'private' || route.kind === 'local'
   const ownsPrivateRoute = route.kind === 'private' && !!session && session.info.publicKey.z32() === route.owner && scope === scopeForSession(session)
   const canOpenRoute = route.kind === 'local' ? scope === GUEST_SCOPE : ownsPrivateRoute
   const routeLoading = requestedNote && (initializing || restoringNotebook || routeRefreshing)
   const active = requestedNote
     ? canOpenRoute && !routeLoading ? records.find(row => row.note.id === route.id && row.note.id !== exampleId.current) : undefined
-    : route.kind === 'home' ? visibleRecords.find(row => row.note.id === activeId) ?? visibleRecords[0] : undefined
+    : route.kind === 'home' ? records.find(row => row.note.id === activeId) ?? records.find(row => !row.note.deleted) : undefined
   const note = active?.note
   const owner = session?.info.publicKey.z32() ?? (scope !== GUEST_SCOPE ? scope.split(':')[1] : '')
   const receiveProfileName = useCallback((profileOwner: string, name: string) => setProfileName({ owner: profileOwner, name }), [])
@@ -237,7 +236,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     folderNameInput.current?.select()
   }, [folderEditor])
   useEffect(() => {
-    setFolderEditor(null); setMoveEditor(null); setFolderError(''); setDropFolder(null)
+    setFolderEditor(null); setMoveEditor(null); setFolderError(''); setDropFolder(null); setDragging(false)
     dragSource.current = null; renameAttempt.current = null
   }, [scope])
   useEffect(() => {
@@ -341,7 +340,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     replaceRecords([row, ...recordsRef.current.filter(item => item.note.id !== incoming.id && item.note.id !== exampleId.current)])
     exampleId.current = null
     if (select) {
-      activeIdRef.current = row.note.id; setActiveId(row.note.id); setMode('write'); setQuery(''); setFilter('all'); setSelectedFolder(null); setMobileList(false)
+      activeIdRef.current = row.note.id; setActiveId(row.note.id); setMode('write'); setQuery(''); setNotebookView('notes'); setSelectedFolder(null); setMenuOpen(false)
       navigateToNote(row.note.id, capturedScope)
     }
     await persistRecord(row, capturedScope)
@@ -369,8 +368,8 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     displayName: profileName?.owner === owner ? profileName.name : undefined,
     persist: persistCollaborativeNote, beforeRemoteChange: beforeCollaborativeChange })
   useEffect(() => {
-    if (note && (mode !== 'write' || note.deleted || busy || initializing || modal || (mobileViewport && mobileList))) collaboration.updateSelection(note.id, null)
-  }, [mode, note?.id, note?.deleted, busy, initializing, modal, mobileViewport, mobileList, collaboration.updateSelection])
+    if (note && (mode !== 'write' || note.deleted || busy || initializing || modal || (mobileViewport && menuOpen))) collaboration.updateSelection(note.id, null)
+  }, [mode, note?.id, note?.deleted, busy, initializing, modal, mobileViewport, menuOpen, collaboration.updateSelection])
   useEffect(() => { if (collaboration.invitation && !initializing) setModal('join') }, [collaboration.invitation, initializing, session])
   useEffect(() => { if (collaboration.view.request) setModal('collaborate') }, [collaboration.view.request])
   const flushLocal = useCallback(async () => {
@@ -495,14 +494,14 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
       return
     }
     if (route.kind !== 'private' && route.kind !== 'local') return
-    setMobileList(false); setMenuOpen(false)
+    setMenuOpen(false)
     if (!canOpenRoute) return
     activeIdRef.current = route.id; setActiveId(route.id)
     const target = recordsRef.current.find(row => row.note.id === route.id)
     if (target) {
       // Selecting a URL must not clear a folder or search chosen while the
       // initial notebook load was finishing. Only Trash needs a view change.
-      setFilter(current => target.note.deleted ? 'trash' : current === 'trash' ? 'all' : current)
+      setNotebookView(target.note.deleted ? 'trash' : 'notes')
       void setLocalActiveId(scopeRef.current, route.id).catch(error => notice(errorMessage(error), true))
     }
   }, [route, initializing, restoringNotebook, canOpenRoute, note?.id, note?.deleted, scope, navigateToNote, notice])
@@ -553,13 +552,14 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
       const draft = editNote(initializeNote(createNote()), { content: SAMPLE_MARKDOWN, folder: selectedFolder || '', ...(imported ?? {}) })
       const row = { note: draft, published: null }
       replaceRecords([row, ...recordsRef.current.filter(existing => existing.note.id !== exampleId.current)]); exampleId.current = null
-      activeIdRef.current = draft.id; setActiveId(draft.id); setMode('write'); setQuery(''); setFilter('all'); setMobileList(false); setMenuOpen(false)
+      activeIdRef.current = draft.id; setActiveId(draft.id); setMode('write'); setQuery(''); setNotebookView('notes'); setMenuOpen(false)
+      setCollapsedFolders(current => new Set([...current].filter(path => !folderContains(path, draft.folder || ''))))
       navigateToNote(draft.id)
       await persistRecord(row); await setLocalActiveId(scopeRef.current, draft.id)
     } catch (error) { notice(errorMessage(error), true) }
   }
   async function switchNote(id: string) {
-    try { await flushLocal(); activeIdRef.current = id; setActiveId(id); setMobileList(false); if (id !== exampleId.current) navigateToNote(id); else navigateRoute('/'); await setLocalActiveId(scopeRef.current, id) } catch (error) { notice(errorMessage(error), true) }
+    try { await flushLocal(); activeIdRef.current = id; setActiveId(id); setMenuOpen(false); if (id !== exampleId.current) navigateToNote(id); else navigateRoute('/'); await setLocalActiveId(scopeRef.current, id) } catch (error) { notice(errorMessage(error), true) }
   }
   function openFolder(path: string) {
     if (path && selectedFolder === path && !busyRef.current && !initializing) {
@@ -567,7 +567,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
       return
     }
     setFolderEditor(null); setMoveEditor(null); setFolderError('')
-    setSelectedFolder(path); setFilter('all'); setQuery(''); setMobileList(true); setMenuOpen(false)
+    setSelectedFolder(path); setNotebookView('notes')
   }
   function toggleFolder(path: string) {
     setCollapsedFolders(current => {
@@ -706,7 +706,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
         const paths = currentFolderPaths()
         if (paths.includes(target)) throw new Error('A folder with that name already exists here.')
         await writeFolders(normalizeFolderPaths([...paths, target]), capturedScope)
-        revealFolder(target); setSelectedFolder(target); setFilter('all'); setQuery(''); setMobileList(true)
+        revealFolder(target); setSelectedFolder(target); setNotebookView('notes'); setQuery('')
       }
     }, true)
   }
@@ -728,8 +728,9 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     // this tab's scoped ref; external data, paths and JSON are never consumed.
     event.dataTransfer.setData('application/x-pubky-notes', 'internal')
     event.dataTransfer.effectAllowed = 'move'
+    setDragging(true)
   }
-  function endDrag() { dragSource.current = null; setDropFolder(null) }
+  function endDrag() { dragSource.current = null; setDropFolder(null); setDragging(false) }
   function canDrop(folder: string) {
     const source = dragSource.current
     if (!source || source.scope !== scopeRef.current || busyRef.current || folderBusy.current || initializing) return false
@@ -797,7 +798,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
       displayNotebook(adopted, accountScope, true, preferred)
       candidate = null
       committing = false; busyRef.current = false; setBusy(false)
-      setModal(null); setAuthStarting(false); setQuery(''); setFilter('all'); setSelectedFolder(null); setCollapsedFolders(new Set())
+      setModal(null); setAuthStarting(false); setQuery(''); setNotebookView('notes'); setSelectedFolder(null); setCollapsedFolders(new Set())
       notice('Connected. Local drafts are syncing privately.')
       void navigator.storage?.persist?.().catch(() => undefined)
       await sync()
@@ -822,7 +823,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
       sessionRef.current = null; setSession(null); scopeRef.current = GUEST_SCOPE; setScope(GUEST_SCOPE)
       try { localStorage.removeItem(ACCOUNT_KEY) } catch { /* The in-memory account has still been cleared. */ }
       displayNotebook(guest, GUEST_SCOPE, true)
-      setMode('write'); setSelectedFolder(null); setCollapsedFolders(new Set()); setQuery(''); setFilter('all')
+      setMode('write'); setSelectedFolder(null); setCollapsedFolders(new Set()); setQuery(''); setNotebookView('notes')
       notice('Disconnected. Your account notes remain saved on this device.')
     } catch (error) { notice(errorMessage(error), true) } finally { setBusy(false) }
   }
@@ -894,7 +895,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     setBusy(true)
     try {
       await flushLocal(); await applyChangedNote(editNote(target, { deleted: false }))
-      setFilter('all'); setSelectedFolder(null); activeIdRef.current = id; setActiveId(id)
+      setNotebookView('notes'); setSelectedFolder(null); setQuery(''); setMenuOpen(false); revealFolder(target.folder || ''); activeIdRef.current = id; setActiveId(id)
       if (routeRef.current.kind === 'home' || ('id' in routeRef.current && routeRef.current.id !== id)) navigateToNote(id)
       await setLocalActiveId(scopeRef.current, id); notice('Note restored.')
     } catch (error) { notice(errorMessage(error), true) } finally { setBusy(false) }
@@ -942,23 +943,29 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     finally { setRouteRefreshing(false) }
   }
   function openNotebook() {
-    setFilter('all'); setSelectedFolder(null); setQuery(''); setMobileList(true)
+    setNotebookView('notes'); setSelectedFolder(null); setQuery('')
+    if (mobileViewport) setMenuOpen(true)
+    else setLayout(current => ({ ...current, collapsed: false }))
     navigateRoute('/')
   }
-  const paths = folderPaths(records.filter(row => !row.note.deleted), explicitFolders)
+  const liveRecords = records.filter(row => !row.note.deleted)
+  // Keep complete paths for move destinations and validation. Search only prunes
+  // the rendered tree, and never changes folder selection or collapse settings.
+  const paths = folderPaths(liveRecords, explicitFolders)
+  const searching = !!query.trim()
+  const matchingRecords = filterNotes(notebookView === 'trash' ? records.filter(row => row.note.deleted) : liveRecords, query, 'all', null)
+    .sort((a, b) => a.note.title.localeCompare(b.note.title))
+  const renderedPaths = searching ? folderPaths(matchingRecords) : paths
   const childFolders = new Map<string, string[]>()
   const childNotes = new Map<string, NoteRecord[]>()
-  for (const path of paths) {
+  for (const path of renderedPaths) {
     const parent = path.split('/').slice(0, -1).join('/')
     childFolders.set(parent, [...childFolders.get(parent) || [], path])
   }
-  for (const row of records.filter(row => !row.note.deleted && row.note.id !== exampleId.current).sort((a, b) => a.note.title.localeCompare(b.note.title))) {
+  for (const row of matchingRecords) {
     const folder = row.note.folder || ''
     childNotes.set(folder, [...childNotes.get(folder) || [], row])
   }
-  const searching = !!query.trim()
-  const filtered = filterNotes(visibleRecords, query, filter === 'trash' ? 'all' : filter, selectedFolder).sort((a, b) => b.note.updatedAt.localeCompare(a.note.updatedAt))
-  const listTitle = filter === 'trash' ? 'Trash' : searching ? 'Search results' : selectedFolder !== null ? folderLabel(selectedFolder) || 'No folder' : filter === 'all' ? 'All notes' : filter === 'private' ? 'Private notes' : 'Public notes'
   const words = note?.content.trim().split(/\s+/).filter(Boolean).length ?? 0
   const publicChanged = active?.published && (active?.published.content !== note?.content || active?.published.title !== note?.title)
   const locked = busy || initializing
@@ -968,28 +975,19 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
         : route.kind === 'local' && scope !== GUEST_SCOPE ? { title: 'Local note', message: 'This link belongs to drafts saved in this browser before connecting Pubky. Open your notebook to find any drafts already uploaded.' }
           : { title: 'Note not found', message: route.kind === 'local' ? 'This local note is not available in this browser.' : 'This private note could not be found in your notebook.' }
       : null
-  const navigationCollapsed = mobileViewport ? !menuOpen : layout.navigationCollapsed
-  const notesCollapsed = mobileViewport ? !mobileList : layout.notesCollapsed
-  const bothCollapsed = navigationCollapsed && notesCollapsed
+  const sidebarCollapsed = mobileViewport ? !menuOpen : layout.collapsed
   const fittedLayout = fitSidebarLayout(layout, viewportWidth)
-  const sidebarStyle = { '--preferred-navigation-width': `${fittedLayout.navigationWidth}px`, '--preferred-notes-width': `${fittedLayout.notesWidth}px` } as CSSProperties
-  function resizeSidebar(kind: 'navigation' | 'notes', requestedWidth: number) {
+  const sidebarStyle = { '--preferred-sidebar-width': `${fittedLayout.width}px` } as CSSProperties
+  function resizeSidebar(requestedWidth: number) {
     if (mobileViewport || !Number.isFinite(requestedWidth)) return
-    setLayout(current => {
-      const fitted = fitSidebarLayout(current, viewportWidth)
-      const limits = SIDEBAR_LIMITS[kind]
-      const max = kind === 'navigation' ? fitted.navigationMaxWidth : fitted.notesMaxWidth
-      const width = Math.round(Math.min(max, Math.max(limits.min, requestedWidth)))
-      // A deliberate resize starts from the visible widths. Window resizing alone
-      // only fits the display and never rewrites the user's saved preferences.
-      return kind === 'navigation'
-        ? { ...current, navigationWidth: width, notesWidth: current.notesCollapsed ? current.notesWidth : fitted.notesWidth }
-        : { ...current, notesWidth: width, navigationWidth: current.navigationCollapsed ? current.navigationWidth : fitted.navigationWidth }
-    })
+    setLayout(current => ({ ...current, width: Math.round(Math.min(fitSidebarLayout(current, viewportWidth).maxWidth, Math.max(SIDEBAR_LIMITS.min, requestedWidth))) }))
   }
-  function expandSidebars() {
-    if (mobileViewport) { setMenuOpen(true); setMobileList(true) }
-    else setLayout(current => ({ ...current, navigationCollapsed: false, notesCollapsed: false }))
+  function showNotes() {
+    setNotebookView('notes'); setSelectedFolder(null); setQuery('')
+    setFolderEditor(null); setMoveEditor(null); setFolderError('')
+  }
+  function showTrash() {
+    setNotebookView('trash'); setQuery(''); setFolderEditor(null); setMoveEditor(null); setFolderError('')
   }
   function folderNameForm() {
     if (!folderEditor) return null
@@ -1019,14 +1017,14 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   function treeContents(parent: string, depth = 0): ReactNode {
     return <>
       {childFolders.get(parent)?.map(path => {
-        const expanded = !collapsedFolders.has(path)
+        const expanded = searching || !collapsedFolders.has(path)
         const hasChildren = !!childFolders.get(path)?.length || !!childNotes.get(path)?.length
         const empty = isEmptyFolder(path, records, explicitFolders)
         const renaming = folderEditor?.kind === 'rename' && folderEditor.path === path
         return <div className="folder-node" key={path} data-folder-path={path}>
           <div className={`folder-entry ${dropFolder === path ? 'drop-target' : ''}`} onDragOver={event => dragOver(event, path)} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropFolder(null) }} onDrop={event => dropInto(event, path)}>
             {renaming ? folderNameForm() : <><div className="folder-row" style={{ paddingLeft: Math.min(30, depth * 8) }}>
-              {hasChildren ? <button className="folder-toggle" disabled={locked} aria-label={`${expanded ? 'Collapse' : 'Expand'} folder ${path}`} aria-expanded={expanded} onClick={() => toggleFolder(path)}><ChevronRight size={13} style={{ transform: expanded ? 'rotate(90deg)' : undefined }} /></button> : <span className="folder-toggle" />}
+              {hasChildren ? <button className="folder-toggle" disabled={locked || searching} aria-label={`${expanded ? 'Collapse' : 'Expand'} folder ${path}`} aria-expanded={expanded} onClick={() => toggleFolder(path)}><ChevronRight size={13} style={{ transform: expanded ? 'rotate(90deg)' : undefined }} /></button> : <span className="folder-toggle" />}
               <button className={`folder-select ${selectedFolder === path ? 'active' : ''}`} aria-label={`Open folder ${path}`} title={selectedFolder === path ? `${path} · click to rename` : path} disabled={locked} draggable={!locked} onDragStart={event => startDrag(event, 'folder', path)} onDragEnd={endDrag} onClick={() => openFolder(path)}><Folder size={15} /><span>{folderLabel(path)}</span></button>
             </div><button className="icon-button folder-delete" aria-label={`Delete folder ${path}`} title={empty ? `Delete folder ${path}` : 'Only empty folders can be deleted'} disabled={locked || !empty} onClick={() => void deleteFolder(path)}><Trash2 size={14} /></button><SidebarActions label={`Folder actions for ${path}`} disabled={locked} items={[
               { label: 'New subfolder', action: () => manageFolder('create', path) },
@@ -1039,35 +1037,60 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
           {expanded && treeContents(path, depth + 1)}
         </div>
       })}
-      {childNotes.get(parent)?.map(row => <button key={row.note.id} data-tree-note-id={row.note.id} className={`tree-note ${row.note.id === note?.id ? 'active' : ''}`} style={{ paddingLeft: 24 + Math.min(30, depth * 8) }} aria-label={`Open note ${row.note.title || 'Untitled note'} in folder tree`} title={row.note.title || 'Untitled note'} disabled={locked} draggable={!locked} onDragStart={event => startDrag(event, 'note', row.note.id)} onDragEnd={endDrag} onClick={() => { setMenuOpen(false); void switchNote(row.note.id) }}><FileText size={14} /><span>{row.note.title || 'Untitled note'}</span></button>)}
+      {childNotes.get(parent)?.map(row => treeNote(row, depth))}
     </>
   }
 
-  return <div className={`app-shell ${menuOpen ? 'mobile-open' : ''} ${mobileList ? 'mobile-list' : ''} ${navigationCollapsed ? 'navigation-collapsed' : ''} ${notesCollapsed ? 'notes-collapsed' : ''} ${bothCollapsed ? 'both-collapsed' : ''}`} style={sidebarStyle}>
-    {menuOpen && <button className="navigation-dismiss" aria-label="Close navigation" onClick={() => setMenuOpen(false)} />}
-    <div className="navigation-pane"><aside className="sidebar" id="notebook-navigation">
-      <a className="brand" href="/"><span className="brand-mark"><BookOpen size={22} /></span><strong>Pubky Notes</strong></a>
-      <button className="new-note-button" onClick={() => void addNote()} disabled={locked}><Plus size={18} /> New note</button>
-      <nav className="nav-group" aria-label="Notebook filters">{([{ key: 'all', label: 'All notes', icon: FileText }, { key: 'private', label: 'Private', icon: LockKeyhole }, { key: 'public', label: 'Public', icon: Globe2 }, { key: 'trash', label: 'Trash', icon: Trash2 }] as const).map(item => <button key={item.key} className={`nav-item ${selectedFolder === null && filter === item.key ? 'active' : ''} ${item.key === 'all' && dropFolder === '' ? 'drop-target' : ''}`} title={item.key === 'all' ? 'All notes · drop here to move items to the top level' : undefined} onDragOver={item.key === 'all' ? event => dragOver(event, '') : undefined} onDragLeave={item.key === 'all' ? () => setDropFolder(null) : undefined} onDrop={item.key === 'all' ? event => dropInto(event, '') : undefined} onClick={() => { setFilter(item.key); setSelectedFolder(null); setQuery(''); setMobileList(true); setMenuOpen(false) }}><item.icon size={17} /><span>{item.label}</span></button>)}</nav>
+  function treeNote(row: NoteRecord, depth = 0) {
+    const title = row.note.title || 'Untitled note'
+    const changedPublic = !!row.published && (row.published.title !== row.note.title || row.published.content !== row.note.content)
+    const visibility = row.published ? row.note.deleted ? 'Public copy pending removal' : changedPublic ? 'Public copy published; draft has unpublished changes' : 'Public copy published' : 'Private note'
+    return <div key={row.note.id} data-note-id={row.note.id} data-tree-note-id={row.note.id} className={`tree-note-entry ${row.note.id === note?.id ? 'selected' : ''}`}>
+      <button className={`tree-note ${row.note.id === note?.id ? 'active' : ''}`} style={{ paddingLeft: 24 + Math.min(30, depth * 8) }} aria-label={`Open note ${title}`} title={title} disabled={locked} draggable={!locked && !row.note.deleted && row.note.id !== exampleId.current} onDragStart={event => startDrag(event, 'note', row.note.id)} onDragEnd={endDrag} onClick={() => void switchNote(row.note.id)}>
+        <FileText size={15} /><span>{title}</span>{row.note.crdt?.version === 2 && <UsersRound size={13} aria-label="Collaborative note" />}<span className={`note-visibility ${row.published ? 'is-public' : ''}`} title={visibility} role="img" aria-label={visibility}>{row.published ? <Globe2 size={13} aria-hidden="true" /> : <LockKeyhole size={13} aria-hidden="true" />}</span>
+      </button>
+      {row.note.id !== exampleId.current && <SidebarActions label={`Note actions for ${title}`} disabled={locked} items={row.note.deleted ? [{ label: 'Restore', action: () => void restoreNote(row.note.id) }] : [{ label: 'Move to…', action: () => openMove(row.note.id) }]} />}
+      {moveControl('note', row.note.id)}
+    </div>
+  }
+
+  return <div className={`app-shell ${menuOpen ? 'mobile-open' : ''} ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`} style={sidebarStyle}>
+    {menuOpen && <button className="navigation-dismiss" aria-label="Close sidebar" onClick={() => setMenuOpen(false)} />}
+    <div className="navigation-pane"><aside className="sidebar" id="notebook-navigation" aria-label="Notebook">
+      <div className="notebook-header">
+        <a className="brand" href="/"><span className="brand-mark"><BookOpen size={22} /></span><strong>Pubky Notes</strong></a>
+        <SidebarActions label="Notebook options" disabled={locked} items={[
+          { label: notebookView === 'trash' ? 'Back to notes' : 'Trash', action: notebookView === 'trash' ? showNotes : showTrash },
+          { label: 'Import Markdown', action: () => importer.current?.click() },
+          ...(session ? [{ label: 'Refresh notes', action: () => void refresh() }] : []),
+          { label: 'Help', action: () => setModal('help') },
+        ]} />
+      </div>
+      <div className="search-box"><Search size={16} /><input type="search" placeholder={notebookView === 'trash' ? 'Search Trash…' : 'Search all notes…'} aria-label={notebookView === 'trash' ? 'Search Trash' : 'Search all notes'} value={query} onChange={event => setQuery(event.target.value)} />{query && <button className="icon-button search-clear" aria-label="Clear search" onClick={() => setQuery('')}><X size={14} /></button>}</div>
       <div className="folder-section">
-        <button className="nav-item new-folder-button" disabled={locked} onClick={() => manageFolder('create')}><FolderPlus size={17} /><span>New folder</span></button>
-        {folderEditor?.kind === 'create' && !folderEditor.path && folderNameForm()}
-        <nav className="folder-tree" aria-label="Folders and notes">{treeContents('')}</nav>
+        <div className="tree-heading">
+          {notebookView === 'trash' ? <><button className="icon-button" aria-label="Back to notes" title="Back to notes" onClick={showNotes}><ChevronLeft size={16} /></button><h2>Trash</h2></> : <>
+            <button className={`tree-root ${selectedFolder === null ? 'active' : ''} ${dropFolder === '' ? 'drop-target' : ''}`} title="Notes · drop here to move items to the top level" onDragOver={event => dragOver(event, '')} onDragLeave={() => setDropFolder(null)} onDrop={event => dropInto(event, '')} onClick={showNotes}>Notes</button>
+            <button className="icon-button" aria-label="New folder" title="New folder" disabled={locked} onClick={() => { setQuery(''); manageFolder('create') }}><FolderPlus size={17} /></button>
+            <button className="icon-button" aria-label="New note" title={selectedFolder ? `New note in ${selectedFolder}` : 'New note'} disabled={locked} onClick={() => void addNote()}><Plus size={18} /></button>
+          </>}
+        </div>
+        {notebookView === 'notes' && folderEditor?.kind === 'create' && !folderEditor.path && folderNameForm()}
+        <nav className="folder-tree" aria-label={notebookView === 'trash' ? 'Deleted notes' : 'Folders and notes'}>
+          {notebookView === 'trash' ? matchingRecords.map(row => treeNote(row)) : treeContents('')}
+          {!matchingRecords.length && (searching || notebookView === 'trash') && <div className="tree-empty"><p>{searching ? 'No notes match your search.' : 'Trash is empty.'}</p>{searching && <button className="button ghost small" onClick={() => setQuery('')}>Clear search</button>}</div>}
+        </nav>
+        {notebookView === 'notes' && <div className={`root-drop-zone ${dragging && canDrop('') ? 'drop-available' : ''} ${dropFolder === '' ? 'drop-target' : ''}`} role="region" aria-label="Move to top level" onDragOver={event => dragOver(event, '')} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropFolder(null) }} onDrop={event => dropInto(event, '')}>
+          {dragging && canDrop('') && <span>Move to top level</span>}
+        </div>}
       </div>
       <div className="sidebar-bottom">
-        <button className="nav-item" onClick={() => importer.current?.click()} disabled={locked}><ArrowUpFromLine size={16} /><span>Import Markdown</span></button>
-        <button className="nav-item" onClick={() => setModal('help')}><CircleHelp size={16} /><span>Help</span></button>
         {!session && <button className="button primary sidebar-connect" onClick={() => void connect()} disabled={initializing || authStarting} aria-busy={initializing}>Connect Pubky</button>}
         {owner && <AccountProfile owner={owner} disabled={locked} copy={copy} disconnect={() => void disconnect()} onName={receiveProfileName} />}
         {IS_TESTNET && <span className="network-label">Local testnet</span>}
         <footer className="repository-links"><a href="https://github.com/its-gaib/pubky-notes" target="_blank" rel="noopener noreferrer" title="Pubky Notes on GitHub">GitHub</a><span aria-hidden="true">·</span><a href="https://github.com/its-gaib/pubky-notes-cli" target="_blank" rel="noopener noreferrer" title="Pubky Notes CLI on GitHub">CLI</a></footer>
       </div>
-    </aside>{!mobileViewport && !navigationCollapsed && <SidebarResizeHandle label="Resize navigation" controls="notebook-navigation" width={fittedLayout.navigationWidth} min={SIDEBAR_LIMITS.navigation.min} max={fittedLayout.navigationMaxWidth} defaultWidth={SIDEBAR_LIMITS.navigation.default} onResize={width => resizeSidebar('navigation', width)} />}{bothCollapsed ? <button className="pane-toggle navigation-edge" aria-label="Expand sidebars" title="Expand sidebars" aria-controls="notebook-navigation notebook-notes" aria-expanded={false} onClick={expandSidebars}><ChevronRight size={17} /></button> : <button className="pane-toggle navigation-edge" aria-label={navigationCollapsed ? 'Expand navigation' : 'Collapse navigation'} title={navigationCollapsed ? 'Expand navigation' : 'Collapse navigation'} aria-controls="notebook-navigation" aria-expanded={!navigationCollapsed} onClick={() => mobileViewport ? setMenuOpen(current => !current) : setLayout(current => ({ ...current, navigationCollapsed: !current.navigationCollapsed }))}>{navigationCollapsed ? <ChevronRight size={17} /> : <ChevronLeft size={17} />}</button>}</div>
-    <div className="notes-pane"><section className="notes-panel" id="notebook-notes" aria-label="Notes">
-      <div className="notes-header"><h2 title={selectedFolder || undefined}><span className="notes-heading-label">{listTitle}</span><span className="count">{filtered.length}</span></h2><div className="notes-header-actions">{session && <button className="icon-button" aria-label="Refresh notes" title="Refresh notes" disabled={locked} onClick={() => void refresh()}><RefreshCw size={16} /></button>}<button className="icon-button" aria-label="Create a new note" disabled={locked} onClick={() => void addNote()}><PenLine size={18} /></button></div></div>
-      <div className="search-box"><Search size={16} /><input type="search" placeholder="Search all notes…" aria-label="Search all notes" value={query} onChange={event => setQuery(event.target.value)} />{query && <button className="icon-button search-clear" aria-label="Clear search" onClick={() => setQuery('')}><X size={14} /></button>}</div>
-      <div className="note-list">{filtered.map(row => <div key={row.note.id} data-note-id={row.note.id} className={`note-card note-entry ${row.note.id === note?.id ? 'selected' : ''}`}><button className="note-select" aria-label={`Open note ${row.note.title || 'Untitled note'}`} onClick={() => void switchNote(row.note.id)} disabled={locked} draggable={!locked && !row.note.deleted} onDragStart={event => startDrag(event, 'note', row.note.id)} onDragEnd={endDrag}><div className="note-card-title"><FileText size={15} /><strong>{row.note.title || 'Untitled note'}</strong>{row.note.crdt?.version === 2 && <UsersRound size={13} aria-label="Collaborative note" />}{row.published ? <Globe2 size={13} /> : <LockKeyhole size={13} />}</div><p className="note-card-excerpt">{row.note.content.replace(/[#*>`_\[\]]/g, '').trim().slice(0, 115)}</p><div className="note-card-meta"><span>{dateLabel(row.note.updatedAt)}</span><span className="folder-path" title={row.note.folder || 'No folder'}><Folder size={11} /><span>{row.note.folder || 'No folder'}</span></span></div></button><SidebarActions label={`Note actions for ${row.note.title || 'Untitled note'}`} disabled={locked} items={row.note.deleted ? [{ label: 'Restore', action: () => void restoreNote(row.note.id) }] : [{ label: 'Move to…', action: () => openMove(row.note.id) }]} />{moveControl('note', row.note.id)}</div>)}{!visibleRecords.length && filter !== 'trash' && !initializing && <button className="note-card selected" onClick={() => setMobileList(false)}><div className="note-card-title"><Code2 size={15} /><strong>Markdown basics</strong></div><div className="note-card-meta">Sample</div></button>}{!filtered.length && (records.length > 0 || filter === 'trash') && <div className="empty-state"><Search size={25} /><p>{filter === 'trash' ? 'Trash is empty.' : searching ? 'No notes match your search.' : 'No notes.'}</p><button className="button ghost small" onClick={() => { if (searching || filter !== 'all' || selectedFolder !== null) { setQuery(''); setFilter('all'); setSelectedFolder(null) } else void addNote() }}> {searching || filter !== 'all' || selectedFolder !== null ? 'Show all notes' : 'New note'}</button></div>}</div>
-    </section>{!mobileViewport && !notesCollapsed && <SidebarResizeHandle label="Resize notes" controls="notebook-notes" width={fittedLayout.notesWidth} min={SIDEBAR_LIMITS.notes.min} max={fittedLayout.notesMaxWidth} defaultWidth={SIDEBAR_LIMITS.notes.default} onResize={width => resizeSidebar('notes', width)} />}{!bothCollapsed && <button className="pane-toggle notes-edge" aria-label={notesCollapsed ? 'Expand notes' : 'Collapse notes'} title={notesCollapsed ? 'Expand notes' : 'Collapse notes'} aria-controls="notebook-notes" aria-expanded={!notesCollapsed} onClick={() => mobileViewport ? setMobileList(current => !current) : setLayout(current => ({ ...current, notesCollapsed: !current.notesCollapsed }))}>{notesCollapsed ? <ChevronRight size={17} /> : <ChevronLeft size={17} />}</button>}</div>
+    </aside>{!mobileViewport && !sidebarCollapsed && <SidebarResizeHandle label="Resize sidebar" controls="notebook-navigation" width={fittedLayout.width} min={SIDEBAR_LIMITS.min} max={fittedLayout.maxWidth} defaultWidth={SIDEBAR_LIMITS.default} onResize={resizeSidebar} />}<button className="pane-toggle navigation-edge" aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'} title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'} aria-controls="notebook-navigation" aria-expanded={!sidebarCollapsed} onClick={() => mobileViewport ? setMenuOpen(current => !current) : setLayout(current => ({ ...current, collapsed: !current.collapsed }))}>{sidebarCollapsed ? <ChevronRight size={17} /> : <ChevronLeft size={17} />}</button></div>
     <main className="editor-panel">
       {routeLoading ? <div className="empty-state editor-empty"><LoaderCircle className="spin" aria-label="Loading note" /><p>Opening note…</p></div> : routeIssue ? <div className="empty-state editor-empty"><LockKeyhole size={30} /><h2>{routeIssue.title}</h2><p>{routeIssue.message}</p><div className="modal-actions">{route.kind === 'private' && !ownsPrivateRoute && <button className="button primary" disabled={locked} onClick={() => void connect()}>Connect Pubky</button>}{requestedNote && canOpenRoute && <button className="button secondary" disabled={locked} onClick={() => void retryNoteLink()}>Retry</button>}<button className="button secondary" onClick={openNotebook}>Open your notebook</button></div></div> : note ? <><div className="editor-topbar"><div className="note-location"><div className="mode-switch"><button className={mode === 'write' ? 'active' : ''} onClick={() => setMode('write')}><PenLine size={14} /> Write</button><button className={mode === 'preview' ? 'active' : ''} onClick={() => setMode('preview')}><BookOpen size={14} /> Preview</button></div></div>{mode === 'write' && <div className="formatting-toolbar" aria-label="Markdown formatting">{[{ icon: Bold, title: 'Bold', before: '**', after: '**' }, { icon: Italic, title: 'Italic', before: '_', after: '_' }, { icon: Heading2, title: 'Heading', before: '\n## ', after: '' }, { icon: List, title: 'List', before: '\n- ', after: '' }, { icon: Quote, title: 'Quote', before: '\n> ', after: '' }, { icon: Code2, title: 'Code', before: '`', after: '`' }, { icon: Link, title: 'Link', before: '[', after: '](https://)' }].map(item => <button key={item.title} className="icon-button" aria-label={item.title} title={item.title} disabled={locked || note.deleted} onClick={() => format(item.before, item.after)}><item.icon size={16} /></button>)}</div>}<div className="editor-actions">{session && <span className={`visibility-badge ${active?.published ? 'public' : ''}`}>{active?.published ? <Globe2 size={13} /> : <LockKeyhole size={13} />}{active?.published ? 'Public copy' : 'Private'}</span>}{note.id !== exampleId.current && <button className="icon-button" onClick={() => void copyNoteLink()} disabled={locked} aria-label="Copy note link" title="Copy note link"><Link size={16} /></button>}{note.content === SAMPLE_MARKDOWN && <button className="icon-button" onClick={() => void copy(SAMPLE_MARKDOWN)} aria-label="Copy Markdown" title="Copy Markdown"><Copy size={16} /></button>}<button className="button ghost small" onClick={() => download(note)} aria-label="Export Markdown" title="Export Markdown"><ArrowDownToLine size={16} /></button>{note.deleted && <button className="button secondary small" disabled={locked} onClick={() => void restoreNote(note.id)}>Restore</button>}<button className="button secondary small collaboration-button" onClick={() => setModal('collaborate')} disabled={locked || note.deleted} aria-label="Collaborate"><UsersRound size={15} /><span>Collaborate</span></button><button className="button secondary small" onClick={() => setModal('share')} disabled={locked || note.deleted}><Globe2 size={14} /> Share</button><button className="icon-button" onClick={() => setModal('delete')} disabled={locked || note.deleted} aria-label="Delete note"><Trash2 size={16} /></button></div></div>
       <div className="editor-content"><input ref={titleEditor} className="note-title-input" aria-label="Note title" placeholder="Untitled note" value={note.title} maxLength={200} disabled={locked || note.deleted} onChange={event => edit({ title: event.target.value })} />{mode === 'write' ? <div className="collaborative-editor"><textarea ref={editor} className="markdown-editor" aria-label="Markdown content" placeholder="Write a note…" value={note.content} disabled={locked || note.deleted} onChange={event => { edit({ content: event.target.value }); shareEditorSelection(event.currentTarget) }} onFocus={event => shareEditorSelection(event.currentTarget)} onSelect={event => shareEditorSelection(event.currentTarget)} onKeyUp={event => shareEditorSelection(event.currentTarget)} onClick={event => shareEditorSelection(event.currentTarget)} onBlur={() => collaboration.updateSelection(note.id, null)} spellCheck /><RemoteSelection textarea={editor} content={note.content} selection={collaboration.remoteSelection?.noteId === note.id && !note.deleted ? { ...collaboration.remoteSelection, direction: collaboration.remoteSelection.direction ?? 'none' } : null} /></div> : <Markdown content={note.content} />}</div>

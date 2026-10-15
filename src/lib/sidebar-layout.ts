@@ -1,80 +1,47 @@
 export interface SidebarLayout {
-  navigationCollapsed: boolean
-  notesCollapsed: boolean
-  navigationWidth: number
-  notesWidth: number
+  collapsed: boolean
+  width: number
 }
 
 export const MIN_EDITOR_WIDTH = 320
 export const COLLAPSED_SIDEBAR_WIDTH = 28
-export const SIDEBAR_LIMITS = {
-  navigation: { min: 160, max: 360, default: 174 },
-  notes: { min: 200, max: 480, default: 242 },
-} as const
-
+export const SIDEBAR_LIMITS = { min: 160, max: 900, default: 260 } as const
 export const SIDEBAR_DEFAULTS: Readonly<SidebarLayout> = {
-  navigationCollapsed: false,
-  notesCollapsed: false,
-  navigationWidth: SIDEBAR_LIMITS.navigation.default,
-  notesWidth: SIDEBAR_LIMITS.notes.default,
+  collapsed: false,
+  width: SIDEBAR_LIMITS.default,
 }
 
-function parseWidth(value: unknown, limits: { min: number; max: number; default: number }) {
+function validWidth(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value)
-    ? Math.max(limits.min, Math.min(limits.max, Math.round(value)))
-    : limits.default
 }
 
-/** Read only known, correctly typed settings, including the original collapse-only format. */
+/** Validate device preferences and migrate the former two-sidebar settings. */
 export function parseSidebarLayout(value: unknown): SidebarLayout {
   const settings = value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown> : {}
   const own = (key: string): unknown => Object.hasOwn(settings, key) ? settings[key] : undefined
+  const preferred = [own('width'), own('notesWidth'), own('navigationWidth')].find(validWidth)
   return {
-    navigationCollapsed: own('navigationCollapsed') === true,
-    notesCollapsed: own('notesCollapsed') === true,
-    navigationWidth: parseWidth(own('navigationWidth'), SIDEBAR_LIMITS.navigation),
-    notesWidth: parseWidth(own('notesWidth'), SIDEBAR_LIMITS.notes),
+    collapsed: typeof own('collapsed') === 'boolean' ? own('collapsed') === true
+      : own('navigationCollapsed') === true && own('notesCollapsed') === true,
+    width: preferred === undefined ? SIDEBAR_LIMITS.default
+      : Math.max(SIDEBAR_LIMITS.min, Math.min(SIDEBAR_LIMITS.max, Math.round(preferred))),
   }
 }
 
 export interface FittedSidebarLayout {
-  navigationWidth: number
-  notesWidth: number
-  navigationMaxWidth: number
-  notesMaxWidth: number
+  width: number
+  maxWidth: number
 }
 
-/**
- * Fit desktop panes without changing the user's saved width preferences. Each
- * expanded pane gives up the same proportion of the space above its minimum.
- * Mobile uses its own layout; below the desktop minimum these widths stay usable.
- */
+/** Fit the sidebar while retaining its preferred width for wider windows. */
 export function fitSidebarLayout(layout: SidebarLayout, viewportWidth: number): FittedSidebarLayout {
   const preferred = parseSidebarLayout(layout)
-  const navigationMinimum = preferred.navigationCollapsed ? COLLAPSED_SIDEBAR_WIDTH : SIDEBAR_LIMITS.navigation.min
-  const notesMinimum = preferred.notesCollapsed
-    ? preferred.navigationCollapsed ? 0 : COLLAPSED_SIDEBAR_WIDTH
-    : SIDEBAR_LIMITS.notes.min
-  let navigationWidth = preferred.navigationCollapsed ? navigationMinimum : preferred.navigationWidth
-  let notesWidth = preferred.notesCollapsed ? notesMinimum : preferred.notesWidth
   const viewport = Number.isFinite(viewportWidth) && viewportWidth > 0
-    ? Math.floor(viewportWidth) : navigationWidth + notesWidth + MIN_EDITOR_WIDTH
-  const budget = Math.max(navigationMinimum + notesMinimum, viewport - MIN_EDITOR_WIDTH)
-  const navigationExtra = navigationWidth - navigationMinimum
-  const notesExtra = notesWidth - notesMinimum
-  const totalExtra = navigationExtra + notesExtra
-
-  if (navigationWidth + notesWidth > budget && totalExtra > 0) {
-    const availableExtra = budget - navigationMinimum - notesMinimum
-    navigationWidth = navigationMinimum + Math.round(availableExtra * navigationExtra / totalExtra)
-    notesWidth = notesMinimum + availableExtra - (navigationWidth - navigationMinimum)
-  }
-
+    ? Math.floor(viewportWidth) : preferred.width + MIN_EDITOR_WIDTH
+  const maxWidth = Math.max(SIDEBAR_LIMITS.min, Math.min(SIDEBAR_LIMITS.max, viewport - MIN_EDITOR_WIDTH))
   return {
-    navigationWidth,
-    notesWidth,
-    navigationMaxWidth: Math.max(SIDEBAR_LIMITS.navigation.min, Math.min(SIDEBAR_LIMITS.navigation.max, viewport - MIN_EDITOR_WIDTH - notesWidth)),
-    notesMaxWidth: Math.max(SIDEBAR_LIMITS.notes.min, Math.min(SIDEBAR_LIMITS.notes.max, viewport - MIN_EDITOR_WIDTH - navigationWidth)),
+    width: preferred.collapsed ? COLLAPSED_SIDEBAR_WIDTH : Math.min(preferred.width, maxWidth),
+    maxWidth,
   }
 }

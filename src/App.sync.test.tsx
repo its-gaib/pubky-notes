@@ -192,7 +192,7 @@ describe('durable local notes and account synchronization', () => {
   it('uploads a newly created guest note including its untouched Markdown template after login', async () => {
     render(<App />)
     await readyGuest()
-    fireEvent.click(screen.getByRole('button', { name: 'Create a new note' }))
+    fireEvent.click(screen.getByRole('button', { name: 'New note' }))
     await waitFor(() => expect(title()).toBe('Untitled note'))
     const template = content()
     expect(template).toContain('**Bold**')
@@ -265,7 +265,14 @@ describe('durable local notes and account synchronization', () => {
     await waitFor(async () => expect((await readLocalNotebook(scopeForSession(alice))).pending).toEqual([]))
     expect(mocks.remove).toHaveBeenCalledWith(alice, expect.objectContaining({ deleted: true, content: 'Retain this text' }))
     expect((await readLocalNotebook(scopeForSession(alice))).records[0].note.deleted).toBe(true)
-    fireEvent.click(screen.getByRole('button', { name: 'Trash' }))
+    // A deleted active link opens its retained copy in Trash; leaving this view
+    // must remain possible without changing the retained note or its history.
+    expect(screen.getByRole('navigation', { name: 'Deleted notes' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Back to notes' }))
+    expect(screen.getByRole('navigation', { name: 'Folders and notes' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Notebook options' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Trash' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Open note Recoverable note' }))
     expect(content()).toBe('Retain this text')
     fireEvent.click(screen.getByRole('button', { name: 'Restore' }))
     await waitFor(async () => expect((await readLocalNotebook(scopeForSession(alice))).records[0].note.deleted).not.toBe(true))
@@ -368,7 +375,8 @@ describe('durable local notes and account synchronization', () => {
     const unrelated = { note: editNote({ ...original.note, id: 'unrelated-copy' }, { title: 'Other copy', content: 'Keep this copy separate' }), published: null }
     await acknowledgeLocalNote(scopeForSession(alice), unrelated)
     mocks.list.mockResolvedValue([replacement, unrelated])
-    fireEvent.click(screen.getByRole('button', { name: 'Refresh notes' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Notebook options' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Refresh notes' }))
     await waitFor(() => expect(title()).toBe('Exact source (recovered)'))
     expect(content()).toBe('Source text')
     const cache = await readLocalNotebook(scopeForSession(alice))

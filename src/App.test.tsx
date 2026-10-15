@@ -226,7 +226,7 @@ describe('private saving and explicit publication', () => {
     expect(mocks.saveNote).not.toHaveBeenCalled()
     expect(mocks.publishNote).not.toHaveBeenCalled()
 
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Create a new note' })) })
+    await act(async () => { fireEvent.click(within(screen.getByRole('complementary', { name: 'Notebook' })).getByRole('button', { name: 'New note' })) })
     expect(screen.queryByRole('textbox', { name: 'Sample Markdown' })).toBeNull()
     expect((screen.getByRole('textbox', { name: 'Markdown content' }) as HTMLTextAreaElement).value).toBe(sample.value)
     await act(async () => { await new Promise(resolve => setTimeout(resolve, 950)) })
@@ -299,40 +299,40 @@ describe('folders and notebook-wide search', () => {
     return session
   }
 
-  it('searches title and content across folders and visibility, then restores the selected scope when cleared', async () => {
+  it('searches title and content across collapsed folders and visibility, then restores the collapsed tree', async () => {
     await openNotebook(organizedNotebook())
+    const notes = within(screen.getByRole('navigation', { name: 'Folders and notes' }))
     fireEvent.click(screen.getByRole('button', { name: 'Open folder Personal' }))
-    const notes = within(screen.getByRole('region', { name: 'Notes' }))
-    expect(notes.getByText('Private garden', { exact: true })).toBeTruthy()
-    expect(notes.queryByText('Public garden', { exact: true })).toBeNull()
-    expect(notes.queryByText('Unfiled garden', { exact: true })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse folder Personal' }))
+    expect(notes.queryByRole('button', { name: 'Open note Private garden' })).toBeNull()
+    expect(notes.getByRole('button', { name: 'Open note Public garden' })).toBeTruthy()
+    expect(notes.getByRole('button', { name: 'Open note Unfiled garden' })).toBeTruthy()
 
     fireEvent.change(screen.getByRole('searchbox', { name: 'Search all notes' }), {
       target: { value: ' GARDEN tomatoes ' },
     })
-    expect(notes.getByText('Private garden', { exact: true })).toBeTruthy()
-    expect(notes.getByText('Public garden', { exact: true })).toBeTruthy()
-    expect(notes.getByText('Unfiled garden', { exact: true })).toBeTruthy()
+    expect(notes.getByRole('button', { name: 'Open note Private garden' })).toBeTruthy()
+    expect(notes.getByRole('button', { name: 'Open note Public garden' })).toBeTruthy()
+    expect(notes.getByRole('button', { name: 'Open note Unfiled garden' })).toBeTruthy()
+    expect(notes.getByRole('button', { name: 'Open folder Personal/Garden' })).toBeTruthy()
 
-    fireEvent.change(screen.getByRole('searchbox', { name: 'Search all notes' }), { target: { value: '' } })
-    expect(notes.getByText('Private garden', { exact: true })).toBeTruthy()
-    expect(notes.queryByText('Public garden', { exact: true })).toBeNull()
-    expect(notes.queryByText('Unfiled garden', { exact: true })).toBeNull()
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search all notes' }), { target: { value: 'herbs' } })
+    expect(notes.getByRole('button', { name: 'Open note Private garden' })).toBeTruthy()
+    expect(notes.queryByRole('button', { name: 'Open note Public garden' })).toBeNull()
+    expect(notes.queryByRole('button', { name: 'Open note Unfiled garden' })).toBeNull()
+    expect(notes.queryByRole('button', { name: 'Open folder Work' })).toBeNull()
+    expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe('Private garden')
 
-    fireEvent.click(screen.getByRole('button', { name: /^Private$/ }))
-    expect(notes.queryByText('Public garden', { exact: true })).toBeNull()
-    expect(notes.getByText('Unfiled garden', { exact: true })).toBeTruthy()
-    fireEvent.change(screen.getByRole('searchbox', { name: 'Search all notes' }), { target: { value: 'garden tomatoes' } })
-    expect(notes.getByText('Public garden', { exact: true })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Clear search' }))
-    expect(notes.queryByText('Public garden', { exact: true })).toBeNull()
-    expect(notes.getByText('Private garden', { exact: true })).toBeTruthy()
-    expect(notes.getByText('Unfiled garden', { exact: true })).toBeTruthy()
+    expect(notes.getByRole('button', { name: 'Expand folder Personal' })).toBeTruthy()
+    expect(notes.queryByRole('button', { name: 'Open note Private garden' })).toBeNull()
+    expect(notes.getByRole('button', { name: 'Open note Public garden' })).toBeTruthy()
+    expect(notes.getByRole('button', { name: 'Open note Unfiled garden' })).toBeTruthy()
     expect(mocks.saveNote).not.toHaveBeenCalled()
     expect(mocks.publishNote).not.toHaveBeenCalled()
   })
 
-  it('creates a nested folder and moves a note entirely within the sidebars, saving organization privately', async () => {
+  it('creates a nested folder and moves a note entirely within the sidebar, saving organization privately', async () => {
     const original = { ...savedNote }
     const session = await openNotebook([{ note: original, published: { ...original } }])
     fireEvent.click(screen.getByRole('button', { name: 'New folder' }))
@@ -346,11 +346,11 @@ describe('folders and notebook-wide search', () => {
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Create folder' })) })
     await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Folder name' })).toBeNull())
     await screen.findByRole('button', { name: 'Open folder Work/Project' })
-    fireEvent.click(screen.getByRole('button', { name: /^All notes$/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^Notes$/ }))
     fireEvent.click(screen.getByRole('button', { name: `Note actions for ${original.title}` }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'Move to…' }))
     const destination = screen.getByRole('combobox', { name: 'Move note to' })
-    expect(destination.closest('#notebook-notes')).not.toBeNull()
+    expect(destination.closest('#notebook-navigation')).not.toBeNull()
     expect(screen.queryByRole('dialog')).toBeNull()
     fireEvent.change(destination, { target: { value: 'Work/Project' } })
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: /^Move$/ })) })
@@ -369,7 +369,7 @@ describe('folders and notebook-wide search', () => {
   it('starts a new note in the selected nested folder with the Markdown template', async () => {
     const session = await openNotebook(organizedNotebook())
     fireEvent.click(screen.getByRole('button', { name: 'Open folder Personal/Garden' }))
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Create a new note' })) })
+    await act(async () => { fireEvent.click(within(screen.getByRole('complementary', { name: 'Notebook' })).getByRole('button', { name: 'New note' })) })
     const content = (screen.getByRole('textbox', { name: 'Markdown content' }) as HTMLTextAreaElement).value
     expect(content).toContain('## Heading')
     expect(content).toContain('**Bold**')

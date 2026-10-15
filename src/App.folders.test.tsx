@@ -41,7 +41,7 @@ function noteMenu(title: string) {
 function folder(path: string) { return screen.getByRole('button', { name: `Open folder ${path}` }) }
 function folderName() { return screen.getByRole('textbox', { name: 'Folder name' }) as HTMLInputElement }
 function expectInline(control: HTMLElement) {
-  expect(control.closest('#notebook-navigation, #notebook-notes')).not.toBeNull()
+  expect(control.closest('#notebook-navigation')).not.toBeNull()
   expect(screen.queryByRole('dialog')).toBeNull()
 }
 async function flush() {
@@ -88,25 +88,72 @@ afterEach(async () => { cleanup(); await closeLocalNotebook(); vi.useRealTimers(
 // These workflows render the full app and persist multiple IndexedDB transactions.
 // Keep each condition's 3s deadline, while allowing the complete workflow time under parallel load.
 describe('sidebar folder management', { timeout: 15_000 }, () => {
-  it('shows notes in their folder tree independently of filters and collapses folders containing only notes', async () => {
+  it('shows one tree of root and nested notes and collapses folders containing only notes', async () => {
     const deleted = row('Deleted', 'Work')
     deleted.note.deleted = true
     await open([row('First'), row('Second', 'Work'), deleted])
     const tree = within(screen.getByRole('navigation', { name: 'Folders and notes' }))
-    const rootNote = tree.getByRole('button', { name: 'Open note First in folder tree' })
-    const nestedNote = tree.getByRole('button', { name: 'Open note Second in folder tree' })
+    const rootNote = tree.getByRole('button', { name: 'Open note First' })
+    const nestedNote = tree.getByRole('button', { name: 'Open note Second' })
     expect(rootNote.closest('[data-folder-path]')).toBeNull()
     expect(nestedNote.closest('[data-folder-path]')?.getAttribute('data-folder-path')).toBe('Work')
-    expect(tree.queryByRole('button', { name: 'Open note Deleted in folder tree' })).toBeNull()
+    expect(tree.queryByRole('button', { name: 'Open note Deleted' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Unfiled' })).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'Public' }))
-    expect(tree.getByRole('button', { name: 'Open note Second in folder tree' })).toBeTruthy()
+    for (const name of ['All notes', 'Public', 'Private', 'Trash']) expect(screen.queryByRole('button', { name })).toBeNull()
+    expect(screen.getAllByRole('button', { name: 'Open note Second' })).toHaveLength(1)
     fireEvent.click(screen.getByRole('button', { name: 'Collapse folder Work' }))
-    expect(tree.queryByRole('button', { name: 'Open note Second in folder tree' })).toBeNull()
+    expect(tree.queryByRole('button', { name: 'Open note Second' })).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Expand folder Work' }))
-    await act(async () => { fireEvent.click(tree.getByRole('button', { name: 'Open note Second in folder tree' })) })
+    await act(async () => { fireEvent.click(tree.getByRole('button', { name: 'Open note Second' })) })
     expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe('Second')
     expect(window.location.pathname.endsWith('/priv/notes/Second.json')).toBe(true)
+  })
+
+  it('marks each note privacy accurately and distinguishes a published snapshot from unpublished draft edits', async () => {
+    const published = row('Published', 'Work', true)
+    const draftChanged = row('Draft-changes', 'Work', true)
+    draftChanged.note.title = 'Draft changes'
+    draftChanged.published!.title = 'Draft changes'
+    draftChanged.note.content = 'Private edits not in the public copy'
+    await open([row('Private'), published, draftChanged])
+    const privateButton = screen.getByRole('button', { name: 'Open note Private' })
+    const publishedButton = screen.getByRole('button', { name: 'Open note Published' })
+    const changedButton = screen.getByRole('button', { name: 'Open note Draft changes' })
+    expect(within(privateButton).getByRole('img', { name: 'Private note' }).getAttribute('title')).toBe('Private note')
+    expect(within(publishedButton).getByRole('img', { name: 'Public copy published' }).getAttribute('title')).toBe('Public copy published')
+    expect(within(changedButton).getByRole('img', { name: 'Public copy published; draft has unpublished changes' }).getAttribute('title')).toBe('Public copy published; draft has unpublished changes')
+    await act(async () => { fireEvent.click(changedButton) })
+    expect((screen.getByRole('textbox', { name: 'Markdown content' }) as HTMLTextAreaElement).value).toBe('Private edits not in the public copy')
+    expect((await readLocalNotebook(scopeForSession(session))).records.find(record => record.note.id === 'Draft-changes')?.published).toEqual(draftChanged.published)
+    expect(mocks.save).not.toHaveBeenCalled()
+    expect(mocks.publish).not.toHaveBeenCalled()
+  })
+
+  it('keeps the active editor when browsing Trash and opens a restored note from its sidebar menu', async () => {
+    const deleted = row('Recoverable', 'Work')
+    deleted.note.deleted = true
+    await open([row('First'), deleted])
+    fireEvent.click(screen.getByRole('button', { name: 'Notebook options' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Trash' }))
+    expect(screen.getByRole('button', { name: 'Open note Recoverable' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Open note First' })).toBeNull()
+    expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe('First')
+    fireEvent.click(screen.getByRole('button', { name: 'Back to notes' }))
+    expect(screen.getByRole('button', { name: 'Open note First' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Notebook options' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Trash' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Note actions for Recoverable' }))
+    await act(async () => { fireEvent.click(screen.getByRole('menuitem', { name: 'Restore' })) })
+    await waitFor(() => expect(screen.queryByRole('navigation', { name: 'Deleted notes' })).toBeNull())
+    await flush()
+    const restored = (await readLocalNotebook(scopeForSession(session))).records.find(record => record.note.id === 'Recoverable')?.note
+    expect(restored).toMatchObject({ content: 'Content of Recoverable', folder: 'Work' })
+    expect(restored?.deleted).not.toBe(true)
+    expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe('Recoverable')
+    expect(window.location.pathname.endsWith('/priv/notes/Recoverable.json')).toBe(true)
+    expect(screen.getByRole('button', { name: 'Open note Recoverable' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Open note First' })).toBeTruthy()
+    expect(mocks.publish).not.toHaveBeenCalled()
   })
 
   it('moves a non-active note from the sidebar without changing the editor or publishing', async () => {
@@ -241,15 +288,16 @@ describe('sidebar folder management', { timeout: 15_000 }, () => {
     expect(screen.queryByRole('dialog')).toBeNull()
   })
 
-  it('drags a note into a folder and back to the top level using All notes without publishing or changing its identity', async () => {
+  it.each(['Notes heading', 'empty sidebar space'])('drags a note into a folder and back to the top level using %s without publishing or changing its identity', async target => {
     const original = row('Second', undefined, true)
     await open([row('First'), original], ['Work'])
     const noteUrl = window.location.pathname
-    await drag(screen.getByRole('button', { name: 'Open note Second in folder tree' }), folder('Work'))
+    await drag(screen.getByRole('button', { name: 'Open note Second' }), folder('Work'))
     await flush()
     expect(mocks.save).toHaveBeenLastCalledWith(session, expect.objectContaining({ id: 'Second', folder: 'Work', content: original.note.content }))
     fireEvent.click(folder('Work'))
-    await drag(screen.getByRole('button', { name: 'Open note Second in folder tree' }), screen.getByRole('button', { name: 'All notes' }))
+    const root = target === 'Notes heading' ? screen.getByRole('button', { name: /^Notes$/ }) : screen.getByRole('region', { name: 'Move to top level' })
+    await drag(screen.getByRole('button', { name: 'Open note Second' }), root)
     await flush()
     const moved = (await readLocalNotebook(scopeForSession(session))).records.find(record => record.note.id === 'Second')
     expect(moved?.note.folder || '').toBe('')
@@ -272,8 +320,8 @@ describe('sidebar folder management', { timeout: 15_000 }, () => {
     expect(folder('Archive/Ideas/Deep')).toBeTruthy()
     expect(folder('Archive/Ideas/Empty')).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Open folder Work/Ideas' })).toBeNull()
-    expect(within(screen.getByRole('region', { name: 'Notes' })).getByRole('button', { name: 'Open note First' })).toBeTruthy()
-    await drag(folder('Archive/Ideas'), screen.getByRole('button', { name: 'All notes' }))
+    expect(within(screen.getByRole('navigation', { name: 'Folders and notes' })).getByRole('button', { name: 'Open note First' })).toBeTruthy()
+    await drag(folder('Archive/Ideas'), screen.getByRole('region', { name: 'Move to top level' }))
     await flush()
     expect(folder('Ideas/Deep')).toBeTruthy()
     expect(folder('Ideas/Empty')).toBeTruthy()
@@ -287,6 +335,26 @@ describe('sidebar folder management', { timeout: 15_000 }, () => {
     expect(screen.queryByRole('dialog')).toBeNull()
   })
 
+  it('shows the root hint only for eligible drags and never turns a rejected nested drop into a root move', async () => {
+    await open([row('First', 'Work/Ideas/Deep'), row('Second')])
+    const root = screen.getByRole('region', { name: 'Move to top level' })
+    const source = folder('Work/Ideas'), transfer = dataTransfer()
+    expect(root.textContent).toBe('')
+    fireEvent.dragStart(source, { dataTransfer: transfer })
+    expect(root.textContent).toBe('Move to top level')
+    fireEvent.dragEnd(source, { dataTransfer: transfer })
+    expect(root.textContent).toBe('')
+    await drag(source, folder('Work/Ideas/Deep'))
+    expect(folder('Work/Ideas/Deep')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Open folder Ideas' })).toBeNull()
+    expect(mocks.saveFolders).not.toHaveBeenCalled()
+    expect(mocks.save).not.toHaveBeenCalled()
+    const rootNote = screen.getByRole('button', { name: 'Open note Second' })
+    fireEvent.dragStart(rootNote, { dataTransfer: dataTransfer() })
+    expect(root.textContent).toBe('')
+    fireEvent.dragEnd(rootNote)
+  })
+
   it('ignores external drag payloads and rejects folder cycles and destination collisions before writes', async () => {
     await open([row('First', 'Work/Ideas')], ['Archive/Work'])
     const external = dataTransfer()
@@ -295,6 +363,8 @@ describe('sidebar folder management', { timeout: 15_000 }, () => {
     await act(async () => {
       fireEvent.dragOver(folder('Archive'), { dataTransfer: external })
       fireEvent.drop(folder('Archive'), { dataTransfer: external })
+      fireEvent.dragOver(screen.getByRole('region', { name: 'Move to top level' }), { dataTransfer: external })
+      fireEvent.drop(screen.getByRole('region', { name: 'Move to top level' }), { dataTransfer: external })
     })
     expect(mocks.saveFolders).not.toHaveBeenCalled()
     expect(mocks.save).not.toHaveBeenCalled()

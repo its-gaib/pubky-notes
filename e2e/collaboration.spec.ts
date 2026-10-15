@@ -199,6 +199,7 @@ test('approved browsers exchange real RTC edits, keep independent private files,
       expect(row.published).toBeNull()
       expect(row.note.crdt?.version).toBe(2)
       expect(Buffer.from(row.note.crdt!.update, 'base64').toString()).not.toContain('DELETED PRIVATE TEXT MUST NOT BE SHARED')
+      await expect(page.locator(`[data-note-id="${id}"]`).getByLabel('Private note', { exact: true })).toBeVisible()
     }
 
     await alice.page.getByRole('button', { name: 'New folder', exact: true }).click()
@@ -208,8 +209,8 @@ test('approved browsers exchange real RTC edits, keep independent private files,
     await alice.page.getByRole('menuitem', { name: 'New subfolder', exact: true }).click()
     await alice.page.getByRole('textbox', { name: 'Folder name' }).fill('Research')
     await alice.page.getByRole('button', { name: 'Create folder', exact: true }).click()
-    await alice.page.getByRole('button', { name: 'All notes', exact: true }).click()
-    await alice.page.locator('.note-entry.selected').getByRole('button', { name: 'Note actions for E2E shared draft' }).click()
+    await alice.page.getByRole('button', { name: 'Notes', exact: true }).click()
+    await alice.page.locator(`[data-note-id="${id}"]`).getByRole('button', { name: 'Note actions for E2E shared draft', exact: true }).click()
     await alice.page.getByRole('menuitem', { name: 'Move to…' }).click()
     await alice.page.getByRole('combobox', { name: 'Move note to', exact: true }).selectOption('Alice only/Research')
     await expect(alice.page.getByRole('dialog')).toHaveCount(0)
@@ -221,11 +222,14 @@ test('approved browsers exchange real RTC edits, keep independent private files,
     await alice.page.getByRole('button', { name: 'Share', exact: true }).click()
     await alice.page.getByRole('button', { name: 'Publish public copy' }).click()
     await expect.poll(async () => (await notes(alice.page)).find(row => row.note.id === id)?.published).not.toBeNull()
+    await expect(alice.page.locator(`[data-note-id="${id}"]`).getByLabel('Public copy published', { exact: true })).toBeVisible()
     expect((await notes(bob.page)).find(row => row.note.id === id)?.published).toBeNull()
+    await expect(bob.page.locator(`[data-note-id="${id}"]`).getByLabel('Private note', { exact: true })).toBeVisible()
     await alice.page.getByRole('button', { name: 'Unpublish', exact: true }).click()
     // A snapshot can list the public file just before Unpublish removes it.
     // Retry the complete read, including that transient GET404, until it is absent.
     await expect(async () => expect((await notes(alice.page)).find(row => row.note.id === id)?.published).toBeNull()).toPass({ timeout: 20_000 })
+    await expect(alice.page.locator(`[data-note-id="${id}"]`).getByLabel('Private note', { exact: true })).toBeVisible()
     await alice.page.getByRole('button', { name: 'Close dialog' }).click()
     await connected(bob.page)
 
@@ -338,9 +342,9 @@ test('live collaborator cursors follow native selections, CRDT edits, wrapping, 
   await expect.poll(() => highlights.count()).toBeGreaterThan(1)
   await expect(caret).toBeVisible()
   await overlaysStayInsideEditor(alice.page)
-  for (const name of ['navigation', 'notes'] as const) {
-    const border = alice.page.getByRole('separator', { name: `Resize ${name}`, exact: true })
-    const pane = alice.page.locator(`.${name}-pane`)
+  {
+    const border = alice.page.getByRole('separator', { name: 'Resize sidebar', exact: true })
+    const pane = alice.page.locator('.navigation-pane')
     const originalWidth = (await pane.boundingBox())!.width
     const originalCaret = (await caret.boundingBox())!
     for (const delta of [80, -80]) {
@@ -359,15 +363,14 @@ test('live collaborator cursors follow native selections, CRDT edits, wrapping, 
     }
   }
   const beforeResize = (await caret.boundingBox())!
-  await alice.page.getByRole('button', { name: 'Collapse navigation', exact: true }).click()
-  await alice.page.getByRole('button', { name: 'Collapse notes', exact: true }).click()
+  await alice.page.getByRole('button', { name: 'Collapse sidebar', exact: true }).click()
   await expect.poll(async () => {
     const box = await caret.boundingBox()
     return box ? Math.abs(box.x - beforeResize.x) + Math.abs(box.y - beforeResize.y) : 0
   }).toBeGreaterThan(20)
   await overlaysStayInsideEditor(alice.page)
   await alice.page.screenshot({ path: '/tmp/pubky-notes-live-cursors-desktop.png' })
-  await alice.page.getByRole('button', { name: 'Expand sidebars', exact: true }).click()
+  await alice.page.getByRole('button', { name: 'Expand sidebar', exact: true }).click()
   await overlaysStayInsideEditor(alice.page)
 
   await bobEditor.press('Control+End')
