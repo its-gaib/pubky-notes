@@ -70,7 +70,7 @@ describe('inline collaboration', () => {
     expect(screen.queryByRole('button', { name: 'Retry connection' })).toBeNull()
     const details = screen.getByText('Details').closest('details')!
     expect(details.open).toBe(false)
-    expect(within(details).getByText('Direct connections only; a relay is unavailable.')).toBeTruthy()
+    expect(within(details).getByText('Direct connections only: the TURN relay for syncing edits is unavailable.')).toBeTruthy()
     fireEvent.click(within(details).getByText('Disconnect collaboration'))
     expect(actions.disconnect).toHaveBeenCalledOnce()
   })
@@ -78,7 +78,7 @@ describe('inline collaboration', () => {
   it('shows an actionable direct-connection failure throughout automatic retries, then clears on success', () => {
     const actions = props({ view: { ...waiting, status: { state: 'connecting', relayAvailable: false, issue: 'direct-connection-failed' } } })
     const { rerender } = render(<CollaborationPanel {...actions} />)
-    expect(screen.getByRole('alert').textContent).toContain('A relay is unavailable')
+    expect(screen.getByRole('alert').textContent).toContain('The TURN relay for syncing edits is unavailable')
     expect(screen.getByRole('status').textContent).toBe('Connection problem')
     fireEvent.click(screen.getByRole('button', { name: 'Retry connection' }))
     expect(actions.retry).toHaveBeenCalledOnce()

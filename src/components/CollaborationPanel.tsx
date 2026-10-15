@@ -39,7 +39,7 @@ export default function CollaborationPanel(props: Props) {
   const active = !!view.noteId && !invitation
   const failed = !!view.status?.issue || view.status?.state === 'error' || view.status?.state === 'disconnected' || !!view.error
   const connectionMessage = view.status?.issue === 'direct-connection-failed'
-    ? 'Could not establish a direct connection. A relay is unavailable. Keep both browsers online or try another network.'
+    ? 'Could not establish a direct connection. The TURN relay for syncing edits is unavailable. Keep both browsers online or try another network.'
     : view.status?.issue === 'connection-failed'
       ? 'The connection failed. Check that both people are online, then retry.'
       : view.error
@@ -61,7 +61,7 @@ export default function CollaborationPanel(props: Props) {
       {failed && <div className="collaboration-panel-actions"><button className="button secondary small" onClick={props.retry}>Retry connection</button></div>}
       <details className="collaboration-details"><summary>Details</summary>
         <p>Each person saves a private copy. Folders and Trash stay personal. Both browsers must be online to sync.</p>
-        {view.status && <p>{view.status.relayAvailable ? 'Relay fallback is configured.' : 'Direct connections only; a relay is unavailable.'}</p>}
+        {view.status && <p>{view.status.relayAvailable ? 'TURN relay fallback for syncing edits is configured.' : 'Direct connections only: the TURN relay for syncing edits is unavailable.'}</p>}
         {view.error && view.error !== connectionMessage && <p>{view.error}</p>}
         <button className="button ghost small" onClick={props.disconnect}>Disconnect collaboration</button>
       </details>
