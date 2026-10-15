@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
-import type { ChangeEvent, DragEvent, ReactNode } from 'react'
+import type { ChangeEvent, CSSProperties, DragEvent, ReactNode } from 'react'
 import type { Session } from '@synonymdev/pubky'
 import QRCode from 'qrcode'
 import { ArrowDownToLine, ArrowUpFromLine, BookOpen, CheckCheck, ChevronLeft, ChevronRight, CircleHelp, Code2, Copy, FileText, Folder, Globe2, Heading2, Link, List, LoaderCircle, LockKeyhole, PenLine, Plus, Search, RefreshCw, Trash2, X, MoreHorizontal, FolderPlus, Bold, Italic, Quote, ExternalLink, UsersRound } from 'lucide-react'
 import Markdown from './components/Markdown'
 import AccountProfile from './components/AccountProfile'
 import RemoteSelection from './components/RemoteSelection'
+import SidebarResizeHandle from './components/SidebarResizeHandle'
 import { IS_TESTNET } from './config'
 import { discardSession, persistSession, restoreSession, signOut, startSignIn } from './lib/pubky'
 import type { AuthFlow } from './lib/pubky'
@@ -23,6 +24,7 @@ import type { SharedNoteDocument } from './lib/shared-note'
 import { EditorSelectionKeeper } from './lib/editor-selection'
 import { notePath, noteUrl, parseNoteRoute } from './lib/note-links'
 import type { NoteRoute } from './lib/note-links'
+import { fitSidebarLayout, parseSidebarLayout, SIDEBAR_LIMITS } from './lib/sidebar-layout'
 
 const SAMPLE_MARKDOWN = [
   '## Heading',
@@ -42,10 +44,8 @@ function rememberedScope() {
   try { const value = localStorage.getItem(ACCOUNT_KEY); return value?.startsWith(GUEST_SCOPE.split(':')[0] + ':') && /^[a-z][a-z0-9-]{0,31}:[a-zA-Z0-9_-]{1,128}$/.test(value) ? value : GUEST_SCOPE } catch { return GUEST_SCOPE }
 }
 function savedLayout() {
-  try {
-    const value = JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? '{}')
-    return { navigationCollapsed: value?.navigationCollapsed === true, notesCollapsed: value?.notesCollapsed === true }
-  } catch { return { navigationCollapsed: false, notesCollapsed: false } }
+  try { return parseSidebarLayout(JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? '{}')) }
+  catch { return parseSidebarLayout(null) }
 }
 
 function scratchpad(): NoteRecord {
@@ -175,6 +175,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   const [mobileList, setMobileList] = useState(true)
   const [mobileViewport, setMobileViewport] = useState(() => window.matchMedia?.('(max-width: 700px)')?.matches ?? false)
   const [layout, setLayout] = useState(savedLayout)
+  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth)
   const recordsRef = useRef(records); recordsRef.current = records
   const foldersRef = useRef(explicitFolders); foldersRef.current = explicitFolders
   const busyRef = useRef(busy); busyRef.current = busy
@@ -226,6 +227,11 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   useEffect(() => {
     try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout)) } catch { /* Layout still works when browser storage is unavailable. */ }
   }, [layout])
+  useEffect(() => {
+    const resize = () => setViewportWidth(window.innerWidth)
+    window.addEventListener('resize', resize)
+    return () => window.removeEventListener('resize', resize)
+  }, [])
   useEffect(() => {
     folderNameInput.current?.focus()
     folderNameInput.current?.select()
@@ -965,9 +971,25 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   const navigationCollapsed = mobileViewport ? !menuOpen : layout.navigationCollapsed
   const notesCollapsed = mobileViewport ? !mobileList : layout.notesCollapsed
   const bothCollapsed = navigationCollapsed && notesCollapsed
+  const fittedLayout = fitSidebarLayout(layout, viewportWidth)
+  const sidebarStyle = { '--preferred-navigation-width': `${fittedLayout.navigationWidth}px`, '--preferred-notes-width': `${fittedLayout.notesWidth}px` } as CSSProperties
+  function resizeSidebar(kind: 'navigation' | 'notes', requestedWidth: number) {
+    if (mobileViewport || !Number.isFinite(requestedWidth)) return
+    setLayout(current => {
+      const fitted = fitSidebarLayout(current, viewportWidth)
+      const limits = SIDEBAR_LIMITS[kind]
+      const max = kind === 'navigation' ? fitted.navigationMaxWidth : fitted.notesMaxWidth
+      const width = Math.round(Math.min(max, Math.max(limits.min, requestedWidth)))
+      // A deliberate resize starts from the visible widths. Window resizing alone
+      // only fits the display and never rewrites the user's saved preferences.
+      return kind === 'navigation'
+        ? { ...current, navigationWidth: width, notesWidth: current.notesCollapsed ? current.notesWidth : fitted.notesWidth }
+        : { ...current, notesWidth: width, navigationWidth: current.navigationCollapsed ? current.navigationWidth : fitted.navigationWidth }
+    })
+  }
   function expandSidebars() {
     if (mobileViewport) { setMenuOpen(true); setMobileList(true) }
-    else setLayout({ navigationCollapsed: false, notesCollapsed: false })
+    else setLayout(current => ({ ...current, navigationCollapsed: false, notesCollapsed: false }))
   }
   function folderNameForm() {
     if (!folderEditor) return null
@@ -1021,7 +1043,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     </>
   }
 
-  return <div className={`app-shell ${menuOpen ? 'mobile-open' : ''} ${mobileList ? 'mobile-list' : ''} ${navigationCollapsed ? 'navigation-collapsed' : ''} ${notesCollapsed ? 'notes-collapsed' : ''} ${bothCollapsed ? 'both-collapsed' : ''}`}>
+  return <div className={`app-shell ${menuOpen ? 'mobile-open' : ''} ${mobileList ? 'mobile-list' : ''} ${navigationCollapsed ? 'navigation-collapsed' : ''} ${notesCollapsed ? 'notes-collapsed' : ''} ${bothCollapsed ? 'both-collapsed' : ''}`} style={sidebarStyle}>
     {menuOpen && <button className="navigation-dismiss" aria-label="Close navigation" onClick={() => setMenuOpen(false)} />}
     <div className="navigation-pane"><aside className="sidebar" id="notebook-navigation">
       <a className="brand" href="/"><span className="brand-mark"><BookOpen size={22} /></span><strong>Pubky Notes</strong></a>
@@ -1040,12 +1062,12 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
         {IS_TESTNET && <span className="network-label">Local testnet</span>}
         <footer className="repository-links"><a href="https://github.com/its-gaib/pubky-notes" target="_blank" rel="noopener noreferrer" title="Pubky Notes on GitHub">GitHub</a><span aria-hidden="true">·</span><a href="https://github.com/its-gaib/pubky-notes-cli" target="_blank" rel="noopener noreferrer" title="Pubky Notes CLI on GitHub">CLI</a></footer>
       </div>
-    </aside>{bothCollapsed ? <button className="pane-toggle navigation-edge" aria-label="Expand sidebars" title="Expand sidebars" aria-controls="notebook-navigation notebook-notes" aria-expanded={false} onClick={expandSidebars}><ChevronRight size={17} /></button> : <button className="pane-toggle navigation-edge" aria-label={navigationCollapsed ? 'Expand navigation' : 'Collapse navigation'} title={navigationCollapsed ? 'Expand navigation' : 'Collapse navigation'} aria-controls="notebook-navigation" aria-expanded={!navigationCollapsed} onClick={() => mobileViewport ? setMenuOpen(current => !current) : setLayout(current => ({ ...current, navigationCollapsed: !current.navigationCollapsed }))}>{navigationCollapsed ? <ChevronRight size={17} /> : <ChevronLeft size={17} />}</button>}</div>
+    </aside>{!mobileViewport && !navigationCollapsed && <SidebarResizeHandle label="Resize navigation" controls="notebook-navigation" width={fittedLayout.navigationWidth} min={SIDEBAR_LIMITS.navigation.min} max={fittedLayout.navigationMaxWidth} defaultWidth={SIDEBAR_LIMITS.navigation.default} onResize={width => resizeSidebar('navigation', width)} />}{bothCollapsed ? <button className="pane-toggle navigation-edge" aria-label="Expand sidebars" title="Expand sidebars" aria-controls="notebook-navigation notebook-notes" aria-expanded={false} onClick={expandSidebars}><ChevronRight size={17} /></button> : <button className="pane-toggle navigation-edge" aria-label={navigationCollapsed ? 'Expand navigation' : 'Collapse navigation'} title={navigationCollapsed ? 'Expand navigation' : 'Collapse navigation'} aria-controls="notebook-navigation" aria-expanded={!navigationCollapsed} onClick={() => mobileViewport ? setMenuOpen(current => !current) : setLayout(current => ({ ...current, navigationCollapsed: !current.navigationCollapsed }))}>{navigationCollapsed ? <ChevronRight size={17} /> : <ChevronLeft size={17} />}</button>}</div>
     <div className="notes-pane"><section className="notes-panel" id="notebook-notes" aria-label="Notes">
       <div className="notes-header"><h2 title={selectedFolder || undefined}><span className="notes-heading-label">{listTitle}</span><span className="count">{filtered.length}</span></h2><div className="notes-header-actions">{session && <button className="icon-button" aria-label="Refresh notes" title="Refresh notes" disabled={locked} onClick={() => void refresh()}><RefreshCw size={16} /></button>}<button className="icon-button" aria-label="Create a new note" disabled={locked} onClick={() => void addNote()}><PenLine size={18} /></button></div></div>
       <div className="search-box"><Search size={16} /><input type="search" placeholder="Search all notes…" aria-label="Search all notes" value={query} onChange={event => setQuery(event.target.value)} />{query && <button className="icon-button search-clear" aria-label="Clear search" onClick={() => setQuery('')}><X size={14} /></button>}</div>
       <div className="note-list">{filtered.map(row => <div key={row.note.id} data-note-id={row.note.id} className={`note-card note-entry ${row.note.id === note?.id ? 'selected' : ''}`}><button className="note-select" aria-label={`Open note ${row.note.title || 'Untitled note'}`} onClick={() => void switchNote(row.note.id)} disabled={locked} draggable={!locked && !row.note.deleted} onDragStart={event => startDrag(event, 'note', row.note.id)} onDragEnd={endDrag}><div className="note-card-title"><FileText size={15} /><strong>{row.note.title || 'Untitled note'}</strong>{row.note.crdt?.version === 2 && <UsersRound size={13} aria-label="Collaborative note" />}{row.published ? <Globe2 size={13} /> : <LockKeyhole size={13} />}</div><p className="note-card-excerpt">{row.note.content.replace(/[#*>`_\[\]]/g, '').trim().slice(0, 115)}</p><div className="note-card-meta"><span>{dateLabel(row.note.updatedAt)}</span><span className="folder-path" title={row.note.folder || 'No folder'}><Folder size={11} /><span>{row.note.folder || 'No folder'}</span></span></div></button><SidebarActions label={`Note actions for ${row.note.title || 'Untitled note'}`} disabled={locked} items={row.note.deleted ? [{ label: 'Restore', action: () => void restoreNote(row.note.id) }] : [{ label: 'Move to…', action: () => openMove(row.note.id) }]} />{moveControl('note', row.note.id)}</div>)}{!visibleRecords.length && filter !== 'trash' && !initializing && <button className="note-card selected" onClick={() => setMobileList(false)}><div className="note-card-title"><Code2 size={15} /><strong>Markdown basics</strong></div><div className="note-card-meta">Sample</div></button>}{!filtered.length && (records.length > 0 || filter === 'trash') && <div className="empty-state"><Search size={25} /><p>{filter === 'trash' ? 'Trash is empty.' : searching ? 'No notes match your search.' : 'No notes.'}</p><button className="button ghost small" onClick={() => { if (searching || filter !== 'all' || selectedFolder !== null) { setQuery(''); setFilter('all'); setSelectedFolder(null) } else void addNote() }}> {searching || filter !== 'all' || selectedFolder !== null ? 'Show all notes' : 'New note'}</button></div>}</div>
-    </section>{!bothCollapsed && <button className="pane-toggle notes-edge" aria-label={notesCollapsed ? 'Expand notes' : 'Collapse notes'} title={notesCollapsed ? 'Expand notes' : 'Collapse notes'} aria-controls="notebook-notes" aria-expanded={!notesCollapsed} onClick={() => mobileViewport ? setMobileList(current => !current) : setLayout(current => ({ ...current, notesCollapsed: !current.notesCollapsed }))}>{notesCollapsed ? <ChevronRight size={17} /> : <ChevronLeft size={17} />}</button>}</div>
+    </section>{!mobileViewport && !notesCollapsed && <SidebarResizeHandle label="Resize notes" controls="notebook-notes" width={fittedLayout.notesWidth} min={SIDEBAR_LIMITS.notes.min} max={fittedLayout.notesMaxWidth} defaultWidth={SIDEBAR_LIMITS.notes.default} onResize={width => resizeSidebar('notes', width)} />}{!bothCollapsed && <button className="pane-toggle notes-edge" aria-label={notesCollapsed ? 'Expand notes' : 'Collapse notes'} title={notesCollapsed ? 'Expand notes' : 'Collapse notes'} aria-controls="notebook-notes" aria-expanded={!notesCollapsed} onClick={() => mobileViewport ? setMobileList(current => !current) : setLayout(current => ({ ...current, notesCollapsed: !current.notesCollapsed }))}>{notesCollapsed ? <ChevronRight size={17} /> : <ChevronLeft size={17} />}</button>}</div>
     <main className="editor-panel">
       {routeLoading ? <div className="empty-state editor-empty"><LoaderCircle className="spin" aria-label="Loading note" /><p>Opening note…</p></div> : routeIssue ? <div className="empty-state editor-empty"><LockKeyhole size={30} /><h2>{routeIssue.title}</h2><p>{routeIssue.message}</p><div className="modal-actions">{route.kind === 'private' && !ownsPrivateRoute && <button className="button primary" disabled={locked} onClick={() => void connect()}>Connect Pubky</button>}{requestedNote && canOpenRoute && <button className="button secondary" disabled={locked} onClick={() => void retryNoteLink()}>Retry</button>}<button className="button secondary" onClick={openNotebook}>Open your notebook</button></div></div> : note ? <><div className="editor-topbar"><div className="note-location"><div className="mode-switch"><button className={mode === 'write' ? 'active' : ''} onClick={() => setMode('write')}><PenLine size={14} /> Write</button><button className={mode === 'preview' ? 'active' : ''} onClick={() => setMode('preview')}><BookOpen size={14} /> Preview</button></div></div>{mode === 'write' && <div className="formatting-toolbar" aria-label="Markdown formatting">{[{ icon: Bold, title: 'Bold', before: '**', after: '**' }, { icon: Italic, title: 'Italic', before: '_', after: '_' }, { icon: Heading2, title: 'Heading', before: '\n## ', after: '' }, { icon: List, title: 'List', before: '\n- ', after: '' }, { icon: Quote, title: 'Quote', before: '\n> ', after: '' }, { icon: Code2, title: 'Code', before: '`', after: '`' }, { icon: Link, title: 'Link', before: '[', after: '](https://)' }].map(item => <button key={item.title} className="icon-button" aria-label={item.title} title={item.title} disabled={locked || note.deleted} onClick={() => format(item.before, item.after)}><item.icon size={16} /></button>)}</div>}<div className="editor-actions">{session && <span className={`visibility-badge ${active?.published ? 'public' : ''}`}>{active?.published ? <Globe2 size={13} /> : <LockKeyhole size={13} />}{active?.published ? 'Public copy' : 'Private'}</span>}{note.id !== exampleId.current && <button className="icon-button" onClick={() => void copyNoteLink()} disabled={locked} aria-label="Copy note link" title="Copy note link"><Link size={16} /></button>}{note.content === SAMPLE_MARKDOWN && <button className="icon-button" onClick={() => void copy(SAMPLE_MARKDOWN)} aria-label="Copy Markdown" title="Copy Markdown"><Copy size={16} /></button>}<button className="button ghost small" onClick={() => download(note)} aria-label="Export Markdown" title="Export Markdown"><ArrowDownToLine size={16} /></button>{note.deleted && <button className="button secondary small" disabled={locked} onClick={() => void restoreNote(note.id)}>Restore</button>}<button className="button secondary small collaboration-button" onClick={() => setModal('collaborate')} disabled={locked || note.deleted} aria-label="Collaborate"><UsersRound size={15} /><span>Collaborate</span></button><button className="button secondary small" onClick={() => setModal('share')} disabled={locked || note.deleted}><Globe2 size={14} /> Share</button><button className="icon-button" onClick={() => setModal('delete')} disabled={locked || note.deleted} aria-label="Delete note"><Trash2 size={16} /></button></div></div>
       <div className="editor-content"><input ref={titleEditor} className="note-title-input" aria-label="Note title" placeholder="Untitled note" value={note.title} maxLength={200} disabled={locked || note.deleted} onChange={event => edit({ title: event.target.value })} />{mode === 'write' ? <div className="collaborative-editor"><textarea ref={editor} className="markdown-editor" aria-label="Markdown content" placeholder="Write a note…" value={note.content} disabled={locked || note.deleted} onChange={event => { edit({ content: event.target.value }); shareEditorSelection(event.currentTarget) }} onFocus={event => shareEditorSelection(event.currentTarget)} onSelect={event => shareEditorSelection(event.currentTarget)} onKeyUp={event => shareEditorSelection(event.currentTarget)} onClick={event => shareEditorSelection(event.currentTarget)} onBlur={() => collaboration.updateSelection(note.id, null)} spellCheck /><RemoteSelection textarea={editor} content={note.content} selection={collaboration.remoteSelection?.noteId === note.id && !note.deleted ? { ...collaboration.remoteSelection, direction: collaboration.remoteSelection.direction ?? 'none' } : null} /></div> : <Markdown content={note.content} />}</div>

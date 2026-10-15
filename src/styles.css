@@ -44,8 +44,8 @@ button svg { pointer-events: none; }
 ::-webkit-scrollbar-track { background: transparent; }
 
 .app-shell {
-  --navigation-width: 174px;
-  --notes-width: 242px;
+  --navigation-width: var(--preferred-navigation-width, 174px);
+  --notes-width: var(--preferred-notes-width, 242px);
   display: grid;
   grid-template-columns: var(--navigation-width) var(--notes-width) minmax(0, 1fr);
   width: 100%;
@@ -64,6 +64,10 @@ button svg { pointer-events: none; }
 .pane-toggle:hover { color: #635c8f; }
 .pane-toggle:focus-visible { z-index: 3; outline-offset: -3px; }
 .app-shell:not(.navigation-collapsed) .navigation-edge { right: -10px; width: 20px; }
+.sidebar-resize-handle { position: absolute; z-index: 1; top: 0; right: -4px; bottom: 0; width: 8px; cursor: col-resize; touch-action: none; outline: none; }
+.sidebar-resize-handle::after { content: ''; position: absolute; top: 0; bottom: 0; left: 3px; width: 2px; background: transparent; transition: background .15s; }
+.sidebar-resize-handle:hover::after, .sidebar-resize-handle:focus-visible::after, .sidebar-resize-handle.is-dragging::after { background: #8d88c4; }
+.app-shell:has(.sidebar-resize-handle.is-dragging), .app-shell:has(.sidebar-resize-handle.is-dragging) * { cursor: col-resize !important; user-select: none !important; }
 .sidebar {
   display: flex;
   flex-direction: column;
@@ -349,9 +353,6 @@ p.auth-instructions { padding-left: 0; font-size: 13px; }
 .spin { animation: spin 1.2s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-@media (min-width: 1350px) {
-  .app-shell { --navigation-width: 176px; --notes-width: 252px; }
-}
 @media (min-width: 701px) {
   .app-shell.navigation-collapsed { --navigation-width: 28px; }
   .app-shell.notes-collapsed { --notes-width: 28px; }
@@ -371,6 +372,7 @@ p.auth-instructions { padding-left: 0; font-size: 13px; }
   .editor-content { padding-top: 22px; padding-right: 24px; padding-left: 24px; }
 }
 @media (max-width: 700px) {
+  .sidebar-resize-handle { display: none; }
   .app-shell { grid-template-columns: 28px 28px minmax(0, 1fr); }
   .app-shell.mobile-list { grid-template-columns: 28px minmax(0, 1fr) 0px; }
   .app-shell.both-collapsed { grid-template-columns: 28px 0px minmax(0, 1fr); }

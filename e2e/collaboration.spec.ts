@@ -338,6 +338,26 @@ test('live collaborator cursors follow native selections, CRDT edits, wrapping, 
   await expect.poll(() => highlights.count()).toBeGreaterThan(1)
   await expect(caret).toBeVisible()
   await overlaysStayInsideEditor(alice.page)
+  for (const name of ['navigation', 'notes'] as const) {
+    const border = alice.page.getByRole('separator', { name: `Resize ${name}`, exact: true })
+    const pane = alice.page.locator(`.${name}-pane`)
+    const originalWidth = (await pane.boundingBox())!.width
+    const originalCaret = (await caret.boundingBox())!
+    for (const delta of [80, -80]) {
+      const box = (await border.boundingBox())!
+      const x = box.x + box.width / 2, y = box.y + box.height / 4
+      await alice.page.mouse.move(x, y)
+      await alice.page.mouse.down()
+      await alice.page.mouse.move(x + delta, y, { steps: 10 })
+      await alice.page.mouse.up()
+      await expect.poll(async () => Math.abs((await pane.boundingBox())!.width - (originalWidth + (delta > 0 ? 80 : 0)))).toBeLessThan(1)
+      await overlaysStayInsideEditor(alice.page)
+      if (delta > 0) await expect.poll(async () => {
+        const position = await caret.boundingBox()
+        return position ? Math.abs(position.x - originalCaret.x) + Math.abs(position.y - originalCaret.y) : 0
+      }).toBeGreaterThan(10)
+    }
+  }
   const beforeResize = (await caret.boundingBox())!
   await alice.page.getByRole('button', { name: 'Collapse navigation', exact: true }).click()
   await alice.page.getByRole('button', { name: 'Collapse notes', exact: true }).click()
