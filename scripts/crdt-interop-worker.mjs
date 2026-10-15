@@ -5,7 +5,7 @@ import { createRequire } from 'node:module'
 import * as crdt from '../../pubky-notes-cli/dist/crdt.js'
 import * as notes from '../../pubky-notes-cli/dist/notes.js'
 
-const crdtMethods = new Set(['ensureCrdt', 'initializeNote', 'editNote', 'mergeNotes', 'validateCrdtNote', 'noteRevision'])
+const crdtMethods = new Set(['ensureCrdt', 'initializeNote', 'editNote', 'mergeNotes', 'validateCrdtNote', 'noteRevision', 'checkpointNote', 'listNoteVersions', 'readNoteVersion'])
 const noteMethods = new Set(['getNote', 'listNotes', 'createNote', 'updateNote', 'publishNote', 'unpublishNote', 'deleteNote', 'restoreNote'])
 let session, signer, client
 

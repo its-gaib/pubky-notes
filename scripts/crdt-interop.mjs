@@ -4,7 +4,7 @@ import { copy, fixture, openWebModules, startCli } from './crdt-interop-support.
 if (process.argv.length !== 2) throw new Error('Usage: node scripts/crdt-interop.mjs')
 const web = await openWebModules()
 const cli = startCli()
-const { initializeNote, ensureCrdt, editNote, mergeNotes, noteRevision } = web.crdt
+const { initializeNote, ensureCrdt, editNote, mergeNotes, noteRevision, checkpointNote, listNoteVersions, readNoteVersion } = web.crdt
 let passed = 0
 const test = async (name, action) => { await action(); passed++; console.log(`PASS ${name}`) }
 const same = (a, b) => { assert.deepEqual(a, b); assert.equal(noteRevision(a), noteRevision(b)) }
@@ -32,6 +32,48 @@ try {
     assert.equal(merged.content, `WEB 🧭\n${base.content}\nCLI café`)
     assert.equal(merged.title, 'Changed in CLI 📝')
     assert.equal(merged.folder, 'Projects/日本語')
+  })
+
+  await test('CLI reads browser checkpoints without changing the saved note', async () => {
+    const original = { ...fixture('web-history'), title: 'First title', content: 'First draft\nPrivate deleted text' }
+    const base = initializeNote(original)
+    const saved = checkpointNote(editNote(base, { title: 'Revised title', content: 'First draft', updatedAt: '2026-01-01T00:01:00.000Z' }), {
+      recordedAt: '2026-01-01T00:01:00.000Z',
+    })
+    const revision = noteRevision(saved)
+    const versions = listNoteVersions(saved)
+    assert.equal(versions.length, 2)
+    assert.deepEqual(await cli.call('crdt:listNoteVersions', copy(saved)), versions)
+    for (const version of versions) {
+      assert.deepEqual(await cli.call('crdt:readNoteVersion', copy(saved), version.id), readNoteVersion(saved, version.id))
+    }
+    assert.deepEqual(await cli.call('crdt:readNoteVersion', copy(saved), versions[0].id), {
+      title: original.title, content: original.content,
+    })
+    assert.equal(await cli.call('crdt:noteRevision', copy(saved)), revision)
+    assert.equal(noteRevision(saved), revision)
+  })
+
+  await test('browser reads CLI deletion checkpoints and both offline branch histories after merging', async () => {
+    const base = initializeNote({ ...fixture('merged-history'), content: 'First\nMiddle\nLast' })
+    const browser = checkpointNote(editNote(base, { content: 'Browser first\nMiddle\nLast', updatedAt: '2026-01-01T00:01:00.000Z' }), {
+      recordedAt: '2026-01-01T00:01:00.000Z',
+    })
+    const deleted = await cli.call('crdt:editNote', copy(base), { content: 'First\nLast', updatedAt: '2026-01-01T00:02:00.000Z' })
+    const terminal = await cli.call('crdt:checkpointNote', deleted, { recordedAt: '2026-01-01T00:02:00.000Z' })
+    const terminalVersions = await cli.call('crdt:listNoteVersions', copy(terminal))
+    const browserVersion = listNoteVersions(browser).at(-1).id
+    const terminalVersion = terminalVersions.at(-1).id
+    assert.deepEqual(readNoteVersion(terminal, terminalVersion), { title: base.title, content: 'First\nLast' })
+
+    const merged = await exchange(browser, terminal)
+    assert.equal(merged.content, 'Browser first\nLast')
+    assert.equal(listNoteVersions(merged).length, 3)
+    assert.deepEqual(readNoteVersion(merged, browserVersion), { title: base.title, content: browser.content })
+    assert.deepEqual(readNoteVersion(merged, terminalVersion), { title: base.title, content: terminal.content })
+    assert.deepEqual(await cli.call('crdt:listNoteVersions', copy(merged)), listNoteVersions(merged))
+    assert.deepEqual(await cli.call('crdt:readNoteVersion', copy(merged), browserVersion), readNoteVersion(merged, browserVersion))
+    same(await exchange(merged, base), merged)
   })
 
   await test('overlapping replacements converge and retain both new contributions', async () => {

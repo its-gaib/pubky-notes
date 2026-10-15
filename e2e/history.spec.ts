@@ -1,0 +1,46 @@
+import { expect, test } from '@playwright/test'
+
+for (const viewport of [{ width: 1440, height: 1000 }, { width: 390, height: 844 }]) {
+  test(`private history can replay and restore without losing later versions at ${viewport.width}px`, async ({ browser }) => {
+    const context = await browser.newContext({ viewport })
+    const page = await context.newPage()
+    const errors: string[] = []
+    page.on('pageerror', error => errors.push(error.message))
+    try {
+      await page.goto('/')
+      await page.getByRole('textbox', { name: 'Note title', exact: true }).fill('History browser fixture')
+      await page.getByRole('textbox', { name: 'Markdown content', exact: true }).fill('First saved text.')
+      await page.keyboard.press('Control+s')
+      await page.getByRole('button', { name: 'Version history', exact: true }).click()
+      const slider = page.getByRole('slider', { name: 'Version timeline' })
+      const firstIndex = await slider.getAttribute('max')
+      await expect(page.getByRole('article', { name: 'Version preview' })).toContainText('First saved text.')
+      await page.getByRole('button', { name: 'Close history' }).click()
+      await page.getByRole('textbox', { name: 'Markdown content', exact: true }).fill('Later saved text must remain recoverable.')
+      await page.keyboard.press('Control+s')
+      await page.getByRole('button', { name: 'Version history', exact: true }).click()
+      const lastIndex = Number(await slider.getAttribute('max'))
+      expect(lastIndex).toBeGreaterThan(Number(firstIndex))
+      await slider.fill(firstIndex!)
+      await expect(page.getByRole('article', { name: 'Version preview' })).toContainText('First saved text.')
+      await expect(page.getByRole('textbox', { name: 'Markdown content', exact: true })).toHaveCount(0)
+      await page.getByRole('button', { name: 'Play history' }).click()
+      await expect(slider).toHaveValue(String(lastIndex))
+      await expect(page.getByRole('button', { name: 'Play history' })).toBeVisible()
+      await slider.fill(firstIndex!)
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+      await page.screenshot({ path: test.info().outputPath(`history-${viewport.width}.png`), fullPage: true })
+      await page.getByRole('button', { name: 'Restore this version' }).click()
+      await expect(page.getByRole('textbox', { name: 'Markdown content', exact: true })).toHaveValue('First saved text.')
+      await page.keyboard.press('Control+s')
+      await expect(page.getByTitle('Save changes')).toContainText('Saved on this device')
+      await page.reload()
+      await expect(page.getByRole('textbox', { name: 'Markdown content', exact: true })).toHaveValue('First saved text.')
+      await page.getByRole('button', { name: 'Version history', exact: true }).click()
+      expect(Number(await slider.getAttribute('max'))).toBeGreaterThan(lastIndex)
+      await slider.fill(String(lastIndex))
+      await expect(page.getByRole('article', { name: 'Version preview' })).toContainText('Later saved text must remain recoverable.')
+      expect(errors).toEqual([])
+    } finally { await context.close() }
+  })
+}

@@ -7,6 +7,7 @@ import type { Note, NoteRecord } from './lib/notes'
 import App from './App'
 import { IDBFactory } from 'fake-indexeddb'
 import { closeLocalNotebook } from './lib/local-notebook'
+import { initializeNote } from './lib/crdt'
 
 configure({ asyncUtilTimeout: 3000 })
 
@@ -118,10 +119,11 @@ beforeEach(async () => {
   mocks.discardSession.mockResolvedValue(undefined)
   mocks.signOut.mockResolvedValue(undefined)
   mocks.listNotes.mockResolvedValue(savedNotebook())
-  mocks.createNote.mockImplementation(() => ({
+  mocks.createNote.mockImplementation((text: Partial<Pick<Note, 'title' | 'content' | 'folder'>> = {}) => initializeNote({
     id: 'de0671c0-3626-483a-a482-817e8fae2bc8',
     title: 'Untitled note',
     content: '',
+    ...text,
     createdAt: '2026-10-01T12:00:00.000Z',
     updatedAt: '2026-10-01T12:00:00.000Z',
   }))

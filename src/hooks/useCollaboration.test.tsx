@@ -3,7 +3,7 @@ import { webcrypto } from 'node:crypto'
 import { act, cleanup, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useCollaboration } from './useCollaboration'
-import { initializeNote } from '../lib/crdt'
+import { initializeNote, listNoteVersions, readNoteVersion } from '../lib/crdt'
 import { createSharedNote, joinSharedNote, SharedNoteDocument } from '../lib/shared-note'
 import type { CollaborationCallbacks, StoredRoom } from '../lib/collaboration'
 import { decodePresence } from '../lib/collaboration/presence'
@@ -54,6 +54,39 @@ async function setup(presenceSupported = true, remapNotes = false) {
 }
 
 describe('collaboration cursor hook', () => {
+  it('restores against the latest live text and retains unseen peer work as a private version', async () => {
+    const { result, peer, shared } = await setup()
+    const originalId = listNoteVersions(shared)[0].id
+    peer.edit({ content: 'Peer work received before React renders' })
+    await act(async () => { await callbacks.onMessage(new Uint8Array([1, ...peer.getUpdate()])) })
+    let restored = shared
+    act(() => { restored = result.current.restoreVersion(shared, originalId) })
+    expect(restored.content).toBe(shared.content)
+    const versions = listNoteVersions(restored)
+    expect(versions).toHaveLength(3)
+    expect(readNoteVersion(restored, versions[1].id).content).toBe('Peer work received before React renders')
+    expect(versions.at(-1)?.restoredFrom).toBe(originalId)
+    const update = mocks.send.mock.calls.findLast(([message]) => message[0] === 1)![0].subarray(1)
+    peer.applyPeerUpdate(update)
+    expect(peer.note.content).toBe(shared.content)
+    expect(listNoteVersions(peer.note)).toHaveLength(1)
+    peer.destroy()
+  })
+
+  it('keeps checkpoints private and preserves them across later live edits', async () => {
+    const { result, peer, shared } = await setup()
+    let changed = shared
+    act(() => { changed = result.current.edit(shared, { content: 'Saved locally' }) })
+    mocks.send.mockClear()
+    act(() => { changed = result.current.checkpoint(changed) })
+    expect(mocks.send).not.toHaveBeenCalled()
+    expect(listNoteVersions(changed)).toHaveLength(2)
+    act(() => { changed = result.current.edit(changed, { content: 'Next text' }) })
+    expect(listNoteVersions(changed)).toHaveLength(2)
+    expect(readNoteVersion(changed, listNoteVersions(changed)[1].id).content).toBe('Saved locally')
+    peer.destroy()
+  })
+
   it('clears a stale connection error on manual retry without restarting a stopped room', async () => {
     const { result, peer } = await setup()
     act(() => { callbacks.onError(new Error('Signaling is disconnected')) })

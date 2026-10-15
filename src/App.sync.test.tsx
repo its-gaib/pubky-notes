@@ -5,7 +5,7 @@ import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Session } from '@synonymdev/pubky'
 import App from './App'
-import { editNote, initializeNote, LineageConflictError } from './lib/crdt'
+import { checkpointNote, editNote, initializeNote, LineageConflictError, listNoteVersions, noteRevision, readNoteVersion } from './lib/crdt'
 import type { Note, NoteRecord } from './lib/notes'
 import { GUEST_SCOPE, scopeForSession } from './lib/notebook-sync'
 import { acknowledgeLocalNote, adoptGuestNotebook, closeLocalNotebook, readLocalNotebook, setLocalActiveId, writeLocalNote } from './lib/local-notebook'
@@ -123,6 +123,79 @@ afterEach(async () => {
 })
 
 describe('durable local notes and account synchronization', () => {
+  it('browses versions without saving and restores text as a new version while preserving metadata', async () => {
+    const original = row('History note', 'Earlier text')
+    const latest: NoteRecord = { ...original, note: checkpointNote(editNote(original.note, { content: 'Latest text', folder: 'Private folder' })) }
+    latest.published = { ...original.note, crdt: undefined }
+    await writeLocalNote(GUEST_SCOPE, latest)
+    render(<App />)
+    await readyGuest()
+    await screen.findByDisplayValue('Latest text')
+    fireEvent.click(screen.getByRole('button', { name: 'Version history' }))
+    const before = await readLocalNotebook(GUEST_SCOPE)
+    const revision = noteRevision(before.records[0].note)
+    mocks.localWriteStarted.mockClear()
+    fireEvent.change(screen.getByRole('slider', { name: 'Version timeline' }), { target: { value: '0' } })
+    expect(within(screen.getByRole('article', { name: 'Version preview' })).getByText('Earlier text')).toBeTruthy()
+    expect(noteRevision((await readLocalNotebook(GUEST_SCOPE)).records[0].note)).toBe(revision)
+    expect(mocks.localWriteStarted).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Close history' }))
+    expect(content()).toBe('Latest text')
+    fireEvent.click(screen.getByRole('button', { name: 'Version history' }))
+    fireEvent.change(screen.getByRole('slider', { name: 'Version timeline' }), { target: { value: '0' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Restore this version' }))
+    expect(content()).toBe('Earlier text')
+    await waitFor(async () => {
+      const restored = (await readLocalNotebook(GUEST_SCOPE)).records[0]
+      expect(restored.note.content).toBe('Earlier text')
+      expect(restored.note.folder).toBe('Private folder')
+      expect(restored.note.crdt?.lineage).toBe(latest.note.crdt?.lineage)
+      expect(restored.published).toEqual(latest.published)
+      const versions = listNoteVersions(restored.note)
+      expect(versions).toHaveLength(3)
+      expect(readNoteVersion(restored.note, versions[1].id).content).toBe('Latest text')
+      expect(versions[2].restoredFrom).toBe(versions[0].id)
+    })
+    expect(mocks.publish).not.toHaveBeenCalled()
+  })
+
+  it('records saved versions after an idle pause and flushes pending text before switching notes', async () => {
+    await writeLocalNote(GUEST_SCOPE, row('First history', 'Initial'))
+    await writeLocalNote(GUEST_SCOPE, row('Second history', 'Second'))
+    await setLocalActiveId(GUEST_SCOPE, 'First-history')
+    render(<App />)
+    await readyGuest()
+    changeContent('Paused text')
+    await waitFor(async () => {
+      const first = (await readLocalNotebook(GUEST_SCOPE)).records.find(row => row.note.id === 'First-history')!
+      expect(listNoteVersions(first.note)).toHaveLength(2)
+    })
+    changeContent('Saved on switching')
+    fireEvent.click(screen.getByRole('button', { name: 'Open note Second history' }))
+    await screen.findByDisplayValue('Second')
+    const first = (await readLocalNotebook(GUEST_SCOPE)).records.find(row => row.note.id === 'First-history')!
+    expect(listNoteVersions(first.note)).toHaveLength(3)
+    expect(readNoteVersion(first.note, listNoteVersions(first.note).at(-1)!.id).content).toBe('Saved on switching')
+  })
+
+  it('closes history and stops playback when leaving an account', async () => {
+    const original = row('Account history', 'Private earlier text')
+    const latest: NoteRecord = { ...original, note: checkpointNote(editNote(original.note, { content: 'Private current text' })) }
+    await writeLocalNote(scopeForSession(alice), latest)
+    mocks.restore.mockResolvedValue(alice)
+    mocks.list.mockResolvedValue([latest])
+    render(<App />)
+    await screen.findByDisplayValue('Private current text')
+    await screen.findByText('Saved to Pubky')
+    fireEvent.click(screen.getByRole('button', { name: 'Version history' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Play history' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Disconnect from Pubky' }))
+    await screen.findByText('Disconnected. Your account notes remain saved on this device.')
+    expect(screen.queryByRole('region', { name: 'Note history' })).toBeNull()
+    expect(screen.queryByText('Private earlier text')).toBeNull()
+    expect((await readLocalNotebook(GUEST_SCOPE)).records).toEqual([])
+  })
+
   it('keeps an untouched sample ephemeral, then restores an edited guest draft after a reload', async () => {
     const view = render(<App />)
     await readyGuest()

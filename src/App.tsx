@@ -2,12 +2,13 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import type { ChangeEvent, CSSProperties, DragEvent, ReactNode } from 'react'
 import type { Session } from '@synonymdev/pubky'
 import QRCode from 'qrcode'
-import { ArrowDownToLine, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight, Code2, Copy, FileText, Folder, Globe2, Heading2, Link, List, LoaderCircle, LockKeyhole, PenLine, Plus, Search, Trash2, X, MoreHorizontal, FolderPlus, Bold, Italic, Quote, ExternalLink, UsersRound } from 'lucide-react'
+import { ArrowDownToLine, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight, Code2, Copy, FileText, Folder, Globe2, Heading2, History, Link, List, LoaderCircle, LockKeyhole, PenLine, Plus, Search, Trash2, X, MoreHorizontal, FolderPlus, Bold, Italic, Quote, ExternalLink, UsersRound } from 'lucide-react'
 import Markdown from './components/Markdown'
 import AccountProfile from './components/AccountProfile'
 import RemoteSelection from './components/RemoteSelection'
 import CollaborationPanel, { collaborationStatusLabel } from './components/CollaborationPanel'
 import SidebarResizeHandle from './components/SidebarResizeHandle'
+import HistoryPanel from './components/HistoryPanel'
 import { IS_TESTNET } from './config'
 import { discardSession, persistSession, restoreSession, signOut, startSignIn } from './lib/pubky'
 import type { AuthFlow } from './lib/pubky'
@@ -16,7 +17,7 @@ import type { Note, NoteRecord } from './lib/notes'
 import { filterNotes, folderContains, folderLabel, folderPaths, normalizeFolder, renameFolderPath } from './lib/folders'
 import { loadFolders, normalizeFolderPaths } from './lib/folder-store'
 import { folderMoveTarget, isEmptyFolder, planFolderRelocation } from './lib/folder-operations'
-import { editNote, initializeNote, LineageConflictError, mergeNotes, noteRevision } from './lib/crdt'
+import { editNote, initializeNote, LineageConflictError, listNoteVersions, mergeNotes, noteRevision, readNoteVersion } from './lib/crdt'
 import { adoptGuestNotebook, readLocalNotebook, resolveLocalNoteDestination, setLocalActiveId, writeLocalFolders, writeLocalNote } from './lib/local-notebook'
 import type { LocalNotebook } from './lib/local-notebook'
 import { GUEST_SCOPE, mergeRemoteNotebook, scopeForSession, synchronizeNotebook, uploadNotebook } from './lib/notebook-sync'
@@ -50,7 +51,7 @@ function savedLayout() {
 }
 
 function scratchpad(): NoteRecord {
-  return { note: editNote(initializeNote(createNote()), { title: 'Markdown basics', content: SAMPLE_MARKDOWN }), published: null }
+  return { note: createNote({ title: 'Markdown basics', content: SAMPLE_MARKDOWN }), published: null }
 }
 function errorMessage(error: unknown) {
   const name = error instanceof Error ? error.name : ''
@@ -170,6 +171,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   const [toast, setToast] = useState<{ message: string; error?: boolean } | null>(null)
   const [modal, setModal] = useState<'auth' | 'share' | 'delete' | 'help' | null>(null)
   const [collaborationOpen, setCollaborationOpen] = useState(false)
+  const [historyIdentity, setHistoryIdentity] = useState<string | null>(null)
   const [authUrl, setAuthUrl] = useState('')
   const [qr, setQr] = useState('')
   const [authError, setAuthError] = useState('')
@@ -220,6 +222,13 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     ? canOpenRoute && !routeLoading ? records.find(row => row.note.id === route.id && row.note.id !== exampleId.current) : undefined
     : route.kind === 'home' ? records.find(row => row.note.id === activeId) ?? records.find(row => !row.note.deleted) : undefined
   const note = active?.note
+  const noteIdentity = note ? historyKey(scope, note) : null
+  const historyOpen = !!noteIdentity && historyIdentity === noteIdentity
+  const history = useMemo(() => {
+    try { return { entries: historyOpen && note ? listNoteVersions(note) : [], error: '' } }
+    catch (error) { return { entries: [], error: errorMessage(error) } }
+  }, [historyOpen, note])
+  useEffect(() => { setHistoryIdentity(previous => previous === noteIdentity ? previous : null) }, [noteIdentity])
   const owner = session?.info.publicKey.z32() ?? (scope !== GUEST_SCOPE ? scope.split(':')[1] : '')
   const receiveProfileName = useCallback((profileOwner: string, name: string) => setProfileName({ owner: profileOwner, name }), [])
   const notice = useCallback((message: string, error = false) => setToast({ message, error }), [])
@@ -351,7 +360,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   const selectionKeeper = useMemo(() => new EditorSelectionKeeper({ scope: () => scopeRef.current, activeId: () => activeIdRef.current,
     content: () => editor.current, title: () => titleEditor.current }), [])
   useLayoutEffect(() => { selectionKeeper.flush() }, [selectionKeeper, note?.content, note?.title])
-  useEffect(() => { selectionKeeper.invalidate(); return () => selectionKeeper.invalidate() }, [selectionKeeper, scope, note?.id, mode])
+  useEffect(() => { selectionKeeper.invalidate(); return () => selectionKeeper.invalidate() }, [selectionKeeper, scope, note?.id, mode, historyOpen])
   useEffect(() => {
     // A delayed remote update must never undo a newer keyboard, pointer, or input action.
     const changed = (event: Event) => {
@@ -372,23 +381,58 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     persist: persistCollaborativeNote, beforeRemoteChange: beforeCollaborativeChange })
   useLayoutEffect(() => {
     const element = editor.current
-    if (note && element && mode === 'write' && !note.deleted && !busy && !initializing && !modal && !(mobileViewport && menuOpen) && document.activeElement === element) {
+    if (note && element && !historyOpen && mode === 'write' && !note.deleted && !busy && !initializing && !modal && !(mobileViewport && menuOpen) && document.activeElement === element) {
       collaboration.updateSelection(note.id, { field: 'content', start: element.selectionStart, end: element.selectionEnd, direction: element.selectionDirection })
     }
-  }, [note?.content, note?.id, mode, busy, initializing, modal, mobileViewport, menuOpen, collaboration.updateSelection])
+  }, [note?.content, note?.id, mode, historyOpen, busy, initializing, modal, mobileViewport, menuOpen, collaboration.updateSelection])
   useEffect(() => {
-    if (note && (mode !== 'write' || note.deleted || busy || initializing || modal || (mobileViewport && menuOpen))) collaboration.updateSelection(note.id, null)
-  }, [mode, note?.id, note?.deleted, busy, initializing, modal, mobileViewport, menuOpen, collaboration.updateSelection])
+    if (note && (historyOpen || mode !== 'write' || note.deleted || busy || initializing || modal || (mobileViewport && menuOpen))) collaboration.updateSelection(note.id, null)
+  }, [mode, historyOpen, note?.id, note?.deleted, busy, initializing, modal, mobileViewport, menuOpen, collaboration.updateSelection])
   useEffect(() => { if (collaboration.invitation && !initializing) setCollaborationOpen(true) }, [collaboration.invitation, initializing])
   useEffect(() => { if (collaboration.view.request || collaboration.view.status?.issue) setCollaborationOpen(true) }, [collaboration.view.request, collaboration.view.status?.issue])
   useEffect(() => { if (collaboration.view.status?.state === 'connected') setCollaborationOpen(false) }, [collaboration.view.status?.state])
+  const checkpointHistory = useCallback(() => {
+    const capturedScope = scopeRef.current
+    const changed: NoteRecord[] = []
+    const next = recordsRef.current.map(row => {
+      if (row.note.id === exampleId.current) return row
+      try {
+        const checkpointed = collaboration.checkpoint(row.note)
+        if (noteRevision(checkpointed) === noteRevision(row.note)) return row
+        const updated = { ...row, note: checkpointed }
+        changed.push(updated)
+        return updated
+      } catch (error) {
+        // History capacity must not prevent flushing durable text, switching
+        // notes, or leaving an account. Keep every existing version intact.
+        notice(`Could not save a version of “${row.note.title || 'Untitled note'}”: ${errorMessage(error)}`, true)
+        return row
+      }
+    })
+    if (changed.length) {
+      replaceRecords(next)
+      for (const row of changed) void persistRecord(row, capturedScope).catch(error => {
+        if (scopeRef.current === capturedScope) notice(errorMessage(error), true)
+      })
+    }
+  }, [collaboration.checkpoint, replaceRecords, persistRecord, notice])
+  useEffect(() => {
+    if (initializing || restoringNotebook) return
+    const save = () => { try { checkpointHistory() } catch (error) { notice(errorMessage(error), true) } }
+    const pending = setTimeout(save, 1000)
+    const hidden = () => { if (document.visibilityState === 'hidden') save() }
+    document.addEventListener('visibilitychange', hidden)
+    window.addEventListener('pagehide', save)
+    return () => { clearTimeout(pending); document.removeEventListener('visibilitychange', hidden); window.removeEventListener('pagehide', save) }
+  }, [records, initializing, restoringNotebook, checkpointHistory, notice])
   const flushLocal = useCallback(async () => {
+    checkpointHistory()
     await localQueue.current
     for (const { scope: savedScope, record } of [...dirtyLocal.current.values()]) await persistRecord(record, savedScope)
     const pendingFolders = dirtyFolders.current
     if (pendingFolders) await persistFolders(pendingFolders.folders, pendingFolders.scope)
     await localQueue.current
-  }, [persistRecord, persistFolders])
+  }, [persistRecord, persistFolders, checkpointHistory])
   const displayNotebook = useCallback((notebook: LocalNotebook, capturedScope: string, replace = false, preferredId?: string) => {
     if (scopeRef.current !== capturedScope) return
     const current = replace ? [] : recordsRef.current.filter(row => row.note.id !== exampleId.current)
@@ -547,7 +591,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   }, [flush, notice])
 
   function edit(patch: Partial<Pick<Note, 'title' | 'content'>>) {
-    if (!note || note.deleted || busy || initializing) return
+    if (!note || note.deleted || busy || initializing || historyOpen) return
     try {
       const next = collaboration.edit(note, patch)
       const row = { ...active!, note: next }
@@ -559,13 +603,37 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     } catch (error) { notice(errorMessage(error), true) }
   }
   function shareEditorSelection(element: HTMLTextAreaElement) {
-    if (!note || note.deleted || busy || initializing || mode !== 'write' || document.activeElement !== element) return
+    if (!note || note.deleted || busy || initializing || historyOpen || mode !== 'write' || document.activeElement !== element) return
     collaboration.updateSelection(note.id, { field: 'content', start: element.selectionStart, end: element.selectionEnd, direction: element.selectionDirection })
+  }
+  function openHistory() {
+    if (!note || busy || initializing || note.id === exampleId.current) return
+    if (historyOpen) { setHistoryIdentity(null); return }
+    try {
+      checkpointHistory()
+      setHistoryIdentity(historyKey(scope, note))
+      collaboration.updateSelection(note.id, null)
+    } catch (error) { notice(errorMessage(error), true) }
+  }
+  function restoreHistoryVersion(id: string) {
+    if (!note || !historyOpen || busyRef.current || initializing || scopeRef.current !== scope || activeIdRef.current !== note.id) return
+    try {
+      const latest = recordsRef.current.find(row => sameHistory(row.note, note))
+      if (!latest || latest.note.deleted || historyKey(scopeRef.current, latest.note) !== historyIdentity) return
+      // Resolve against the current scoped record, never against preview text.
+      // The synchronous edit saves the latest version before replacing text.
+      const changed = collaboration.restoreVersion(latest.note, id)
+      const row = { ...latest, note: changed }
+      replaceRecords(recordsRef.current.map(current => current.note.id === changed.id ? row : current))
+      void persistRecord(row, scope).catch(error => { if (scopeRef.current === scope) notice(errorMessage(error), true) })
+      setHistoryIdentity(null)
+      notice('Version restored. Later edits remain in history.')
+    } catch (error) { notice(errorMessage(error), true) }
   }
   async function addNote(imported?: { title: string; content: string }) {
     try {
       await flushLocal()
-      const draft = editNote(initializeNote(createNote()), { content: SAMPLE_MARKDOWN, folder: selectedFolder || '', ...(imported ?? {}) })
+      const draft = createNote({ content: SAMPLE_MARKDOWN, folder: selectedFolder || '', ...(imported ?? {}) })
       const row = { note: draft, published: null }
       replaceRecords([row, ...recordsRef.current.filter(existing => existing.note.id !== exampleId.current)]); exampleId.current = null
       activeIdRef.current = draft.id; setActiveId(draft.id); setMode('write'); setQuery(''); setNotebookView('notes'); setMenuOpen(false)
@@ -1117,9 +1185,9 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     </aside>{!mobileViewport && !sidebarCollapsed && <SidebarResizeHandle label="Resize sidebar" controls="notebook-navigation" width={fittedLayout.width} min={SIDEBAR_LIMITS.min} max={fittedLayout.maxWidth} defaultWidth={SIDEBAR_LIMITS.default} onResize={resizeSidebar} />}<button className="pane-toggle navigation-edge" aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'} title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'} aria-controls="notebook-navigation" aria-expanded={!sidebarCollapsed} onClick={() => mobileViewport ? setMenuOpen(current => !current) : setLayout(current => ({ ...current, collapsed: !current.collapsed }))}>{sidebarCollapsed ? <ChevronRight size={17} /> : <ChevronLeft size={17} />}</button></div>
     <main className="editor-panel">
       {(routeLoading || routeIssue || (!note && initializing)) && collaborationPanel}
-      {routeLoading ? <div className="empty-state editor-empty"><LoaderCircle className="spin" aria-label="Loading note" /><p>Opening note…</p></div> : routeIssue ? <div className="empty-state editor-empty"><LockKeyhole size={30} /><h2>{routeIssue.title}</h2><p>{routeIssue.message}</p><div className="modal-actions">{route.kind === 'private' && !ownsPrivateRoute && <button className="button primary" disabled={locked} onClick={() => void connect()}>Connect Pubky</button>}{requestedNote && canOpenRoute && <button className="button secondary" disabled={locked} onClick={() => void retryNoteLink()}>Retry</button>}<button className="button secondary" onClick={openNotebook}>Open your notebook</button></div></div> : note ? <><div className="editor-topbar"><div className="note-location"><div className="mode-switch"><button className={mode === 'write' ? 'active' : ''} onClick={() => setMode('write')}><PenLine size={14} /> Write</button><button className={mode === 'preview' ? 'active' : ''} onClick={() => setMode('preview')}><BookOpen size={14} /> Preview</button></div></div>{mode === 'write' && <div className="formatting-toolbar" aria-label="Markdown formatting">{[{ icon: Bold, title: 'Bold', before: '**', after: '**' }, { icon: Italic, title: 'Italic', before: '_', after: '_' }, { icon: Heading2, title: 'Heading', before: '\n## ', after: '' }, { icon: List, title: 'List', before: '\n- ', after: '' }, { icon: Quote, title: 'Quote', before: '\n> ', after: '' }, { icon: Code2, title: 'Code', before: '`', after: '`' }, { icon: Link, title: 'Link', before: '[', after: '](https://)' }].map(item => <button key={item.title} className="icon-button" aria-label={item.title} title={item.title} disabled={locked || note.deleted} onClick={() => format(item.before, item.after)}><item.icon size={16} /></button>)}</div>}<div className="editor-actions">{session && <span className={`visibility-badge ${active?.published ? 'public' : ''}`}>{active?.published ? <Globe2 size={13} /> : <LockKeyhole size={13} />}{active?.published ? 'Public copy' : 'Private'}</span>}{note.id !== exampleId.current && <button className="icon-button" onClick={() => void copyNoteLink()} disabled={locked} aria-label="Copy note link" title="Copy note link"><Link size={16} /></button>}{note.content === SAMPLE_MARKDOWN && <button className="icon-button" onClick={() => void copy(SAMPLE_MARKDOWN)} aria-label="Copy Markdown" title="Copy Markdown"><Copy size={16} /></button>}<button className="button ghost small" onClick={() => download(note)} aria-label="Export Markdown" title="Export Markdown"><ArrowDownToLine size={16} /></button>{note.deleted && <button className="button secondary small" disabled={locked} onClick={() => void restoreNote(note.id)}>Restore</button>}<button className="button secondary small collaboration-button" onClick={() => setCollaborationOpen(current => !current)} aria-expanded={collaborationOpen} aria-controls="collaboration-panel" disabled={locked || note.deleted} aria-label="Collaborate"><UsersRound size={15} /><span>Collaborate</span></button><button className="button secondary small" onClick={() => setModal('share')} disabled={locked || note.deleted}><Globe2 size={14} /> Share</button><button className="icon-button" onClick={() => setModal('delete')} disabled={locked || note.deleted} aria-label="Delete note"><Trash2 size={16} /></button></div></div>
+      {routeLoading ? <div className="empty-state editor-empty"><LoaderCircle className="spin" aria-label="Loading note" /><p>Opening note…</p></div> : routeIssue ? <div className="empty-state editor-empty"><LockKeyhole size={30} /><h2>{routeIssue.title}</h2><p>{routeIssue.message}</p><div className="modal-actions">{route.kind === 'private' && !ownsPrivateRoute && <button className="button primary" disabled={locked} onClick={() => void connect()}>Connect Pubky</button>}{requestedNote && canOpenRoute && <button className="button secondary" disabled={locked} onClick={() => void retryNoteLink()}>Retry</button>}<button className="button secondary" onClick={openNotebook}>Open your notebook</button></div></div> : note ? <><div className="editor-topbar"><div className="note-location"><div className="mode-switch"><button className={mode === 'write' ? 'active' : ''} onClick={() => { setHistoryIdentity(null); setMode('write') }}><PenLine size={14} /> Write</button><button className={mode === 'preview' ? 'active' : ''} onClick={() => { setHistoryIdentity(null); setMode('preview') }}><BookOpen size={14} /> Preview</button></div></div>{mode === 'write' && !historyOpen && <div className="formatting-toolbar" aria-label="Markdown formatting">{[{ icon: Bold, title: 'Bold', before: '**', after: '**' }, { icon: Italic, title: 'Italic', before: '_', after: '_' }, { icon: Heading2, title: 'Heading', before: '\n## ', after: '' }, { icon: List, title: 'List', before: '\n- ', after: '' }, { icon: Quote, title: 'Quote', before: '\n> ', after: '' }, { icon: Code2, title: 'Code', before: '`', after: '`' }, { icon: Link, title: 'Link', before: '[', after: '](https://)' }].map(item => <button key={item.title} className="icon-button" aria-label={item.title} title={item.title} disabled={locked || note.deleted} onClick={() => format(item.before, item.after)}><item.icon size={16} /></button>)}</div>}<div className="editor-actions">{session && <span className={`visibility-badge ${active?.published ? 'public' : ''}`}>{active?.published ? <Globe2 size={13} /> : <LockKeyhole size={13} />}{active?.published ? 'Public copy' : 'Private'}</span>}{note.id !== exampleId.current && <button className="icon-button" onClick={() => void copyNoteLink()} disabled={locked} aria-label="Copy note link" title="Copy note link"><Link size={16} /></button>}{note.content === SAMPLE_MARKDOWN && <button className="icon-button" onClick={() => void copy(SAMPLE_MARKDOWN)} aria-label="Copy Markdown" title="Copy Markdown"><Copy size={16} /></button>}<button className="button ghost small" onClick={() => download(note)} aria-label="Export Markdown" title="Export Markdown"><ArrowDownToLine size={16} /></button>{note.deleted && <button className="button secondary small" disabled={locked} onClick={() => void restoreNote(note.id)}>Restore</button>}{note.id !== exampleId.current && <button className="icon-button" onClick={openHistory} disabled={locked} aria-label="Version history" title="Version history" aria-expanded={historyOpen}><History size={17} /></button>}<button className="button secondary small collaboration-button" onClick={() => setCollaborationOpen(current => !current)} aria-expanded={collaborationOpen} aria-controls="collaboration-panel" disabled={locked || note.deleted} aria-label="Collaborate"><UsersRound size={15} /><span>Collaborate</span></button><button className="button secondary small" onClick={() => setModal('share')} disabled={locked || note.deleted}><Globe2 size={14} /> Share</button><button className="icon-button" onClick={() => setModal('delete')} disabled={locked || note.deleted} aria-label="Delete note"><Trash2 size={16} /></button></div></div>
       {collaborationPanel}
-      <div className="editor-content"><input ref={titleEditor} className="note-title-input" aria-label="Note title" placeholder="Untitled note" value={note.title} maxLength={200} disabled={locked || note.deleted} onChange={event => edit({ title: event.target.value })} />{mode === 'write' ? <div className="collaborative-editor"><textarea ref={editor} className="markdown-editor" aria-label="Markdown content" placeholder="Write a note…" value={note.content} disabled={locked || note.deleted} onChange={event => { const changed = edit({ content: event.target.value }); if (changed?.content === event.currentTarget.value) shareEditorSelection(event.currentTarget) }} onFocus={event => shareEditorSelection(event.currentTarget)} onSelect={event => shareEditorSelection(event.currentTarget)} onKeyUp={event => shareEditorSelection(event.currentTarget)} onClick={event => shareEditorSelection(event.currentTarget)} onBlur={() => collaboration.updateSelection(note.id, null)} spellCheck /><RemoteSelection textarea={editor} content={note.content} selection={collaboration.remoteSelection?.noteId === note.id && !note.deleted ? { ...collaboration.remoteSelection, direction: collaboration.remoteSelection.direction ?? 'none' } : null} /></div> : <Markdown content={note.content} />}</div>
+      {historyOpen ? history.error ? <div className="editor-content"><p role="alert">{history.error}</p><button className="button secondary" onClick={() => setHistoryIdentity(null)}>Close history</button></div> : <HistoryPanel key={noteIdentity!} entries={history.entries} current={note} readVersion={id => readNoteVersion(note, id)} disabled={locked || !!note.deleted} restore={restoreHistoryVersion} close={() => setHistoryIdentity(null)} /> : <div className="editor-content"><input ref={titleEditor} className="note-title-input" aria-label="Note title" placeholder="Untitled note" value={note.title} maxLength={200} disabled={locked || note.deleted} onChange={event => edit({ title: event.target.value })} />{mode === 'write' ? <div className="collaborative-editor"><textarea ref={editor} className="markdown-editor" aria-label="Markdown content" placeholder="Write a note…" value={note.content} disabled={locked || note.deleted} onChange={event => { const changed = edit({ content: event.target.value }); if (changed?.content === event.currentTarget.value) shareEditorSelection(event.currentTarget) }} onFocus={event => shareEditorSelection(event.currentTarget)} onSelect={event => shareEditorSelection(event.currentTarget)} onKeyUp={event => shareEditorSelection(event.currentTarget)} onClick={event => shareEditorSelection(event.currentTarget)} onBlur={() => collaboration.updateSelection(note.id, null)} spellCheck /><RemoteSelection textarea={editor} content={note.content} selection={collaboration.remoteSelection?.noteId === note.id && !note.deleted ? { ...collaboration.remoteSelection, direction: collaboration.remoteSelection.direction ?? 'none' } : null} /></div> : <Markdown content={note.content} />}</div>}
       <footer className="editor-bottom"><button className={`save-status ${status === 'Not saved on this device' ? 'save-error' : ''}`} onClick={() => void flush().catch(error => notice(errorMessage(error), true))} title="Save changes">{status === 'Saving on this device…' || status === 'Syncing…' ? <LoaderCircle size={13} className="spin" /> : session ? <CheckCheck size={14} /> : <PenLine size={13} />}{status}</button>{collaboration.view.noteId && <button className="collaboration-status" onClick={() => setCollaborationOpen(current => !current)} aria-expanded={collaborationOpen} aria-controls="collaboration-panel"><UsersRound size={13} />{collaborationStatusLabel(collaboration.view)}</button>}<span>{words} words</span></footer></> : initializing ? <div className="empty-state editor-empty"><LoaderCircle className="spin" aria-label="Loading notes" /></div> : <><div className="editor-topbar"><div className="editor-actions">{collaboration.view.noteId && <button className="button secondary small" aria-label="Collaborate" aria-expanded={collaborationOpen} aria-controls="collaboration-panel" onClick={() => setCollaborationOpen(current => !current)}><UsersRound size={15} />{collaborationStatusLabel(collaboration.view)}</button>}<button className="button ghost small" onClick={() => void copy(SAMPLE_MARKDOWN)}><Copy size={16} /> Copy Markdown</button><button className="button secondary small" onClick={() => void addNote()} disabled={locked}><Plus size={16} /> New note</button></div></div>{collaborationPanel}<div className="editor-content"><h1 className="note-title-input">Markdown basics</h1><textarea className="markdown-editor" aria-label="Sample Markdown" readOnly value={SAMPLE_MARKDOWN} /></div></>}
     </main>
     <input type="file" accept=".md,.markdown,.txt,text/markdown,text/plain" ref={importer} hidden onChange={event => void importFile(event)} />

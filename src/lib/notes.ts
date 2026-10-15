@@ -20,9 +20,9 @@ const LOCK_SECONDS = 60
 type StorageSpace = keyof typeof APP_PATHS
 type Locks = Record<StorageSpace, StorageLock>
 
-export function createNote(): Note {
+export function createNote(text: Partial<Pick<Note, 'title' | 'content' | 'folder'>> = {}): Note {
   const now = new Date().toISOString()
-  return initializeNote({ id: crypto.randomUUID(), title: 'Untitled note', content: '', createdAt: now, updatedAt: now })
+  return initializeNote({ id: crypto.randomUUID(), title: 'Untitled note', content: '', ...text, createdAt: now, updatedAt: now })
 }
 
 export function notePath(space: StorageSpace, id: string): Path {

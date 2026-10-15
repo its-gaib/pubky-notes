@@ -1,6 +1,6 @@
 import * as Y from 'yjs'
 import {
-  decode, editPersonal, editText, encode, LineageConflictError, materializeSharedNote, mergeNotes, newPersonalDocument,
+  checkpointNote, decode, editPersonal, editText, encode, LineageConflictError, materializeSharedNote, mergeNotes, newPersonalDocument,
   personalDocumentOf, sharedDocumentOf, validateCrdtNote, validateFields, validateSharedUpdate,
 } from './crdt'
 import type { CrdtNote, NotePatch } from './crdt'
@@ -16,7 +16,7 @@ export function createSharedNote(source: CrdtNote): CrdtNote {
   doc.clientID = 0
   try {
     doc.transact(() => { doc.getText('title').insert(0, clean.title); doc.getText('content').insert(0, clean.content) })
-    return materializeSharedNote(doc, personal, { id: crypto.randomUUID(), title: clean.title, content: clean.content, createdAt: now, updatedAt: now }, `shared:${crypto.randomUUID()}`)
+    return checkpointNote(materializeSharedNote(doc, personal, { id: crypto.randomUUID(), title: clean.title, content: clean.content, createdAt: now, updatedAt: now }, `shared:${crypto.randomUUID()}`), { recordedAt: now })
   } finally { doc.destroy(); personal.destroy() }
 }
 
@@ -34,7 +34,8 @@ export function joinSharedNote(descriptor: SharedNoteDescriptor, update: Uint8Ar
     Y.applyUpdate(doc, update)
     // Joining requires a self-contained checkpoint, not unresolved operations whose base is missing.
     if (doc.store.pendingStructs || doc.store.pendingDs) throw new Error('The shared document checkpoint is incomplete.')
-    return materializeSharedNote(doc, personal, { id: descriptor.id, title: '', content: '', createdAt: descriptor.createdAt, updatedAt: new Date().toISOString() }, descriptor.lineage)
+    const now = new Date().toISOString()
+    return checkpointNote(materializeSharedNote(doc, personal, { id: descriptor.id, title: '', content: '', createdAt: descriptor.createdAt, updatedAt: now }, descriptor.lineage), { recordedAt: now })
   } finally { doc.destroy(); personal.destroy() }
 }
 

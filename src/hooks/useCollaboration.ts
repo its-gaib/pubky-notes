@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { CrdtNote, NotePatch } from '../lib/crdt'
-import { editNote, mergeNotes } from '../lib/crdt'
+import { checkpointNote, editNote, mergeNotes, readNoteVersion } from '../lib/crdt'
 import { createSharedNote, joinSharedNote, SharedNoteDocument, sharedNoteDescriptor } from '../lib/shared-note'
 import {
   createGuestRoom, createHostRoom, fingerprint, invitationUrl, loadRoom, parseInvitation, startCollaboration,
@@ -296,6 +296,28 @@ export function useCollaboration(options: Options) {
     if (previous !== next.crdt!.update) sendDifference(connection, before)
     return next
   }
+  const checkpoint = useCallback((note: CrdtNote): CrdtNote => {
+    const connection = live.current
+    if (!connection || !current(connection) || connection.doc?.note.id !== note.id) return checkpointNote(note)
+    const next = checkpointNote(mergeNotes(connection.doc.note, note))
+    return connection.doc.mergeLocal(next)
+  }, [current])
+  function restoreVersion(note: CrdtNote, id: string): CrdtNote {
+    const connection = live.current
+    const connected = connection && current(connection) && connection.doc?.note.id === note.id ? connection : null
+    // A restore deliberately replaces the latest text, including peer edits
+    // received before this click. Save that text first so it remains recoverable.
+    const currentNote = checkpointNote(connected ? mergeNotes(connected.doc!.note, note) : note)
+    const text = readNoteVersion(currentNote, id)
+    const next = checkpointNote(editNote(currentNote, text), { restoredFrom: id })
+    if (connected) {
+      const before = connected.doc!.getStateVector()
+      connected.doc!.mergeLocal(next)
+      connected.presence?.refresh()
+      sendDifference(connected, before)
+    }
+    return next
+  }
   async function approve() {
     const connection = live.current, request = view.request
     if (!connection || !request || !current(connection)) return
@@ -318,6 +340,6 @@ export function useCollaboration(options: Options) {
     if (!connection || !current(connection) || connection.room.descriptor.id !== noteId || latest.current.activeId !== noteId) return
     connection.presence?.update(selection)
   }, [current])
-  return { view, invitation, start, join, edit, approve, reject, stop, updateSelection, remoteSelection,
+  return { view, invitation, start, join, edit, checkpoint, restoreVersion, approve, reject, stop, updateSelection, remoteSelection,
     dismissInvitation: () => setInvitation(null), reconnect }
 }
