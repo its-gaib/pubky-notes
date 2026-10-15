@@ -131,8 +131,8 @@ export async function saveRoom(room: StoredRoom): Promise<void> {
 }
 
 /** A single transaction prevents two host tabs from admitting different guests. */
-export async function admitPeer(room: StoredRoom, publicKey: string): Promise<void> {
-  if (room.role !== 'host' || decodeBytes(publicKey, 65).length !== 65) throw new Error('Invalid collaborator admission')
+export async function admitPeer(room: StoredRoom, publicKey: string, owner: string): Promise<void> {
+  if (room.role !== 'host' || decodeBytes(publicKey, 65).length !== 65 || !/^[a-z0-9]{52}$/.test(owner)) throw new Error('Invalid collaborator admission')
   const db = await openDatabase()
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction('rooms', 'readwrite')
@@ -141,17 +141,43 @@ export async function admitPeer(room: StoredRoom, publicKey: string): Promise<vo
     let failure: Error | undefined
     request.onsuccess = () => {
       const current = request.result as StoredRoom | undefined
-      if (!current || current.room !== room.room || (current.approvedPeer && current.approvedPeer !== publicKey)) {
+      if (!current || current.room !== room.room || (current.approvedPeer && current.approvedPeer !== publicKey)
+        || (current.approvedPeerIdentity && current.approvedPeerIdentity !== owner)) {
         failure = new Error('This room already has a collaborator or was closed')
         tx.abort()
         return
       }
-      store.put({ ...current, approvedPeer: publicKey })
+      store.put({ ...current, approvedPeer: publicKey, approvedPeerIdentity: owner })
     }
     tx.oncomplete = () => resolve()
     tx.onabort = tx.onerror = () => reject(failure ?? tx.error ?? new Error('Unable to save collaborator admission'))
   })
   room.approvedPeer = publicKey
+  room.approvedPeerIdentity = owner
+}
+
+/** A host's account binding cannot silently change when its browser reconnects. */
+export async function pinHostIdentity(room: StoredRoom, owner: string): Promise<void> {
+  if (room.role !== 'guest' || !/^[a-z0-9]{52}$/.test(owner)) throw new Error('Invalid host identity')
+  const db = await openDatabase()
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction('rooms', 'readwrite')
+    const store = tx.objectStore('rooms')
+    const request = store.get([room.scope, room.descriptor.id])
+    let failure: Error | undefined
+    request.onsuccess = () => {
+      const current = request.result as StoredRoom | undefined
+      if (!current || current.room !== room.room || current.hostKey !== room.hostKey || (current.hostIdentity && current.hostIdentity !== owner)) {
+        failure = new Error('The host Pubky identity changed or this collaboration was closed')
+        tx.abort()
+        return
+      }
+      store.put({ ...current, hostIdentity: owner })
+    }
+    tx.oncomplete = () => resolve()
+    tx.onabort = tx.onerror = () => reject(failure ?? tx.error ?? new Error('Unable to save host identity'))
+  })
+  room.hostIdentity = owner
 }
 
 export async function deleteRoom(scope: string, noteId: string): Promise<void> {

@@ -6,7 +6,7 @@ const MAX_PLAINTEXT_BYTES = 32 * 1024
 const MAX_AGE = 60_000
 const encoder = new TextEncoder()
 
-export type SignalKind = 'hello' | 'offer' | 'answer' | 'ice' | 'reject'
+export type SignalKind = 'hello' | 'challenge' | 'identity' | 'offer' | 'answer' | 'ice' | 'reject'
 export interface Signal {
   version: 1
   room: string
@@ -45,7 +45,7 @@ function validateSignal(value: unknown): asserts value is Signal {
     || !exactKeys(value, 'from,kind,nonce,payload,role,room,sentAt,session,targetSession,to,version')) throw new Error('Invalid signaling message')
   const signal = value as Signal
   if (signal.version !== 1 || !['host', 'guest'].includes(signal.role)
-    || !['hello', 'offer', 'answer', 'ice', 'reject'].includes(signal.kind)
+    || !['hello', 'challenge', 'identity', 'offer', 'answer', 'ice', 'reject'].includes(signal.kind)
     || typeof signal.room !== 'string' || decodeBytes(signal.room, 24).length !== 24
     || typeof signal.from !== 'string' || decodeBytes(signal.from, 65).length !== 65
     || typeof signal.to !== 'string' || decodeBytes(signal.to, 65).length !== 65
@@ -54,7 +54,9 @@ function validateSignal(value: unknown): asserts value is Signal {
     || typeof signal.nonce !== 'string' || decodeBytes(signal.nonce, 16).length !== 16
     || !Number.isSafeInteger(signal.sentAt) || typeof signal.payload !== 'string'
     || encoder.encode(signal.payload).length > 24 * 1024) throw new Error('Invalid signaling message')
-  if ((signal.kind === 'hello' && (signal.role !== 'guest' || signal.targetSession !== '' || signal.payload !== ''))
+  if ((signal.kind === 'hello' && (signal.role !== 'guest' || signal.targetSession !== ''))
+    || (signal.kind === 'challenge' && signal.role !== 'host')
+    || (signal.kind === 'identity' && signal.role !== 'guest')
     || (signal.kind === 'offer' && signal.role !== 'host')
     || (signal.kind === 'answer' && signal.role !== 'guest')
     || (signal.kind === 'reject' && (signal.role !== 'host' || signal.payload !== ''))

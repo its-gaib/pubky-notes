@@ -1,4 +1,7 @@
-import { admitPeer, fingerprint, loadRoom, randomToken } from './credentials'
+import { admitPeer, decodeBytes, fingerprint, loadRoom, pinHostIdentity, randomToken } from './credentials'
+import { canonicalOwner, createIdentityProof, IDENTITY_FAILED_MESSAGE, IDENTITY_UNAVAILABLE_MESSAGE, PROOF_MAX_AGE_MS, verifyIdentityProof } from './identity'
+import type { IdentityContext, VerifiedIdentity } from './identity'
+import type { CustomPop } from '@synonymdev/pubky'
 import { frameMessage, MAX_MESSAGE_BYTES, MessageAssembler } from './framing'
 import { HttpRelaySocket } from './http-relay'
 import type { SignalingSocket } from './http-relay'
@@ -10,6 +13,9 @@ import type { CollaborationCallbacks, CollaborationOptions, CollaborationStatus,
 const STUN: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }]
 const SIGNAL_URL = import.meta.env.VITE_COLLAB_SIGNAL_URL || 'https://httprelay.pubky.app/inbox/'
 const DEFAULT_ICE_POLICY: RTCIceTransportPolicy = import.meta.env.VITE_COLLAB_RELAY_ONLY === 'true' ? 'relay' : 'all'
+
+export const WEBRTC_UNAVAILABLE_MESSAGE = 'Live collaboration requires WebRTC, which is disabled or unavailable in this browser. Tor Browser does not support this connection method. You can keep editing your private copy.'
+export function webRtcAvailable(): boolean { return typeof globalThis.RTCPeerConnection === 'function' }
 
 function errorFrom(value: unknown): Error {
   return value instanceof Error ? value : new Error('Collaboration connection failed')
@@ -42,6 +48,15 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
   let remoteSession = ''
   let remoteKey = ''
   let peerFingerprint: string | undefined
+  let peerIdentity: string | undefined
+  let localChallenge = randomToken(24)
+  let identityTimer: ReturnType<typeof setTimeout> | undefined
+  let verifiedPair: { key: string; session: string; localSession: string; owner: string; expiresAt: number } | undefined
+  let exchange: {
+    signal: Signal; localSession: string; challenge: string; guestChallenge: string; startedAt: number
+    ownProof?: CustomPop; ownIdentity?: VerifiedIdentity; reply?: string
+  } | undefined
+  const identity = options.identity ? { ...options.identity } : undefined
   let presenceSupported = false
   let pending: Signal | undefined
   let state: CollaborationStatus['state'] = 'connecting'
@@ -50,6 +65,10 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
   let configuration: RTCConfiguration = { iceServers: STUN, ...options.rtcConfiguration }
   let iceExpiresAt = 0
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined
+  let helloTimer: ReturnType<typeof setInterval> | undefined
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined
+  let networkStarted = false
+  let startupGeneration = 0
   let peerRetryTimer: ReturnType<typeof setTimeout> | undefined
   let connectionTimeout: ReturnType<typeof setTimeout> | undefined
   let socketAttempt = 0
@@ -69,11 +88,56 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
 
   function status(next: CollaborationStatus['state']) {
     state = next
-    if (!disposed) callbacks.onStatus({ state, relayAvailable, presenceSupported, ...(issue ? { issue } : {}), ...(peerFingerprint ? { peerFingerprint } : {}) })
+    if (!disposed) callbacks.onStatus({ state, relayAvailable, presenceSupported, ...(issue ? { issue } : {}), ...(peerFingerprint ? { peerFingerprint } : {}), ...(peerIdentity ? { peerIdentity } : {}) })
   }
 
   function report(error: unknown) {
     if (!disposed) callbacks.onError(errorFrom(error))
+  }
+
+  function proofContext(signal: Signal, challenge: string, own: boolean): IdentityContext {
+    return { room: room.room, descriptor: room.descriptor, role: own ? room.role : signal.role,
+      publicKey: own ? room.identity.publicKey : signal.from, peerKey: own ? signal.from : room.identity.publicKey,
+      session: own ? localSession : signal.session, peerSession: own ? signal.session : localSession, challenge }
+  }
+
+  function resetIdentity() {
+    clearTimeout(identityTimer)
+    identityTimer = undefined
+    verifiedPair = undefined
+    exchange = undefined
+    pending = undefined
+    peerIdentity = undefined
+    localChallenge = randomToken(24)
+  }
+
+  function identityValid() {
+    return !!verifiedPair && verifiedPair.localSession === localSession && verifiedPair.expiresAt > Date.now()
+  }
+
+  function bindIdentity(signal: Signal, other: VerifiedIdentity, own: VerifiedIdentity) {
+    verifiedPair = { key: signal.from, session: signal.session, localSession, owner: other.owner, expiresAt: Math.min(other.expiresAt, own.expiresAt) }
+    peerIdentity = other.owner
+    const pair = verifiedPair
+    const expire = () => {
+      if (disposed || verifiedPair !== pair) return
+      if (pair.expiresAt > Date.now()) { identityTimer = setTimeout(expire, Math.min(pair.expiresAt - Date.now(), 2_147_000_000)); return }
+      stopNetwork()
+      issue = 'identity-unavailable'
+      status('error')
+      report(new Error('Your collaboration identity authorization expired. Sign in again to reconnect.'))
+    }
+    clearTimeout(identityTimer)
+    expire()
+  }
+
+  function parseChallenge(payload: string): string {
+    const value: unknown = JSON.parse(payload)
+    if (!value || typeof value !== 'object' || Object.keys(value).join(',') !== 'challenge'
+      || typeof (value as { challenge?: unknown }).challenge !== 'string') throw new Error(IDENTITY_FAILED_MESSAGE)
+    const challenge = (value as { challenge: string }).challenge
+    if (decodeBytes(challenge, 24).length !== 24) throw new Error(IDENTITY_FAILED_MESSAGE)
+    return challenge
   }
 
   async function refreshIce() {
@@ -125,6 +189,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
   function retryPeer() {
     if (disposed) return
     closePeer()
+    resetIdentity()
     localSession = randomToken(16)
     status('disconnected')
     peerRetryTimer = setTimeout(() => {
@@ -136,7 +201,8 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
 
   function failedConnection() {
     if (disposed) return
-    issue = relayAvailable ? 'connection-failed' : 'direct-connection-failed'
+    issue = !peer?.localDescription || !peer.remoteDescription ? 'handshake-failed'
+      : relayAvailable ? 'connection-failed' : 'direct-connection-failed'
     retryPeer()
   }
 
@@ -155,14 +221,14 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
     if (disposed || denied || room.role !== 'guest' || channel?.readyState === 'open' || helloSending || socket?.readyState !== WebSocket.OPEN) return
     helloSending = true
     try {
-      await publish('hello', room.hostKey, '')
+      await publish('hello', room.hostKey, '', JSON.stringify({ challenge: localChallenge }))
       if (!disposed && !peer) status('waiting')
     } catch (error) { report(error) }
     finally { helloSending = false }
   }
 
   function markConnected(next: RTCDataChannel, connection: RTCPeerConnection) {
-    if (disposed || peer !== connection || channel !== next || next.readyState !== 'open') return
+    if (disposed || peer !== connection || channel !== next || next.readyState !== 'open' || !identityValid()) return
     clearTimeout(connectionTimeout)
     clearTimeout(peerRetryTimer)
     issue = undefined
@@ -170,7 +236,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
   }
 
   function attachChannel(next: RTCDataChannel, connection: RTCPeerConnection) {
-    if (disposed || peer !== connection || channel || next.label !== 'pubky-notes-v1' || !next.ordered || next.maxRetransmits !== null || next.maxPacketLifeTime !== null) {
+    if (disposed || peer !== connection || channel || !identityValid() || next.label !== 'pubky-notes-v1' || !next.ordered || next.maxRetransmits !== null || next.maxPacketLifeTime !== null) {
       next.close()
       return
     }
@@ -182,7 +248,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
     next.onclose = () => { if (!disposed && peer === connection && channel === next) retryPeer() }
     next.onerror = () => { if (!disposed && peer === connection) report(new Error('Collaboration data connection failed')) }
     next.onmessage = event => {
-      if (disposed || peer !== connection || channel !== next) return
+      if (disposed || peer !== connection || channel !== next || !identityValid()) return
       // Browsers may deliver an incoming channel already open, or deliver its
       // first data task before a queued open callback. Consumers must be able
       // to answer that first message instead of treating it as disconnected.
@@ -193,7 +259,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
         if (receivedQueuedBytes + message.length > MAX_MESSAGE_BYTES * 2) throw new Error('Collaboration receiver is overloaded')
         receivedQueuedBytes += message.length
         receiveQueue = receiveQueue.then(async () => {
-          if (!disposed && peer === connection && channel === next) await callbacks.onMessage(message)
+          if (!disposed && peer === connection && channel === next && identityValid()) await callbacks.onMessage(message)
         }).catch(error => {
           if (peer === connection) { report(error); retryPeer() }
         }).finally(() => { receivedQueuedBytes -= message.length })
@@ -203,10 +269,20 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
   }
 
   function newPeer(key: string, session: string): RTCPeerConnection {
+    if (!identityValid() || verifiedPair?.key !== key || verifiedPair.session !== session) throw new Error(IDENTITY_FAILED_MESSAGE)
     closePeer()
     remoteKey = key
     remoteSession = session
-    const connection = new RTCPeerConnection({ iceTransportPolicy: DEFAULT_ICE_POLICY, ...configuration, ...(options.iceTransportPolicy ? { iceTransportPolicy: options.iceTransportPolicy } : {}) })
+    let connection: RTCPeerConnection
+    try {
+      if (!webRtcAvailable()) throw new Error(WEBRTC_UNAVAILABLE_MESSAGE)
+      connection = new globalThis.RTCPeerConnection({ iceTransportPolicy: DEFAULT_ICE_POLICY, ...configuration, ...(options.iceTransportPolicy ? { iceTransportPolicy: options.iceTransportPolicy } : {}) })
+    } catch (cause) {
+      stopNetwork()
+      issue = 'webrtc-unavailable'
+      status('error')
+      throw new Error(WEBRTC_UNAVAILABLE_MESSAGE, { cause })
+    }
     peer = connection
     connection.onicecandidate = event => {
       if (!disposed && peer === connection && event.candidate) {
@@ -242,70 +318,135 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
   }
 
   async function offer(signal: Signal) {
-    // Reload durable admission so a second tab cannot admit another identity.
+    const authenticated = verifiedPair
     const stored = await loadRoom(room.scope, room.descriptor.id)
-    if (disposed || stored?.room !== room.room || stored.approvedPeer !== signal.from) return
+    if (disposed || !authenticated || authenticated !== verifiedPair || !identityValid()
+      || stored?.room !== room.room || stored.approvedPeer !== signal.from || stored.approvedPeerIdentity !== authenticated.owner) return
     room.approvedPeer = stored.approvedPeer
+    room.approvedPeerIdentity = stored.approvedPeerIdentity
     await refreshIce()
-    if (disposed) return
-    localSession = randomToken(16)
+    if (disposed || authenticated !== verifiedPair || !identityValid()) return
     peerFingerprint = await fingerprint(signal.from)
-    if (disposed) return
+    if (disposed || authenticated !== verifiedPair || !identityValid()) return
     const connection = newPeer(signal.from, signal.session)
     attachChannel(connection.createDataChannel('pubky-notes-v1', { ordered: true }), connection)
     const description = await connection.createOffer()
-    if (disposed || peer !== connection) return
+    if (disposed || peer !== connection || !identityValid()) return
     await connection.setLocalDescription(description)
-    if (disposed || peer !== connection) return
+    if (disposed || peer !== connection || !identityValid()) return
     await publish('offer', signal.from, signal.session, advertisePresence(description.sdp ?? ''))
     await flushLocalCandidates(connection)
   }
 
   async function receive(signal: Signal) {
-    if (disposed) return
+    if (disposed || !identity) return
     if (signal.kind === 'hello' && room.role === 'host') {
+      const guestChallenge = parseChallenge(signal.payload)
       const stored = await loadRoom(room.scope, room.descriptor.id)
       if (disposed || stored?.room !== room.room) return
       room.approvedPeer = stored.approvedPeer
+      room.approvedPeerIdentity = stored.approvedPeerIdentity
       if (room.approvedPeer && room.approvedPeer !== signal.from) {
         await publish('reject', signal.from, signal.session)
         return
       }
-      if (room.approvedPeer === signal.from) {
-        if (remoteKey === signal.from && remoteSession === signal.session && peer && !['failed', 'closed'].includes(peer.connectionState)) return
-        await offer(signal)
+      if (identityValid() && verifiedPair?.key === signal.from && verifiedPair.session === signal.session) return
+      if (exchange && exchange.signal.from !== signal.from && Date.now() - exchange.startedAt < PROOF_MAX_AGE_MS) return
+      if (exchange?.signal.from === signal.from && exchange.signal.session === signal.session
+        && exchange.guestChallenge === guestChallenge && Date.now() - exchange.startedAt < PROOF_MAX_AGE_MS && exchange.ownProof) {
+        await publish('challenge', signal.from, signal.session, JSON.stringify({ challenge: exchange.challenge, proof: exchange.ownProof }))
         return
       }
-      if (pending && pending.from !== signal.from) return
-      const first = !pending
-      pending = signal
-      status('approval')
-      if (first) {
-        const requestFingerprint = await fingerprint(signal.from)
-        if (!disposed) callbacks.onRequest({ peerId: signal.from, fingerprint: requestFingerprint })
-      }
+      closePeer()
+      resetIdentity()
+      localSession = randomToken(16)
+      const attempt: NonNullable<typeof exchange> = { signal, localSession, guestChallenge, challenge: randomToken(24), startedAt: Date.now() }
+      exchange = attempt
+      const own = await createIdentityProof(identity, proofContext(signal, guestChallenge, true))
+      if (disposed || exchange !== attempt || attempt.localSession !== localSession) return
+      attempt.ownProof = own.proof
+      attempt.ownIdentity = own.verified
+      await publish('challenge', signal.from, signal.session, JSON.stringify({ challenge: attempt.challenge, proof: own.proof }))
+      status('connecting')
       return
     }
     if (signal.targetSession !== localSession) return
     if (signal.kind === 'reject' && room.role === 'guest') {
       denied = true
       closePeer()
+      resetIdentity()
       status('error')
       report(new Error('The host declined this invitation or already has a collaborator'))
       return
     }
+    if (signal.kind === 'challenge' && room.role === 'guest') {
+      const value: unknown = JSON.parse(signal.payload)
+      if (!value || typeof value !== 'object' || Object.keys(value).sort().join(',') !== 'challenge,proof') throw new Error(IDENTITY_FAILED_MESSAGE)
+      const { challenge, proof } = value as { challenge: string; proof: unknown }
+      if (typeof challenge !== 'string' || decodeBytes(challenge, 24).length !== 24) throw new Error(IDENTITY_FAILED_MESSAGE)
+      if (exchange?.signal.session === signal.session && exchange.challenge === challenge && exchange.reply && identityValid()) {
+        await publish('identity', signal.from, signal.session, exchange.reply)
+        return
+      }
+      const startedSession = localSession
+      const other = verifyIdentityProof(proof, proofContext(signal, localChallenge, false), room.hostIdentity)
+      closePeer()
+      clearTimeout(identityTimer)
+      verifiedPair = undefined
+      peerIdentity = undefined
+      const attempt: NonNullable<typeof exchange> = { signal, localSession, guestChallenge: localChallenge, challenge, startedAt: Date.now() }
+      exchange = attempt
+      const own = await createIdentityProof(identity, proofContext(signal, challenge, true))
+      if (disposed || exchange !== attempt || localSession !== startedSession) return
+      await pinHostIdentity(room, other.owner)
+      if (disposed || exchange !== attempt || localSession !== startedSession) return
+      bindIdentity(signal, other, own.verified)
+      if (!identityValid()) return
+      attempt.reply = JSON.stringify({ proof: own.proof })
+      await publish('identity', signal.from, signal.session, attempt.reply)
+      status('waiting')
+      return
+    }
+    if (signal.kind === 'identity' && room.role === 'host') {
+      const attempt = exchange
+      if (!attempt || !attempt.ownIdentity || attempt.signal.from !== signal.from || attempt.signal.session !== signal.session
+        || attempt.localSession !== localSession || Date.now() - attempt.startedAt > PROOF_MAX_AGE_MS) return
+      if (identityValid() && verifiedPair?.key === signal.from && verifiedPair.session === signal.session) return
+      const value: unknown = JSON.parse(signal.payload)
+      if (!value || typeof value !== 'object' || Object.keys(value).join(',') !== 'proof') throw new Error(IDENTITY_FAILED_MESSAGE)
+      const other = verifyIdentityProof((value as { proof: unknown }).proof, proofContext(signal, attempt.challenge, false), room.approvedPeerIdentity)
+      // Consuming this exchange prevents a second proof from replacing the approved identity.
+      bindIdentity(signal, other, attempt.ownIdentity)
+      if (!identityValid()) return
+      if (room.approvedPeer === signal.from) {
+        await admitPeer(room, signal.from, other.owner)
+        if (disposed || exchange !== attempt || !identityValid()) return
+        await offer(signal)
+        return
+      }
+      pending = signal
+      const requestFingerprint = await fingerprint(signal.from)
+      if (disposed || exchange !== attempt || pending !== signal || !identityValid()) return
+      status('approval')
+      callbacks.onRequest({ peerId: signal.from, fingerprint: requestFingerprint, owner: other.owner })
+      return
+    }
+    if (!identityValid() || verifiedPair?.key !== signal.from || verifiedPair.session !== signal.session) return
     if (signal.kind === 'offer' && room.role === 'guest') {
       if (remoteSession === signal.session && peer) return
+      const authenticated = verifiedPair
       await refreshIce()
-      if (disposed || signal.targetSession !== localSession) return
+      if (disposed || authenticated !== verifiedPair || signal.targetSession !== localSession || !identityValid()) return
       peerFingerprint = await fingerprint(signal.from)
+      if (disposed || authenticated !== verifiedPair || !identityValid()) return
       const connection = newPeer(signal.from, signal.session)
       presenceSupported = supportsPresence(signal.payload)
       await connection.setRemoteDescription({ type: 'offer', sdp: signal.payload })
-      if (disposed || peer !== connection) return
+      if (disposed || peer !== connection || !identityValid()) return
       const answer = await connection.createAnswer()
+      if (disposed || peer !== connection || !identityValid()) return
       await connection.setLocalDescription(answer)
-      if (disposed || peer !== connection) return
+      if (disposed || peer !== connection || !identityValid()) return
       await publish('answer', signal.from, signal.session, advertisePresence(answer.sdp ?? ''))
       await flushLocalCandidates(connection)
       return
@@ -353,7 +494,17 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
         if (disposed || socket !== next) return
         const signal = await openSignal(packet.data, room, replay)
         if (signal) await receive(signal)
-      }).catch(report).finally(() => { queuedSignals-- })
+      }).catch(error => {
+        if (error instanceof Error && error.message === IDENTITY_UNAVAILABLE_MESSAGE) {
+          stopNetwork()
+          issue = 'identity-unavailable'
+          status('error')
+        } else if (error instanceof Error && error.message === IDENTITY_FAILED_MESSAGE && !identityValid()) {
+          issue = 'identity-verification-failed'
+          status('error')
+        }
+        report(error)
+      }).finally(() => { queuedSignals-- })
     }
     next.onclose = () => {
       if (disposed || socket !== next) return
@@ -366,8 +517,10 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
 
   function reconnect() {
     if (disposed) return
+    if (!webRtcAvailable()) { beginNetwork(); return }
     denied = false
     issue = undefined
+    if (!networkStarted) { beginNetwork(); return }
     retryPeer()
     if (!socket || socket.readyState === WebSocket.CLOSED) {
       clearTimeout(reconnectTimer)
@@ -375,27 +528,66 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
     }
   }
 
-  const helloTimer = setInterval(() => { void hello() }, 4_000)
-  const heartbeatTimer = setInterval(() => {
-    if (!disposed && socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'ping' }))
-  }, 25_000)
   const online = () => { if (channel?.readyState !== 'open') reconnect() }
-  globalThis.addEventListener?.('online', online)
-  status('connecting')
-  void refreshIce().then(() => { if (!disposed) openSocket() }).catch(report)
+  function stopNetwork() {
+    networkStarted = false
+    startupGeneration++
+    fetchAbort.abort()
+    clearInterval(helloTimer)
+    clearInterval(heartbeatTimer)
+    clearTimeout(reconnectTimer)
+    helloTimer = heartbeatTimer = reconnectTimer = undefined
+    globalThis.removeEventListener?.('online', online)
+    closePeer()
+    resetIdentity()
+    const previous = socket
+    socket = undefined
+    previous?.close()
+  }
+  function beginNetwork() {
+    if (disposed) return
+    if (!webRtcAvailable()) {
+      stopNetwork()
+      issue = 'webrtc-unavailable'
+      status('error')
+      report(new Error(WEBRTC_UNAVAILABLE_MESSAGE))
+      return
+    }
+    try {
+      if (!identity || typeof identity.createProof !== 'function') throw new Error()
+      canonicalOwner(identity.owner)
+    } catch {
+      stopNetwork()
+      issue = 'identity-unavailable'
+      status('error')
+      report(new Error(IDENTITY_UNAVAILABLE_MESSAGE))
+      return
+    }
+    if (networkStarted) return
+    networkStarted = true
+    const attempt = ++startupGeneration
+    helloTimer = setInterval(() => { void hello() }, 4_000)
+    heartbeatTimer = setInterval(() => {
+      if (!disposed && socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'ping' }))
+    }, 25_000)
+    globalThis.addEventListener?.('online', online)
+    status('connecting')
+    void refreshIce().then(() => { if (!disposed && networkStarted && attempt === startupGeneration) openSocket() }).catch(report)
+  }
+  beginNetwork()
 
   return {
     async send(message) {
       if (!(message instanceof Uint8Array) || message.length < 1 || message.length > MAX_MESSAGE_BYTES || sendQueuedBytes + message.length > MAX_MESSAGE_BYTES * 2) throw new Error('Collaboration update exceeds the send limit')
       const connection = channel
-      if (disposed || !connection || connection.readyState !== 'open') throw new Error('Collaborator is not connected')
+      if (disposed || !connection || connection.readyState !== 'open' || !identityValid()) throw new Error('Collaborator is not connected')
       const copy = new Uint8Array(message)
       sendQueuedBytes += copy.length
       const work = sendQueue.then(async () => {
         for (const frame of frameMessage(copy)) {
-          if (disposed || channel !== connection || connection.readyState !== 'open') throw new Error('Collaborator disconnected')
+          if (disposed || channel !== connection || connection.readyState !== 'open' || !identityValid()) throw new Error('Collaborator disconnected')
           if (connection.bufferedAmount > 512 * 1024) await drain(connection)
-          if (disposed || channel !== connection || connection.readyState !== 'open') throw new Error('Collaborator disconnected')
+          if (disposed || channel !== connection || connection.readyState !== 'open' || !identityValid()) throw new Error('Collaborator disconnected')
           connection.send(frame)
         }
       })
@@ -404,9 +596,11 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
     },
     async approve(peerId) {
       const request = pending
-      if (disposed || room.role !== 'host' || !request || request.from !== peerId) throw new Error('This join request is no longer available')
-      await admitPeer(room, peerId)
-      if (disposed) return
+      const authenticated = verifiedPair
+      if (disposed || room.role !== 'host' || !request || request.from !== peerId || !authenticated || !identityValid()
+        || authenticated.key !== peerId || authenticated.session !== request.session) throw new Error('This join request is no longer available')
+      await admitPeer(room, peerId, authenticated.owner)
+      if (disposed || pending !== request || authenticated !== verifiedPair || !identityValid()) return
       pending = undefined
       await offer(request)
     },
@@ -415,20 +609,14 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
       if (disposed || room.role !== 'host' || !request || request.from !== peerId) return
       pending = undefined
       void publish('reject', peerId, request.session).catch(report)
+      resetIdentity()
       status('waiting')
     },
     reconnect,
     dispose() {
       if (disposed) return
       disposed = true
-      fetchAbort.abort()
-      clearInterval(helloTimer)
-      clearInterval(heartbeatTimer)
-      clearTimeout(reconnectTimer)
-      globalThis.removeEventListener?.('online', online)
-      closePeer()
-      socket?.close()
-      socket = undefined
+      stopNetwork()
     },
   }
 }

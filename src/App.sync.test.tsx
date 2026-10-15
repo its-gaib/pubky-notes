@@ -355,8 +355,10 @@ describe('durable local notes and account synchronization', () => {
     mocks.list.mockResolvedValue([row('Recoverable note', 'Retain this text')])
     render(<App />)
     await screen.findByText('Saved to Pubky')
-    fireEvent.click(screen.getByRole('button', { name: 'Delete note' }))
-    fireEvent.click(within(screen.getByRole('dialog', { name: 'Move note to Trash?' })).getByRole('button', { name: 'Move to Trash' }))
+    expect(screen.queryByRole('button', { name: 'Delete note' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Note actions for Recoverable note' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Move to Trash' }))
+    fireEvent.click(within(await screen.findByRole('dialog', { name: 'Move note to Trash?' })).getByRole('button', { name: 'Move to Trash' }))
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
     await saveNow()
     await waitFor(async () => expect((await readLocalNotebook(scopeForSession(alice))).pending).toEqual([]))
@@ -378,6 +380,33 @@ describe('durable local notes and account synchronization', () => {
     expect(content()).toBe('Retain this text')
     expect(mocks.publish).not.toHaveBeenCalled()
     expect(mocks.save).toHaveBeenLastCalledWith(alice, expect.objectContaining({ content: 'Retain this text' }))
+  })
+
+  it('confirms the sidebar-selected note before moving it to Trash', async () => {
+    await writeLocalNote(GUEST_SCOPE, row('Keep this note', 'Keep this text'))
+    await writeLocalNote(GUEST_SCOPE, row('Selected for Trash', 'Recoverable text'))
+    await setLocalActiveId(GUEST_SCOPE, 'Keep-this-note')
+    render(<App />)
+    await readyGuest()
+    expect(title()).toBe('Keep this note')
+    fireEvent.click(screen.getByRole('button', { name: 'Note actions for Selected for Trash' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Move to Trash' }))
+    const confirmation = await screen.findByRole('dialog', { name: 'Move note to Trash?' })
+    expect(confirmation.textContent).toContain('“Selected for Trash” will move to Trash')
+    expect((await readLocalNotebook(GUEST_SCOPE)).records.every(record => !record.note.deleted)).toBe(true)
+    // Browser navigation must not retarget an already-open confirmation.
+    await act(async () => {
+      window.history.pushState(null, '', '/local/notes/Keep-this-note.json')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    await waitFor(() => expect(title()).toBe('Keep this note'))
+    expect(confirmation.textContent).toContain('“Selected for Trash” will move to Trash')
+    fireEvent.click(within(confirmation).getByRole('button', { name: 'Move to Trash' }))
+    await waitFor(async () => {
+      const records = (await readLocalNotebook(GUEST_SCOPE)).records
+      expect(records.find(record => record.note.id === 'Selected-for-Trash')?.note).toMatchObject({ deleted: true, content: 'Recoverable text' })
+      expect(records.find(record => record.note.id === 'Keep-this-note')?.note.deleted).not.toBe(true)
+    })
   })
 
   it('does not cancel a login after the atomic guest-adoption step has started', async () => {

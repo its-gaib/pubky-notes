@@ -1,9 +1,9 @@
 import * as Y from 'yjs'
 import {
-  checkpointNote, decode, editPersonal, editText, encode, LineageConflictError, materializeSharedNote, mergeNotes, newPersonalDocument,
+  checkpointNote, decode, editAttributedText, editPersonal, encode, LineageConflictError, materializeSharedNote, mergeNotes, newPersonalDocument,
   personalDocumentOf, sharedDocumentOf, validateCrdtNote, validateFields, validateSharedUpdate,
 } from './crdt'
-import type { CrdtNote, NotePatch } from './crdt'
+import type { CrdtNote, NoteEditor, NotePatch } from './crdt'
 
 export interface SharedNoteDescriptor { id: string; createdAt: string; lineage: string }
 export interface SharedSelection { start: Y.RelativePosition; end: Y.RelativePosition; field: 'title' | 'content' }
@@ -57,7 +57,7 @@ export class SharedNoteDocument {
   get note(): CrdtNote { this.assertAlive(); return { ...this.current, crdt: { ...this.current.crdt! } } }
   get descriptor(): SharedNoteDescriptor { this.assertAlive(); return sharedNoteDescriptor(this.current) }
 
-  edit(patch: NotePatch): CrdtNote {
+  edit(patch: NotePatch, editor?: NoteEditor): CrdtNote {
     this.assertAlive()
     const requested = validateFields({ ...this.current, ...patch, updatedAt: patch.updatedAt ?? new Date().toISOString() })
     // Stage the same operations with the same client IDs before touching either live document.
@@ -65,11 +65,12 @@ export class SharedNoteDocument {
     candidate.clientID = this.doc.clientID
     personal.clientID = this.personal.clientID
     try {
-      candidate.transact(() => { editText(candidate.getText('title'), requested.title); editText(candidate.getText('content'), requested.content) })
+      editAttributedText(candidate, requested, editor)
       editPersonal(personal, this.current, requested)
       const next = materializeSharedNote(candidate, personal, requested, this.current.crdt!.lineage)
-      this.doc.transact(() => { editText(this.doc.getText('title'), requested.title); editText(this.doc.getText('content'), requested.content) })
-      editPersonal(this.personal, this.current, requested)
+      // Commit exactly the validated journal UUID and text operation IDs.
+      this.doc.transact(() => Y.applyUpdate(this.doc, Y.encodeStateAsUpdate(candidate)))
+      this.personal.transact(() => Y.applyUpdate(this.personal, Y.encodeStateAsUpdate(personal)))
       this.current = next
       return this.note
     } finally { candidate.destroy(); personal.destroy() }

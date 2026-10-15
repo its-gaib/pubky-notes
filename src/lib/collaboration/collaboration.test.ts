@@ -1,11 +1,20 @@
 import 'fake-indexeddb/auto'
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import { admitPeer, createGuestRoom, createHostRoom, createIdentity, decodeBytes, deleteRoom, encodeBytes, fingerprint, invitationUrl, loadRoom, parseInvitation, randomToken } from './credentials'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { admitPeer, createGuestRoom, createHostRoom, createIdentity, decodeBytes, deleteRoom, encodeBytes, fingerprint, invitationUrl, loadRoom, parseInvitation, pinHostIdentity, randomToken } from './credentials'
 import { frameMessage, MAX_MESSAGE_BYTES, MessageAssembler } from './framing'
 import { openSignal, ReplayGuard, sealSignal } from './signaling'
-import { startCollaboration } from './transport'
+import { startCollaboration, WEBRTC_UNAVAILABLE_MESSAGE } from './transport'
 import { advertisePresence, supportsPresence } from './presence'
-import type { CollaborationCallbacks, Invitation, StoredRoom } from './types'
+import type { CollaborationCallbacks, CollaborationIdentity, Invitation, StoredRoom } from './types'
+import { createIdentityProof, IDENTITY_FAILED_MESSAGE, IDENTITY_UNAVAILABLE_MESSAGE, verifyIdentityProof } from './identity'
+import { testIdentity } from './identity.test-helpers'
+
+const identities = new Map<string, CollaborationIdentity>()
+function proofIdentity(room: StoredRoom): CollaborationIdentity {
+  let identity = identities.get(room.identity.publicKey)
+  if (!identity) { identity = testIdentity(); identities.set(room.identity.publicKey, identity) }
+  return identity
+}
 
 const descriptor = () => ({ id: crypto.randomUUID(), createdAt: '2026-10-14T10:00:00.000Z', lineage: `shared:${crypto.randomUUID()}` })
 const invitation = (room: StoredRoom): Invitation => ({ version: 1, room: room.room, secret: room.secret, hostKey: room.hostKey, descriptor: room.descriptor })
@@ -13,9 +22,10 @@ async function pair() {
   const host = await createHostRoom(`host:${crypto.randomUUID()}`, descriptor())
   return { host, guest: await createGuestRoom(`guest:${crypto.randomUUID()}`, invitation(host)) }
 }
-const helloFields = (host: StoredRoom) => ({ to: host.identity.publicKey, session: randomToken(16), targetSession: '', kind: 'hello' as const, payload: '' })
+const helloFields = (host: StoredRoom) => ({ to: host.identity.publicKey, session: randomToken(16), targetSession: '', kind: 'hello' as const, payload: JSON.stringify({ challenge: randomToken(24) }) })
 
 afterEach(() => vi.restoreAllMocks())
+beforeEach(() => vi.stubGlobal('location', new URL('https://notes.example')))
 
 describe('collaboration credentials and invitation boundaries', () => {
   it('round-trips a fragment-only invitation without signing keys or account identifiers', async () => {
@@ -67,17 +77,28 @@ describe('collaboration credentials and invitation boundaries', () => {
     const { host, guest } = await pair()
     const other = await createIdentity()
     const anotherTab = (await loadRoom(host.scope, host.descriptor.id))!
-    const results = await Promise.allSettled([admitPeer(host, guest.identity.publicKey), admitPeer(anotherTab, other.publicKey)])
+    const results = await Promise.allSettled([admitPeer(host, guest.identity.publicKey, proofIdentity(guest).owner), admitPeer(anotherTab, other.publicKey, testIdentity().owner)])
     expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
     expect((await loadRoom(host.scope, host.descriptor.id))?.approvedPeer).toBe(guest.identity.publicKey)
-    await admitPeer(host, guest.identity.publicKey)
-    await expect(admitPeer(host, other.publicKey)).rejects.toThrow('already has')
+    await admitPeer(host, guest.identity.publicKey, proofIdentity(guest).owner)
+    await expect(admitPeer(host, other.publicKey, testIdentity().owner)).rejects.toThrow('already has')
   })
 
   it('has stable peer fingerprints without pretending they are Pubky identities', async () => {
     const { host, guest } = await pair()
     expect(await fingerprint(host.hostKey)).toMatch(/^([a-f0-9]{4} ){5}[a-f0-9]{4}$/)
     expect(await fingerprint(host.hostKey)).not.toBe(await fingerprint(guest.identity.publicKey))
+  })
+
+  it('pins account identities as well as browser keys across reloads and concurrent tabs', async () => {
+    const { host, guest } = await pair()
+    const staleGuest = (await loadRoom(guest.scope, guest.descriptor.id))!
+    await pinHostIdentity(guest, proofIdentity(host).owner)
+    await expect(pinHostIdentity(staleGuest, testIdentity().owner)).rejects.toThrow('identity changed')
+    expect((await loadRoom(guest.scope, guest.descriptor.id))?.hostIdentity).toBe(proofIdentity(host).owner)
+    await admitPeer(host, guest.identity.publicKey, proofIdentity(guest).owner)
+    await expect(admitPeer(host, guest.identity.publicKey, testIdentity().owner)).rejects.toThrow('already has')
+    expect((await loadRoom(host.scope, host.descriptor.id))?.approvedPeerIdentity).toBe(proofIdentity(guest).owner)
   })
 })
 
@@ -248,7 +269,7 @@ describe('transport admission and lifetime', () => {
     FakeSocket.instances = []
     FakePeer.instances = []
     const callbacks: CollaborationCallbacks = { onStatus: vi.fn(), onRequest: vi.fn(), onMessage: vi.fn(), onError: vi.fn() }
-    const transport = startCollaboration(room, callbacks, { signalingUrl: 'ws://127.0.0.1:4444', iceEndpoint: null, rtcConfiguration: { iceServers } })
+    const transport = startCollaboration(room, callbacks, { identity: proofIdentity(room), signalingUrl: 'ws://127.0.0.1:4444', iceEndpoint: null, rtcConfiguration: { iceServers } })
     active.push(transport)
     return { transport, callbacks }
   }
@@ -260,15 +281,224 @@ describe('transport admission and lifetime', () => {
     return ws
   }
 
+  async function published(ws: FakeSocket, recipient: StoredRoom) {
+    const values = await Promise.all(ws.sent.map(packet => JSON.parse(packet)).filter(packet => packet.type === 'publish')
+      .map(packet => openSignal(packet.data, recipient, new ReplayGuard())))
+    return values.filter(value => value !== null)
+  }
+
+  async function authenticateGuest(ws: FakeSocket, host: StoredRoom, guest: StoredRoom, hello = helloFields(host), identity = proofIdentity(guest)) {
+    ws.receive(await sealSignal(guest, hello), host.room)
+    let challenge: Awaited<ReturnType<typeof openSignal>>
+    await vi.waitFor(async () => {
+      challenge = (await published(ws, guest)).findLast(signal => signal.kind === 'challenge' && signal.targetSession === hello.session) ?? null
+      expect(challenge).toBeTruthy()
+    })
+    const payload = JSON.parse(challenge!.payload)
+    verifyIdentityProof(payload.proof, { room: host.room, descriptor: host.descriptor, role: 'host', publicKey: host.hostKey,
+      peerKey: guest.identity.publicKey, session: challenge!.session, peerSession: hello.session, challenge: JSON.parse(hello.payload).challenge }, proofIdentity(host).owner)
+    const { proof } = await createIdentityProof(identity, { room: host.room, descriptor: host.descriptor, role: 'guest',
+      publicKey: guest.identity.publicKey, peerKey: host.hostKey, session: hello.session, peerSession: challenge!.session, challenge: payload.challenge })
+    ws.receive(await sealSignal(guest, { kind: 'identity', to: host.hostKey, session: hello.session,
+      targetSession: challenge!.session, payload: JSON.stringify({ proof }) }), host.room)
+    return hello
+  }
+
+  async function authenticateHost(ws: FakeSocket, host: StoredRoom, guest: StoredRoom) {
+    let hello: Awaited<ReturnType<typeof openSignal>>
+    await vi.waitFor(async () => { hello = (await published(ws, host)).find(signal => signal.kind === 'hello') ?? null; expect(hello).toBeTruthy() })
+    const session = randomToken(16), challenge = randomToken(24)
+    const { proof } = await createIdentityProof(proofIdentity(host), { room: host.room, descriptor: host.descriptor, role: 'host',
+      publicKey: host.hostKey, peerKey: guest.identity.publicKey, session, peerSession: hello!.session, challenge: JSON.parse(hello!.payload).challenge })
+    ws.receive(await sealSignal(host, { kind: 'challenge', to: guest.identity.publicKey, session,
+      targetSession: hello!.session, payload: JSON.stringify({ challenge, proof }) }), host.room)
+    await vi.waitFor(async () => { expect((await published(ws, host)).some(signal => signal.kind === 'identity')).toBe(true) })
+    return { session, hello: hello! }
+  }
+
+  async function answerOffer(ws: FakeSocket, host: StoredRoom, guest: StoredRoom) {
+    const offers = ws.sent.map(packet => JSON.parse(packet)).filter(packet => packet.type === 'publish')
+    const offer = await openSignal(offers.at(-1)!.data, guest, new ReplayGuard())
+    expect(offer?.kind).toBe('offer')
+    ws.receive(await sealSignal(guest, { kind: 'answer', to: host.identity.publicKey, session: offer!.targetSession,
+      targetSession: offer!.session, payload: 'v=0\r\n' }), host.room)
+    await vi.waitFor(() => expect(FakePeer.instances.at(-1)?.remoteDescription?.type).toBe('answer'))
+  }
+
+  it('stops before any network work when WebRTC is unavailable and rechecks on retry', async () => {
+    const { host } = await pair()
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ iceServers: [], relayAvailable: false })))
+    vi.stubGlobal('fetch', fetch)
+    vi.stubGlobal('WebSocket', FakeSocket)
+    vi.stubGlobal('RTCPeerConnection', undefined)
+    FakeSocket.instances = []
+    FakePeer.instances = []
+    vi.useFakeTimers()
+    const callbacks: CollaborationCallbacks = { onStatus: vi.fn(), onRequest: vi.fn(), onMessage: vi.fn(), onError: vi.fn() }
+    const transport = startCollaboration(host, callbacks, { identity: proofIdentity(host), signalingUrl: 'ws://127.0.0.1:4444' })
+    active.push(transport)
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'error', issue: 'webrtc-unavailable' }))
+    expect(callbacks.onError).toHaveBeenCalledWith(expect.objectContaining({ message: WEBRTC_UNAVAILABLE_MESSAGE }))
+    expect(fetch).not.toHaveBeenCalled()
+    expect(FakeSocket.instances).toHaveLength(0)
+    expect(FakePeer.instances).toHaveLength(0)
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(callbacks.onError).toHaveBeenCalledOnce()
+    transport.reconnect()
+    expect(vi.getTimerCount()).toBe(0)
+    expect(fetch).not.toHaveBeenCalled()
+    vi.stubGlobal('RTCPeerConnection', FakePeer)
+    transport.reconnect()
+    await vi.waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    expect(fetch).toHaveBeenCalledOnce()
+    expect(vi.mocked(callbacks.onStatus).mock.lastCall![0]).not.toHaveProperty('issue')
+    transport.dispose()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('requires a grant-backed identity before network access and cannot fall back to browser keys alone', async () => {
+    const { host } = await pair()
+    const fetch = vi.fn()
+    vi.stubGlobal('fetch', fetch)
+    vi.stubGlobal('WebSocket', FakeSocket)
+    vi.stubGlobal('RTCPeerConnection', FakePeer)
+    FakeSocket.instances = []
+    vi.useFakeTimers()
+    const callbacks: CollaborationCallbacks = { onStatus: vi.fn(), onRequest: vi.fn(), onMessage: vi.fn(), onError: vi.fn() }
+    const transport = startCollaboration(host, callbacks)
+    active.push(transport)
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ issue: 'identity-unavailable' }))
+    expect(callbacks.onError).toHaveBeenCalledWith(expect.objectContaining({ message: IDENTITY_UNAVAILABLE_MESSAGE }))
+    expect(fetch).not.toHaveBeenCalled()
+    expect(FakeSocket.instances).toHaveLength(0)
+    expect(vi.getTimerCount()).toBe(0)
+    transport.reconnect()
+    expect(fetch).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('requires proof before presenting a requester and refuses a proof copied from another browser key', async () => {
+    const { host, guest } = await pair()
+    const { callbacks, transport } = start(host)
+    const ws = await socket(), hello = helloFields(host)
+    ws.receive(await sealSignal(guest, hello), host.room)
+    let challenge: Awaited<ReturnType<typeof openSignal>>
+    await vi.waitFor(async () => { challenge = (await published(ws, guest)).find(signal => signal.kind === 'challenge') ?? null; expect(challenge).toBeTruthy() })
+    expect(callbacks.onRequest).not.toHaveBeenCalled()
+    expect(FakePeer.instances).toHaveLength(0)
+    await expect(transport.approve(guest.identity.publicKey)).rejects.toThrow('no longer available')
+    const payload = JSON.parse(challenge!.payload)
+    const { proof } = await createIdentityProof(proofIdentity(guest), { room: host.room, descriptor: host.descriptor, role: 'guest',
+      publicKey: (await createIdentity()).publicKey, peerKey: host.hostKey, session: hello.session, peerSession: challenge!.session, challenge: payload.challenge })
+    ws.receive(await sealSignal(guest, { kind: 'identity', to: host.hostKey, session: hello.session,
+      targetSession: challenge!.session, payload: JSON.stringify({ proof }) }), host.room)
+    await vi.waitFor(() => expect(callbacks.onError).toHaveBeenCalledWith(expect.objectContaining({ message: IDENTITY_FAILED_MESSAGE })))
+    expect(callbacks.onRequest).not.toHaveBeenCalled()
+    expect(FakePeer.instances).toHaveLength(0)
+    expect((await loadRoom(host.scope, host.descriptor.id))?.approvedPeer).toBeUndefined()
+  })
+
+  it('refuses an admitted browser that presents a different valid Pubky identity after reconnect', async () => {
+    const { host, guest } = await pair()
+    await admitPeer(host, guest.identity.publicKey, proofIdentity(guest).owner)
+    const { callbacks } = start(host)
+    const ws = await socket()
+    await authenticateGuest(ws, host, guest, helloFields(host), testIdentity())
+    await vi.waitFor(() => expect(callbacks.onError).toHaveBeenCalledWith(expect.objectContaining({ message: IDENTITY_FAILED_MESSAGE })))
+    expect(FakePeer.instances).toHaveLength(0)
+    expect(callbacks.onRequest).not.toHaveBeenCalled()
+    expect((await loadRoom(host.scope, host.descriptor.id))?.approvedPeerIdentity).toBe(proofIdentity(guest).owner)
+  })
+
+  it('refuses to reuse a valid account proof after the verifier rotates its challenge and session', async () => {
+    const { host, guest } = await pair()
+    const { callbacks, transport } = start(host)
+    const ws = await socket(), hello = helloFields(host)
+    ws.receive(await sealSignal(guest, hello), host.room)
+    let first: Awaited<ReturnType<typeof openSignal>>
+    await vi.waitFor(async () => { first = (await published(ws, guest)).find(signal => signal.kind === 'challenge') ?? null; expect(first).toBeTruthy() })
+    const { proof } = await createIdentityProof(proofIdentity(guest), { room: host.room, descriptor: host.descriptor, role: 'guest',
+      publicKey: guest.identity.publicKey, peerKey: host.hostKey, session: hello.session,
+      peerSession: first!.session, challenge: JSON.parse(first!.payload).challenge })
+    transport.reconnect()
+    ws.receive(await sealSignal(guest, hello), host.room)
+    let second: Awaited<ReturnType<typeof openSignal>>
+    await vi.waitFor(async () => { second = (await published(ws, guest)).find(signal => signal.kind === 'challenge' && signal.session !== first!.session) ?? null; expect(second).toBeTruthy() })
+    expect(JSON.parse(second!.payload).challenge).not.toBe(JSON.parse(first!.payload).challenge)
+    ws.receive(await sealSignal(guest, { kind: 'identity', to: host.hostKey, session: hello.session,
+      targetSession: second!.session, payload: JSON.stringify({ proof }) }), host.room)
+    await vi.waitFor(() => expect(callbacks.onError).toHaveBeenCalledWith(expect.objectContaining({ message: IDENTITY_FAILED_MESSAGE })))
+    expect(callbacks.onRequest).not.toHaveBeenCalled()
+    expect(FakePeer.instances).toHaveLength(0)
+  })
+
+  it('requires the host account proof before accepting its browser-signed offer', async () => {
+    const { host, guest } = await pair()
+    const { callbacks } = start(guest)
+    const ws = await socket()
+    let hello: Awaited<ReturnType<typeof openSignal>>
+    await vi.waitFor(async () => { hello = (await published(ws, host)).find(signal => signal.kind === 'hello') ?? null; expect(hello).toBeTruthy() })
+    ws.receive(await sealSignal(host, { kind: 'offer', to: guest.identity.publicKey, session: randomToken(16), targetSession: hello!.session, payload: 'v=0\r\n' }), host.room)
+    // Wait for a subsequent ordered signal to be processed before checking the rejected offer.
+    const session = randomToken(16)
+    ws.receive(await sealSignal(host, { kind: 'challenge', to: guest.identity.publicKey, session,
+      targetSession: hello!.session, payload: JSON.stringify({ challenge: randomToken(24), proof: { grant: 'invalid', pop: 'invalid' } }) }), host.room)
+    await vi.waitFor(() => expect(callbacks.onError).toHaveBeenCalledWith(expect.objectContaining({ message: IDENTITY_FAILED_MESSAGE })))
+    expect(FakePeer.instances).toHaveLength(0)
+    expect((await published(ws, host)).some(signal => signal.kind === 'answer')).toBe(false)
+    expect((await loadRoom(guest.scope, guest.descriptor.id))?.hostIdentity).toBeUndefined()
+  })
+
+  it('closes the connection and blocks note bytes when either identity grant expires', async () => {
+    const { host, guest } = await pair()
+    const expiresAt = Math.floor(Date.now() / 1000) + 60
+    identities.set(guest.identity.publicKey, testIdentity('pubky-notes', expiresAt))
+    await admitPeer(host, guest.identity.publicKey, proofIdentity(guest).owner)
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const { callbacks, transport } = start(host)
+    const ws = await socket()
+    await authenticateGuest(ws, host, guest)
+    await vi.waitFor(() => expect(FakePeer.instances).toHaveLength(1))
+    const channel = FakePeer.instances[0].channel!
+    channel.open()
+    await transport.send(new Uint8Array([1]))
+    await vi.advanceTimersByTimeAsync(expiresAt * 1000 - Date.now())
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'error', issue: 'identity-unavailable' }))
+    expect(channel.readyState).toBe('closed')
+    expect(ws.readyState).toBe(FakeSocket.CLOSED)
+    channel.onmessage!({ data: [...frameMessage(new Uint8Array([9]))][0] })
+    await expect(transport.send(new Uint8Array([2]))).rejects.toThrow('not connected')
+    expect(callbacks.onMessage).not.toHaveBeenCalled()
+    expect(channel.sent).toHaveLength(1)
+  })
+
+  it('cleans up and explains a browser that refuses to construct a peer', async () => {
+    const { host, guest } = await pair()
+    const { transport, callbacks } = start(host)
+    const ws = await socket()
+    await authenticateGuest(ws, host, guest)
+    await vi.waitFor(() => expect(callbacks.onRequest).toHaveBeenCalledOnce())
+    vi.stubGlobal('RTCPeerConnection', class { constructor() { throw new DOMException('Blocked', 'NotSupportedError') } })
+    await expect(transport.approve(guest.identity.publicKey)).rejects.toThrow(WEBRTC_UNAVAILABLE_MESSAGE)
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'error', issue: 'webrtc-unavailable' }))
+    expect(ws.readyState).toBe(FakeSocket.CLOSED)
+    expect(FakePeer.instances).toHaveLength(0)
+    vi.stubGlobal('RTCPeerConnection', FakePeer)
+    transport.reconnect()
+    await vi.waitFor(() => expect(FakeSocket.instances).toHaveLength(2))
+    expect(vi.mocked(callbacks.onStatus).mock.lastCall![0]).not.toHaveProperty('issue')
+  })
+
   it('creates no peer or data channel before explicit admission, then persists the approved key', async () => {
     const { host, guest } = await pair()
     const { transport, callbacks } = start(host)
     const ws = await socket()
-    ws.receive(await sealSignal(guest, helloFields(host)), host.room)
+    await authenticateGuest(ws, host, guest)
     await vi.waitFor(() => expect(callbacks.onRequest).toHaveBeenCalledOnce())
     expect(FakePeer.instances).toHaveLength(0)
     await expect(transport.send(new Uint8Array([1]))).rejects.toThrow('not connected')
-    expect(ws.sent.map(packet => JSON.parse(packet)).filter(packet => packet.type === 'publish')).toHaveLength(0)
+    expect((await published(ws, guest)).map(signal => signal.kind)).toEqual(['challenge'])
     await transport.approve(guest.identity.publicKey)
     expect((await loadRoom(host.scope, host.descriptor.id))?.approvedPeer).toBe(guest.identity.publicKey)
     expect(FakePeer.instances).toHaveLength(1)
@@ -280,7 +510,7 @@ describe('transport admission and lifetime', () => {
 
   it('rejects another link holder once the one collaborator has been admitted', async () => {
     const { host, guest } = await pair()
-    await admitPeer(host, guest.identity.publicKey)
+    await admitPeer(host, guest.identity.publicKey, proofIdentity(guest).owner)
     const outsider = await createGuestRoom(`outsider:${crypto.randomUUID()}`, invitation(host))
     const { callbacks } = start(host)
     const ws = await socket()
@@ -296,10 +526,11 @@ describe('transport admission and lifetime', () => {
     const { host, guest } = await pair()
     const { transport, callbacks } = start(host, relay ? [{ urls: 'turn:relay.example:3478', username: 'test', credential: 'test' }] : [])
     const ws = await socket()
-    ws.receive(await sealSignal(guest, helloFields(host)), host.room)
+    await authenticateGuest(ws, host, guest)
     await vi.waitFor(() => expect(callbacks.onRequest).toHaveBeenCalledOnce())
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
     await transport.approve(guest.identity.publicKey)
+    await answerOffer(ws, host, guest)
     const first = FakePeer.instances[0]
     first.connectionState = 'failed'
     first.onconnectionstatechange!()
@@ -307,7 +538,7 @@ describe('transport admission and lifetime', () => {
     expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'disconnected', issue, relayAvailable: relay }))
     await vi.advanceTimersByTimeAsync(1500)
     expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'waiting', issue }))
-    ws.receive(await sealSignal(guest, helloFields(host)), host.room)
+    await authenticateGuest(ws, host, guest)
     await vi.waitFor(() => expect(FakePeer.instances).toHaveLength(2))
     expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'connecting', issue }))
     FakePeer.instances[1].channel!.open()
@@ -318,19 +549,22 @@ describe('transport admission and lifetime', () => {
     expect(vi.mocked(callbacks.onStatus).mock.lastCall![0]).not.toHaveProperty('issue')
   })
 
-  it('reports a timed-out direct connection and clears its explanation on an explicit retry', async () => {
+  it.each([false, true])('distinguishes an unanswered handshake from a negotiated connection timeout (answered=%s)', async answered => {
     const { host, guest } = await pair()
     const { transport, callbacks } = start(host)
     const ws = await socket()
-    ws.receive(await sealSignal(guest, helloFields(host)), host.room)
+    await authenticateGuest(ws, host, guest)
     await vi.waitFor(() => expect(callbacks.onRequest).toHaveBeenCalledOnce())
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
     await transport.approve(guest.identity.publicKey)
-    await vi.advanceTimersByTimeAsync(24_999)
+    const startedAt = Date.now()
+    if (answered) await answerOffer(ws, host, guest)
+    const remaining = 25_000 - (Date.now() - startedAt)
+    await vi.advanceTimersByTimeAsync(remaining - 1)
     expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'connecting' }))
     expect(vi.mocked(callbacks.onStatus).mock.lastCall![0]).not.toHaveProperty('issue')
     await vi.advanceTimersByTimeAsync(1)
-    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'disconnected', issue: 'direct-connection-failed' }))
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'disconnected', issue: answered ? 'direct-connection-failed' : 'handshake-failed' }))
     transport.reconnect()
     expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'disconnected' }))
     expect(vi.mocked(callbacks.onStatus).mock.lastCall![0]).not.toHaveProperty('issue')
@@ -338,23 +572,22 @@ describe('transport admission and lifetime', () => {
 
   it('automatically reconnects the durable admitted identity without another approval', async () => {
     const { host, guest } = await pair()
-    await admitPeer(host, guest.identity.publicKey)
+    await admitPeer(host, guest.identity.publicKey, proofIdentity(guest).owner)
     const { callbacks } = start((await loadRoom(host.scope, host.descriptor.id))!)
     const ws = await socket()
-    ws.receive(await sealSignal(guest, helloFields(host)), host.room)
+    await authenticateGuest(ws, host, guest)
     await vi.waitFor(() => expect(FakePeer.instances).toHaveLength(1))
     expect(callbacks.onRequest).not.toHaveBeenCalled()
   })
 
   it.each([false, true])('negotiates host presence only from the signed guest answer (supported=%s)', async supported => {
     const { host, guest } = await pair()
-    await admitPeer(host, guest.identity.publicKey)
+    await admitPeer(host, guest.identity.publicKey, proofIdentity(guest).owner)
     const { callbacks, transport } = start(host)
     const ws = await socket()
-    const hello = helloFields(host)
-    ws.receive(await sealSignal(guest, hello), host.room)
-    await vi.waitFor(() => expect(ws.sent.some(packet => JSON.parse(packet).type === 'publish')).toBe(true))
-    const offer = await openSignal(JSON.parse(ws.sent.find(packet => JSON.parse(packet).type === 'publish')!).data, guest, new ReplayGuard())
+    const hello = await authenticateGuest(ws, host, guest)
+    await vi.waitFor(async () => expect((await published(ws, guest)).some(signal => signal.kind === 'offer')).toBe(true))
+    const offer = (await published(ws, guest)).find(signal => signal.kind === 'offer')!
     expect(offer?.kind).toBe('offer')
     expect(supportsPresence(offer!.payload)).toBe(true)
     ws.receive(await sealSignal(guest, { kind: 'answer', to: host.identity.publicKey, session: hello.session, targetSession: offer!.session, payload: supported ? advertisePresence('v=0\r\n') : 'v=0\r\n' }), host.room)
@@ -369,11 +602,10 @@ describe('transport admission and lifetime', () => {
     const { host, guest } = await pair()
     const { callbacks } = start(guest)
     const ws = await socket()
-    await vi.waitFor(() => expect(ws.sent.some(packet => JSON.parse(packet).type === 'publish')).toBe(true))
-    const hello = await openSignal(JSON.parse(ws.sent.find(packet => JSON.parse(packet).type === 'publish')!).data, host, new ReplayGuard())
-    ws.receive(await sealSignal(host, { kind: 'offer', to: guest.identity.publicKey, session: randomToken(16), targetSession: hello!.session, payload: supported ? advertisePresence('v=0\r\n') : 'v=0\r\n' }), host.room)
-    await vi.waitFor(() => expect(ws.sent.filter(packet => JSON.parse(packet).type === 'publish')).toHaveLength(2))
-    const answer = await openSignal(JSON.parse(ws.sent.filter(packet => JSON.parse(packet).type === 'publish')[1]).data, host, new ReplayGuard())
+    const { session, hello } = await authenticateHost(ws, host, guest)
+    ws.receive(await sealSignal(host, { kind: 'offer', to: guest.identity.publicKey, session, targetSession: hello.session, payload: supported ? advertisePresence('v=0\r\n') : 'v=0\r\n' }), host.room)
+    await vi.waitFor(async () => expect((await published(ws, host)).some(signal => signal.kind === 'answer')).toBe(true))
+    const answer = (await published(ws, host)).find(signal => signal.kind === 'answer')!
     expect(answer?.kind).toBe('answer')
     expect(supportsPresence(answer!.payload)).toBe(true)
     const channel = new FakeChannel()
@@ -384,10 +616,10 @@ describe('transport admission and lifetime', () => {
 
   it('serializes complete received messages and stops old-account callbacks after disposal', async () => {
     const { host, guest } = await pair()
-    await admitPeer(host, guest.identity.publicKey)
+    await admitPeer(host, guest.identity.publicKey, proofIdentity(guest).owner)
     const { transport, callbacks } = start(host)
     const ws = await socket()
-    ws.receive(await sealSignal(guest, helloFields(host)), host.room)
+    await authenticateGuest(ws, host, guest)
     await vi.waitFor(() => expect(FakePeer.instances).toHaveLength(1))
     const channel = FakePeer.instances[0].channel!
     channel.open()
@@ -412,13 +644,34 @@ describe('transport admission and lifetime', () => {
     expect(FakePeer.instances).toHaveLength(0)
   })
 
+  it('discards an identity proof that finishes signing after its account scope was disposed', async () => {
+    const { host, guest } = await pair(), signer = proofIdentity(host)
+    let release!: () => void
+    const waiting = new Promise<void>(resolve => { release = resolve })
+    const createProof = vi.fn(async (data: Parameters<CollaborationIdentity['createProof']>[0]) => {
+      await waiting
+      return signer.createProof(data)
+    })
+    identities.set(host.identity.publicKey, { ...signer, createProof })
+    const { transport, callbacks } = start(host)
+    const ws = await socket()
+    ws.receive(await sealSignal(guest, helloFields(host)), host.room)
+    await vi.waitFor(() => expect(createProof).toHaveBeenCalledOnce())
+    transport.dispose()
+    release()
+    await createProof.mock.results[0].value
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect((await published(ws, guest))).toHaveLength(0)
+    expect(callbacks.onRequest).not.toHaveBeenCalled()
+    expect(FakePeer.instances).toHaveLength(0)
+  })
+
   it('reports an incoming already-open channel exactly once even if open/connection events follow', async () => {
     const { host, guest } = await pair()
     const { callbacks } = start(guest)
     const ws = await socket()
-    await vi.waitFor(() => expect(ws.sent.some(packet => JSON.parse(packet).type === 'publish')).toBe(true))
-    const hello = await openSignal(JSON.parse(ws.sent.find(packet => JSON.parse(packet).type === 'publish')!).data, host, new ReplayGuard())
-    ws.receive(await sealSignal(host, { kind: 'offer', to: guest.identity.publicKey, session: randomToken(16), targetSession: hello!.session, payload: 'v=0\r\n' }), host.room)
+    const { session, hello } = await authenticateHost(ws, host, guest)
+    ws.receive(await sealSignal(host, { kind: 'offer', to: guest.identity.publicKey, session, targetSession: hello.session, payload: 'v=0\r\n' }), host.room)
     await vi.waitFor(() => expect(FakePeer.instances).toHaveLength(1))
     const connection = FakePeer.instances[0]
     const channel = new FakeChannel()
@@ -433,10 +686,10 @@ describe('transport admission and lifetime', () => {
 
   it('makes the connection usable before delivering a first message that precedes its open event', async () => {
     const { host, guest } = await pair()
-    await admitPeer(host, guest.identity.publicKey)
+    await admitPeer(host, guest.identity.publicKey, proofIdentity(guest).owner)
     const { callbacks } = start(host)
     const ws = await socket()
-    ws.receive(await sealSignal(guest, helloFields(host)), host.room)
+    await authenticateGuest(ws, host, guest)
     await vi.waitFor(() => expect(FakePeer.instances).toHaveLength(1))
     const channel = FakePeer.instances[0].channel!
     channel.readyState = 'open'

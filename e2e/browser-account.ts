@@ -26,7 +26,7 @@ export async function createAccount(): Promise<string> {
       localStorage.setItem(ACCOUNT, cleanup.info.publicKey.z32())
       localStorage.setItem(CLEANUP, (await pubky.browserSessionStore.save(cleanup)).id)
     } finally { cleanup.free() }
-    const session = await signer.signin(`notes-e2e-app-${crypto.randomUUID()}`)
+    const session = await signer.signin('pubky-notes')
     try { localStorage.setItem(APP_SESSION, await persistSession(session)) }
     finally { session.free() }
     return localStorage.getItem(ACCOUNT)!

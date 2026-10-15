@@ -2,11 +2,40 @@ import type { Address } from '@synonymdev/pubky'
 import { getPubky } from './pubky'
 
 export interface Profile { name: string; image?: string }
+export type FollowRelationship = { state: 'following' | 'not-following' } | { state: 'unknown'; error: string }
 export const MAX_PROFILE_BYTES = 16 * 1024
 export const MAX_AVATAR_BYTES = 4 * 1024 * 1024
 const RESOURCE_TIMEOUT = 10_000
 const OWNER = /^[ybndrfg8ejkmcpqxot1uwisza345h769]{52}$/
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/avif', 'image/gif'])
+
+class ResourceUnavailableError extends Error {
+  constructor(readonly status: number) { super(`Profile resource unavailable (${status}).`) }
+}
+
+/** A failed lookup is unknown; only an explicit missing resource means not followed. */
+export async function loadFollowRelationship(viewer: string, peer: string, signal?: AbortSignal): Promise<FollowRelationship> {
+  try {
+    if (!OWNER.test(viewer) || !OWNER.test(peer)) throw new Error('Invalid Pubky identifier.')
+    return await withDeadline(signal, async requestSignal => {
+      // Pubky app specs encode the followee in the path and the creation time in the body.
+      const response = await getResource(`pubky${viewer}/pub/pubky.app/follows/${peer}`, requestSignal)
+      const value = await readJson(response, requestSignal)
+      if (!Number.isSafeInteger(value.created_at)) throw new Error('Invalid follow record.')
+      return { state: 'following' as const }
+    })
+  } catch (error) {
+    const status = error instanceof ResourceUnavailableError ? error.status : sdkRequestStatus(error)
+    if (!signal?.aborted && (status === 404 || status === 410)) return { state: 'not-following' }
+    return { state: 'unknown', error: 'Your follow relationship could not be checked.' }
+  }
+}
+
+function sdkRequestStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object' || !('name' in error) || error.name !== 'RequestError' || !('data' in error) ||
+      !error.data || typeof error.data !== 'object' || !('statusCode' in error.data) || typeof error.data.statusCode !== 'number') return
+  return error.data.statusCode
+}
 
 // Profiles are public resources; loading them never uses the notes session.
 export async function loadProfile(owner: string, signal?: AbortSignal): Promise<Profile> {
@@ -22,9 +51,10 @@ export async function loadProfile(owner: string, signal?: AbortSignal): Promise<
   })
 }
 
-export async function loadAvatar(reference: string, signal?: AbortSignal): Promise<Blob> {
+export async function loadAvatar(reference: string, signal?: AbortSignal, expectedOwner?: string): Promise<Blob> {
+  if (expectedOwner !== undefined && !OWNER.test(expectedOwner)) throw new Error('Invalid Pubky identifier.')
   return withDeadline(signal, async (requestSignal) => {
-    let resource = parseResource(reference)
+    let resource = parseResource(reference, expectedOwner)
     let expectedType: string | undefined
     let expectedSize: number | undefined
     let response = await getResource(resource.address, requestSignal)
@@ -37,7 +67,7 @@ export async function loadAvatar(reference: string, signal?: AbortSignal): Promi
       }
       expectedSize = Number(file.size)
       if (typeof file.src !== 'string') throw new Error('Missing avatar resource.')
-      resource = parseResource(file.src)
+      resource = parseResource(file.src, expectedOwner)
       if (resource.fileRecord) throw new Error('Nested avatar metadata is unsupported.')
       response = await getResource(resource.address, requestSignal)
     }
@@ -55,14 +85,16 @@ export async function loadAvatar(reference: string, signal?: AbortSignal): Promi
   })
 }
 
-function parseResource(value: string): { address: string; fileRecord: boolean } {
+function parseResource(value: string, expectedOwner?: string): { address: string; fileRecord: boolean } {
   if (!value || value.length > 1024 || /[\s\\]/u.test(value)) throw new Error('Invalid avatar resource.')
   const pubky = /^(?:pubky:\/\/|pubky)([ybndrfg8ejkmcpqxot1uwisza345h769]{52})(\/pub\/(?:[a-zA-Z0-9._~-]+\/)*[a-zA-Z0-9._~-]+)$/.exec(value)
   if (pubky) {
+    if (expectedOwner !== undefined && pubky[1] !== expectedOwner) throw new Error('Avatar does not belong to this Pubky account.')
     const path = pubky[2]
     if (path.split('/').some(segment => segment === '.' || segment === '..')) throw new Error('Invalid avatar path.')
     return { address: `pubky${pubky[1]}${path}`, fileRecord: path.startsWith('/pub/pubky.app/files/') }
   }
+  if (expectedOwner !== undefined) throw new Error('Peer avatars must be public resources of the verified Pubky account.')
   const url = new URL(value)
   if (url.protocol !== 'https:' || url.username || url.password || url.hash) throw new Error('Unsupported avatar URL.')
   return { address: url.href, fileRecord: false }
@@ -78,7 +110,7 @@ async function getResource(address: string, signal: AbortSignal): Promise<Respon
   const response = await abortable(request, signal)
   if (!response.ok) {
     void response.body?.cancel().catch(() => undefined)
-    throw new Error(`Profile resource unavailable (${response.status}).`)
+    throw new ResourceUnavailableError(response.status)
   }
   return response
 }

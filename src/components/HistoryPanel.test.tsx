@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ComponentProps } from 'react'
 import HistoryPanel from './HistoryPanel'
@@ -162,5 +162,105 @@ describe('note history', () => {
     rerender(<HistoryPanel {...actions} entries={entries} />)
     expect(screen.getByText('Version 1 of 3')).toBeTruthy()
     expect(screen.getByRole('heading', { name: 'First draft' })).toBeTruthy()
+  })
+
+  it('shows each editor’s additions and deletions in a collaborative saved version', () => {
+    const readChanges = vi.fn(() => ({ baseline: false, edits: [
+      { id: 'a1', recordedAt: entries[1].recordedAt, author: { id: 'alice', label: 'Alice' }, changes: [{ field: 'title' as const, deleted: 'Draft title', inserted: 'Shared title' }] },
+      { id: 'b1', recordedAt: entries[2].recordedAt, author: { id: 'bob', label: 'Bob' }, changes: [{ field: 'content' as const, deleted: 'Outdated sentence', inserted: 'Revised sentence' }] },
+      { id: 'a2', recordedAt: entries[2].recordedAt, author: { id: 'alice', label: 'Alice' }, changes: [{ field: 'content' as const, deleted: '', inserted: 'A final sentence' }] },
+    ] }))
+    const actions = props({ collaborative: true, readChanges })
+    render(<HistoryPanel {...actions} />)
+    expect(screen.getByRole('button', { name: 'Changes' }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.queryByRole('article', { name: 'Version preview' })).toBeNull()
+    const alice = screen.getByRole('region', { name: 'Edits by Alice' })
+    const bob = screen.getByRole('region', { name: 'Edits by Bob' })
+    expect(within(alice).getByText('Draft title').tagName).toBe('DEL')
+    expect(within(alice).getByText('Shared title').tagName).toBe('INS')
+    expect(within(alice).getByText('A final sentence').tagName).toBe('INS')
+    expect(within(bob).getByText('Outdated sentence').tagName).toBe('DEL')
+    expect(within(bob).getByText('Revised sentence').tagName).toBe('INS')
+    expect(within(alice).queryByText('Revised sentence')).toBeNull()
+    expect(within(screen.getByRole('list', { name: 'Editors in this version' })).getAllByRole('listitem').map(item => item.textContent)).toEqual(['Alice', 'Bob'])
+    expect(readChanges).toHaveBeenCalledExactlyOnceWith('third')
+    expect(screen.getByText('Attribution is supplied by editors and is not independently verified.')).toBeTruthy()
+    expect(screen.getByText(/Saved versions stay private; edit attribution is shared/)).toBeTruthy()
+    expect(actions.restore).not.toHaveBeenCalled()
+  })
+
+  it('renders reported names and changed text as inert text and labels unavailable authors', () => {
+    const maliciousLabel = '<script>pretend to be Alice</script>'
+    const actions = props({ collaborative: true, readChanges: () => ({ baseline: false, edits: [
+      { id: 'a1', recordedAt: entries[1].recordedAt, author: { id: 'claimed-id', label: maliciousLabel }, changes: [{ field: 'content', deleted: '<img src=x onerror=alert(1)>', inserted: '[Link](https://example.com)\n<script>alert(1)</script>' }] },
+      { id: 'unknown', recordedAt: entries[2].recordedAt, changes: [{ field: 'content', deleted: 'Someone removed this', inserted: '' }] },
+    ] }) })
+    const { container } = render(<HistoryPanel {...actions} />)
+    expect(screen.getByRole('heading', { name: maliciousLabel })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Author unavailable' })).toBeTruthy()
+    expect(screen.getByText('<img src=x onerror=alert(1)>').tagName).toBe('DEL')
+    expect(container.querySelector('script, img, a')).toBeNull()
+    expect(container.querySelector('ins')?.textContent).toBe('[Link](https://example.com)\n<script>alert(1)</script>')
+    expect(screen.queryByText('You')).toBeNull()
+  })
+
+  it('distinguishes editors who report the same name, including matching short ID suffixes', () => {
+    const firstId = 'pubky:1111abcdefghijkl'
+    const secondId = 'pubky:2222abcdefghijkl'
+    render(<HistoryPanel {...props({ collaborative: true, readChanges: () => ({ baseline: false, edits: [
+      { id: 'a1', recordedAt: entries[1].recordedAt, author: { id: firstId, label: 'Alex' }, changes: [{ field: 'content', deleted: '', inserted: 'First editor addition' }] },
+      { id: 'a2', recordedAt: entries[2].recordedAt, author: { id: secondId, label: 'Alex' }, changes: [{ field: 'content', deleted: 'Second editor deletion', inserted: '' }] },
+      { id: 'a3', recordedAt: entries[2].recordedAt, author: { id: 'pubky:unique', label: 'Sam' }, changes: [{ field: 'title', deleted: '', inserted: 'A title' }] },
+    ] }) })} />)
+    const first = screen.getByRole('region', { name: 'Edits by Alex · …1111abcdefghijkl' })
+    const second = screen.getByRole('region', { name: 'Edits by Alex · …2222abcdefghijkl' })
+    expect(within(first).getByText('First editor addition').tagName).toBe('INS')
+    expect(within(second).getByText('Second editor deletion').tagName).toBe('DEL')
+    expect(within(first).getByRole('heading', { level: 3 }).getAttribute('title')).toBe(firstId)
+    expect(within(second).getByRole('heading', { level: 3 }).getAttribute('title')).toBe(secondId)
+    expect(screen.getByRole('region', { name: 'Edits by Sam' })).toBeTruthy()
+    expect(within(screen.getByRole('list', { name: 'Editors in this version' })).getAllByRole('listitem').map(item => item.textContent)).toEqual(['Alex · …1111abcdefghijkl', 'Alex · …2222abcdefghijkl', 'Sam'])
+  })
+
+  it('labels the shared baseline and allows switching to a read-only preview', () => {
+    const actions = props({ collaborative: true, readChanges: () => ({ baseline: true, edits: [] }) })
+    render(<HistoryPanel {...actions} />)
+    expect(screen.getByRole('heading', { name: 'Shared starting text' })).toBeTruthy()
+    expect(screen.queryByRole('list', { name: 'Editors in this version' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Preview' }))
+    expect(screen.getByRole('button', { name: 'Preview' }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('article', { name: 'Version preview' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Current draft' })).toBeTruthy()
+    expect(screen.queryByRole('textbox')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Changes' }))
+    expect(screen.getByRole('heading', { name: 'Shared starting text' })).toBeTruthy()
+    expect(actions.restore).not.toHaveBeenCalled()
+  })
+
+  it('keeps preview as the default for private notes and describes missing edit records', () => {
+    render(<HistoryPanel {...props({ readChanges: () => ({ baseline: false, edits: [] }) })} />)
+    expect(screen.getByRole('article', { name: 'Version preview' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Changes' }))
+    expect(screen.getByText('No recorded attributed edits for this version.')).toBeTruthy()
+    expect(screen.queryByText(/Attribution is supplied/)).toBeNull()
+  })
+
+  it('pauses on a changes read failure while keeping the preview available', () => {
+    vi.useFakeTimers()
+    const actions = props({ collaborative: true, readChanges: vi.fn(id => {
+      if (id === 'second') throw new Error('Invalid edit history')
+      return { baseline: id === 'first', edits: [] }
+    }) })
+    render(<HistoryPanel {...actions} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Play history' }))
+    tick()
+    expect(screen.getByRole('alert').textContent).toContain('Changes for this version could not be opened')
+    expect(screen.getByRole('button', { name: 'Play history' })).toBeTruthy()
+    expect(vi.getTimerCount()).toBe(0)
+    fireEvent.click(screen.getByRole('button', { name: 'Preview' }))
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByRole('heading', { name: 'Next draft' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Restore this version' }))
+    expect(actions.restore).toHaveBeenCalledExactlyOnceWith('second')
   })
 })

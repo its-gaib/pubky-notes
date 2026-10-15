@@ -17,6 +17,9 @@ export interface StoredRoom extends Invitation {
   role: 'host' | 'guest'
   identity: { publicKey: string; privateKey: CryptoKey }
   approvedPeer?: string
+  approvedPeerIdentity?: string
+  /** Verified account identity of the invitation's pinned host browser. */
+  hostIdentity?: string
 }
 
 export type ConnectionState = 'connecting' | 'waiting' | 'approval' | 'connected' | 'disconnected' | 'error'
@@ -24,8 +27,9 @@ export interface CollaborationStatus {
   state: ConnectionState
   relayAvailable: boolean
   /** A failed connection attempt remains visible through automatic retries. */
-  issue?: 'direct-connection-failed' | 'connection-failed'
+  issue?: 'webrtc-unavailable' | 'identity-unavailable' | 'identity-verification-failed' | 'handshake-failed' | 'direct-connection-failed' | 'connection-failed'
   peerFingerprint?: string
+  peerIdentity?: string
   /** Negotiated through authenticated SDP; absent for older app versions. */
   presenceSupported?: boolean
 }
@@ -33,6 +37,7 @@ export interface CollaborationStatus {
 export interface JoinRequest {
   peerId: string
   fingerprint: string
+  owner: string
 }
 
 export interface CollaborationCallbacks {
@@ -43,11 +48,18 @@ export interface CollaborationCallbacks {
 }
 
 export interface CollaborationOptions {
+  /** Only public grant proofs cross the connection; session secrets stay in the SDK. */
+  identity?: CollaborationIdentity
   signalingUrl?: string
   rtcConfiguration?: RTCConfiguration
   iceTransportPolicy?: RTCIceTransportPolicy
   /** Override only in tests or when an application provides its own TURN config. */
   iceEndpoint?: string | null
+}
+
+export interface CollaborationIdentity {
+  owner: string
+  createProof(data: JsonValue): Promise<CustomPop>
 }
 
 export interface CollaborationTransport {
@@ -57,3 +69,4 @@ export interface CollaborationTransport {
   reconnect(): void
   dispose(): void
 }
+import type { CustomPop, JsonValue } from '@synonymdev/pubky'

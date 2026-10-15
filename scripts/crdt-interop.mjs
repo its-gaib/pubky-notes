@@ -4,7 +4,7 @@ import { copy, fixture, openWebModules, startCli } from './crdt-interop-support.
 if (process.argv.length !== 2) throw new Error('Usage: node scripts/crdt-interop.mjs')
 const web = await openWebModules()
 const cli = startCli()
-const { initializeNote, ensureCrdt, editNote, mergeNotes, noteRevision, checkpointNote, listNoteVersions, readNoteVersion } = web.crdt
+const { initializeNote, ensureCrdt, editNote, mergeNotes, noteRevision, checkpointNote, listNoteVersions, readNoteVersion, readNoteVersionChanges } = web.crdt
 let passed = 0
 const test = async (name, action) => { await action(); passed++; console.log(`PASS ${name}`) }
 const same = (a, b) => { assert.deepEqual(a, b); assert.equal(noteRevision(a), noteRevision(b)) }
@@ -16,6 +16,19 @@ const exchange = async (a, b) => {
 }
 
 try {
+  await test('web and CLI preserve distinct insertion and deletion authors across merged history', async () => {
+    const base = initializeNote({ ...fixture('authors'), content: 'First\nMiddle\nLast' })
+    const browser = editNote(base, { content: `Alice\n${base.content}` }, { id: 'pubky:alice', label: 'Alice' })
+    const terminal = await cli.call('crdt:editNote', copy(base), { content: 'First\nLast' }, { id: 'pubky:bob', label: 'Bob CLI' })
+    const saved = checkpointNote(await exchange(browser, terminal))
+    const id = listNoteVersions(saved).at(-1).id
+    const changes = readNoteVersionChanges(saved, id)
+    assert.deepEqual(await cli.call('crdt:readNoteVersionChanges', copy(saved), id), changes)
+    assert.deepEqual(new Set(changes.edits.map(edit => edit.author.id)), new Set(['pubky:alice', 'pubky:bob']))
+    assert.ok(changes.edits.find(edit => edit.author.id === 'pubky:bob').changes.some(change => change.deleted.includes('Middle')))
+    assert.ok(changes.edits.find(edit => edit.author.id === 'pubky:alice').changes.some(change => change.inserted.includes('Alice')))
+  })
+
   await test('independent legacy initialization produces identical histories', async () => {
     const legacy = { ...fixture('legacy'), title: 'Résumé 🧭', folder: 'Projects/日本語' }
     const fromWeb = await ensureCrdt(copy(legacy))

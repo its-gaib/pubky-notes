@@ -12,8 +12,28 @@
 .history-version-details { display: flex; flex-wrap: wrap; align-items: baseline; gap: 5px 12px; margin-top: 8px; color: #777581; font-size: 11px; line-height: 1.6; }
 .history-version-details strong { color: #5f5a76; font-weight: 550; }
 .history-restored { display: inline-flex; align-items: center; gap: 4px; color: #8a7ba0; }
+.history-contributors { display: flex; flex-wrap: wrap; gap: 5px; margin: 9px 0 0; padding: 0; list-style: none; }
+.history-contributors li { max-width: 100%; padding: 2px 8px; border: 1px solid #e2dfeb; border-radius: 10px; color: #615b76; background: #f2f0f7; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.history-view-options { display: inline-flex; gap: 3px; margin-top: 12px; padding: 3px; border: 1px solid #e3e0eb; border-radius: 7px; background: #f0eef5; }
+.history-view-options button { padding: 5px 12px; border: 0; border-radius: 4px; background: transparent; color: #777181; font-size: 12px; }
+.history-view-options button[aria-pressed="true"] { background: var(--paper); color: var(--accent); box-shadow: 0 1px 3px #3c295918; }
+.history-view-options button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .history-preview { flex: 1; min-height: 0; padding: 24px clamp(24px, 2.5vw, 40px) 32px; overflow: auto; }
 .history-preview article { min-width: 0; }
+.history-attribution-note { margin: 0 0 22px; color: #777481; font-size: 12px; line-height: 1.7; }
+.history-baseline h3 { margin: 0; color: #59556f; font-size: 16px; font-weight: 550; }
+.history-editor-group + .history-editor-group { margin-top: 26px; padding-top: 22px; border-top: 1px solid var(--line); }
+.history-editor-name { margin: 0 0 12px; color: #514a67; font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+.history-edit + .history-edit { margin-top: 18px; }
+.history-edit > time { display: block; color: #85818f; font-size: 11px; }
+.history-change { margin-top: 9px; }
+.history-change h4 { margin: 0 0 6px; color: #777181; font-size: 11px; font-weight: 600; }
+.history-change-line { display: flex; align-items: baseline; gap: 12px; margin: 4px 0; padding: 9px 12px; border-radius: 5px; font-size: 13px; line-height: 1.7; }
+.history-change-label { flex: 0 0 54px; font-size: 10px; font-weight: 600; }
+.history-change-line ins, .history-change-line del { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.history-deletion { background: #fff1f1; color: #874b53; }
+.history-insertion { background: #edf7f0; color: #36684b; }
+.history-insertion ins { text-decoration: none; }
 .history-note-title { margin: 0 0 20px; color: #383a49; font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino, Georgia, serif; font-size: clamp(28px, 2.6vw, 36px); font-weight: 400; line-height: 1.35; letter-spacing: -.8px; overflow-wrap: anywhere; }
 .history-empty { color: #85818f; font-size: 14px; line-height: 1.8; }
 .history-footer { display: flex; flex-shrink: 0; align-items: center; justify-content: space-between; gap: 12px; padding: 12px clamp(18px, 2.5vw, 40px); border-top: 1px solid var(--line); background: #fafafd; }

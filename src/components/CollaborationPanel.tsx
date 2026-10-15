@@ -1,6 +1,8 @@
 import { Copy, UsersRound, X } from 'lucide-react'
 import type { CollaborationView } from '../hooks/useCollaboration'
 import type { Note } from '../lib/notes'
+import { WEBRTC_UNAVAILABLE_MESSAGE } from '../lib/collaboration/transport'
+import PeerIdentity, { isCanonicalPubkyId } from './PeerIdentity'
 
 interface Props {
   invitation: boolean
@@ -8,6 +10,7 @@ interface Props {
   note?: Note
   sharedTitle?: string
   signedIn: boolean
+  ownOwner?: string
   disabled: boolean
   close(): void
   connect(): void
@@ -38,8 +41,18 @@ export default function CollaborationPanel(props: Props) {
   const { invitation, view, note, signedIn, disabled } = props
   const active = !!view.noteId && !invitation
   const failed = !!view.status?.issue || view.status?.state === 'error' || view.status?.state === 'disconnected' || !!view.error
-  const connectionMessage = view.status?.issue === 'direct-connection-failed'
-    ? 'Could not establish a direct connection. The TURN relay for syncing edits is unavailable. Keep both browsers online or try another network.'
+  const unavailable = view.status?.issue === 'webrtc-unavailable'
+  const verifiedRequest = view.request && isCanonicalPubkyId(view.request.owner)
+  const peerOwner = view.request ? view.request.owner : view.status?.peerIdentity
+  const connectionMessage = unavailable ? WEBRTC_UNAVAILABLE_MESSAGE
+    : view.status?.issue === 'identity-unavailable'
+    ? 'Connect your Pubky account again to verify your identity for collaboration.'
+    : view.status?.issue === 'identity-verification-failed'
+    ? 'The other person’s Pubky identity could not be verified. Ask them to reconnect their Pubky account, then retry.'
+    : view.status?.issue === 'handshake-failed'
+    ? 'The browsers did not finish setting up the connection. Check the other browser for an error, keep both notes open, then retry.'
+    : view.status?.issue === 'direct-connection-failed'
+    ? 'Could not establish a direct connection. The TURN relay needed to sync edits between these networks is unavailable. You can keep editing your private copy.'
     : view.status?.issue === 'connection-failed'
       ? 'The connection failed. Check that both people are online, then retry.'
       : view.error
@@ -52,16 +65,15 @@ export default function CollaborationPanel(props: Props) {
     </> : active ? <>
       <p className="collaboration-panel-status" role="status">{collaborationStatusLabel(view)}</p>
       {connectionMessage && <p className="inline-error" role="alert">{connectionMessage}</p>}
+      {peerOwner && isCanonicalPubkyId(peerOwner) && <PeerIdentity owner={peerOwner} ownOwner={props.ownOwner} copy={props.copy} />}
       {view.request ? <div className="collaboration-request">
-        <p>Allow this person to edit?</p>
-        <p className="hint">Compare code <strong>{view.request.fingerprint}</strong> with your invitee. It identifies their browser, not a verified Pubky profile.</p>
-        <div className="collaboration-panel-actions"><button className="button primary small" disabled={view.working} onClick={props.approve}>Allow collaborator</button><button className="button ghost small" onClick={props.reject}>Decline</button></div>
+        {verifiedRequest ? <p>Allow this person to edit?</p> : <p className="inline-error" role="alert">This person’s Pubky identity could not be verified.</p>}
+        <div className="collaboration-panel-actions">{verifiedRequest && <button className="button primary small" disabled={view.working} onClick={props.approve}>Allow collaborator</button>}<button className="button ghost small" onClick={props.reject}>Decline</button></div>
       </div> : view.link && <div className="collaboration-invitation"><input aria-label="Invitation link" readOnly value={view.link} onFocus={event => event.target.select()} /><button className="button secondary small" aria-label="Copy invitation link" onClick={() => props.copy(view.link!)}><Copy size={15} /> Copy link</button></div>}
-      {view.role === 'guest' && view.ownFingerprint && view.status?.state !== 'connected' && <p className="hint">Your connection code: <strong>{view.ownFingerprint}</strong>. Share it with the inviter.</p>}
       {failed && <div className="collaboration-panel-actions"><button className="button secondary small" onClick={props.retry}>Retry connection</button></div>}
       <details className="collaboration-details"><summary>Details</summary>
         <p>Each person saves the shared note privately. Folders and Trash stay personal. Both browsers must be online to sync.</p>
-        {view.status && <p>{view.status.relayAvailable ? 'TURN relay fallback for syncing edits is configured.' : 'Direct connections only: the TURN relay for syncing edits is unavailable.'}</p>}
+        {view.status && !unavailable && <p>{view.status.relayAvailable ? 'TURN relay fallback for syncing edits is configured.' : 'Direct connections only: the TURN relay for syncing edits is unavailable.'}</p>}
         {view.error && view.error !== connectionMessage && <p>{view.error}</p>}
         <button className="button ghost small" onClick={props.disconnect}>Disconnect collaboration</button>
       </details>

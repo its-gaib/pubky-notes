@@ -1,3 +1,4 @@
 export { createGuestRoom, createHostRoom, deleteRoom, fingerprint, invitationUrl, loadRoom, parseInvitation } from './credentials'
-export { startCollaboration } from './transport'
-export type { CollaborationCallbacks, CollaborationOptions, CollaborationStatus, CollaborationTransport, Invitation, JoinRequest, SharedDescriptor, StoredRoom } from './types'
+export { startCollaboration, webRtcAvailable, WEBRTC_UNAVAILABLE_MESSAGE } from './transport'
+export { IDENTITY_UNAVAILABLE_MESSAGE } from './identity'
+export type { CollaborationCallbacks, CollaborationIdentity, CollaborationOptions, CollaborationStatus, CollaborationTransport, Invitation, JoinRequest, SharedDescriptor, StoredRoom } from './types'

@@ -18,7 +18,7 @@ const test = base.extend<{ accounts: Peer[] }>({
   }, { timeout: 60_000 }],
 })
 
-async function peer(browser: Browser, relayOnly = false): Promise<Peer> {
+async function peer(browser: Browser, relayOnly = false, beforeSignIn?: (page: Page) => Promise<void>): Promise<Peer> {
   const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } })
   context.setDefaultTimeout(15_000)
   if (relayOnly) await context.route('**/api/collaboration-ice', route => route.fulfill({ json: {
@@ -61,6 +61,7 @@ async function peer(browser: Browser, relayOnly = false): Promise<Peer> {
     if (message.type() === 'error' && message.text().includes('Maximum update depth exceeded')) browserErrors.push(message.text())
   })
   try {
+    await beforeSignIn?.(page)
     await page.goto(`${BASE}/e2e/fixture.html`)
     const owner = await page.evaluate(async () => {
       const path = '/e2e/browser-account.ts'
@@ -84,11 +85,27 @@ async function notes(page: Page): Promise<Note[]> {
 
 async function cleanup(peers: Peer[]) {
   const failures: unknown[] = []
+  const unloaded = new Set<Page>()
+  // Disconnect waits for the current homeserver save to release its lock.
+  // Navigating away first can abort that save before its finally block runs.
   for (const { page, context } of peers) {
     try {
       await context.setOffline(false)
-      // Unload the app before deleting files so autosave cannot recreate them.
+      const disconnect = page.getByRole('button', { name: 'Disconnect from Pubky', includeHidden: true })
+      if (await disconnect.count()) {
+        await expect(disconnect).toBeEnabled()
+        // The account button is in the collapsed sidebar at phone widths.
+        await disconnect.evaluate(button => (button as HTMLButtonElement).click())
+        await expect(disconnect).toHaveCount(0)
+      }
       await page.goto(`${BASE}/e2e/fixture.html`)
+      unloaded.add(page)
+    } catch (error) { failures.push(error) }
+  }
+  // Both apps are stopped before any disposable account files are removed.
+  for (const { page, context } of peers) {
+    try {
+      if (!unloaded.has(page)) continue
       await page.evaluate(async () => {
         const path = '/e2e/browser-account.ts'
         try { await (await import(/* @vite-ignore */ path)).cleanAccount() }
@@ -113,7 +130,7 @@ async function connected(page: Page) {
   }), { message: 'An actual WebRTC data channel must open' }).toBe(true)
 }
 
-async function share(alice: Page, bob: Page) {
+async function createInvitation(alice: Page) {
   await alice.getByRole('button', { name: 'New note', exact: true }).first().click()
   await alice.getByRole('textbox', { name: 'Note title' }).fill('E2E shared draft')
   await alice.getByRole('textbox', { name: 'Markdown content' }).fill('DELETED PRIVATE TEXT MUST NOT BE SHARED')
@@ -128,11 +145,30 @@ async function share(alice: Page, bob: Page) {
   const encoded = new URL(link).hash.slice('#collaborate='.length)
   const id = JSON.parse(Buffer.from(decodeURIComponent(encoded), 'base64url').toString()).descriptor.id as string
   await alice.getByRole('textbox', { name: 'Markdown content' }).focus()
-  await bob.goto(link)
+  return { id, link }
+}
+
+async function acceptInvitation(alice: Page, bob: Page) {
+  const [hostOwner, guestOwner] = await Promise.all([alice, bob].map(page =>
+    page.evaluate(() => localStorage.getItem('pubky-notes:e2e:disposable-account'))))
+  expect(hostOwner).toBeTruthy()
+  expect(guestOwner).toBeTruthy()
   await expect(bob.getByRole('region', { name: 'Collaboration', exact: true })).toBeVisible()
   await expect(bob.getByRole('dialog')).toHaveCount(0)
   await bob.getByRole('button', { name: 'Join collaboration', exact: true }).click()
   await expect(alice.getByRole('button', { name: 'Allow collaborator' })).toBeVisible()
+  await expect(alice.getByRole('button', { name: 'Copy verified Pubky identifier' })).toHaveText(`pubky${guestOwner}`)
+  await expect(bob.getByRole('button', { name: 'Copy verified Pubky identifier' })).toHaveText(`pubky${hostOwner}`)
+  await expect(alice.getByText('You don’t follow this person.')).toBeVisible()
+  await expect(bob.getByText('You don’t follow this person.')).toBeVisible()
+  if (test.info().title.startsWith('shared history')) {
+    await alice.screenshot({ path: test.info().outputPath('verified-approval-desktop.png'), fullPage: true })
+    const previousViewport = bob.viewportSize()!
+    await bob.setViewportSize({ width: 390, height: 844 })
+    expect(await bob.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+    await bob.screenshot({ path: test.info().outputPath('verified-inviter-phone.png'), fullPage: true })
+    await bob.setViewportSize(previousViewport)
+  }
   await expect(alice.getByRole('textbox', { name: 'Markdown content' })).toBeFocused()
   await expect(alice.getByRole('dialog')).toHaveCount(0)
   // Approval is an actual authorization boundary: no document or peer channel yet.
@@ -161,6 +197,12 @@ async function share(alice: Page, bob: Page) {
       throw error
     }
   }))
+}
+
+async function share(alice: Page, bob: Page) {
+  const { id, link } = await createInvitation(alice)
+  await bob.goto(link)
+  await acceptInvitation(alice, bob)
   return id
 }
 
@@ -268,6 +310,93 @@ test('approved browsers exchange real RTC edits, keep independent private files,
     await expect.poll(() => bob.page.evaluate(() => (window as typeof window & { __testChannels: RTCDataChannel[] }).__testChannels.every(channel => channel.readyState === 'closed'))).toBe(true)
     await insert(alice.page, 'end', '\nAfter Bob signed out')
     expect((await notes(bob.page)).find(row => row.note.id === id)?.note.content).toBe(merged)
+})
+
+test('shared history shows who added and removed text across both browsers and reload', async ({ browser, accounts: peers }) => {
+  const alice = await peer(browser); peers.push(alice)
+  const bob = await peer(browser); peers.push(bob)
+  const id = await share(alice.page, bob.page)
+  const aliceLine = '\nAlice authored this line.'
+  await insert(alice.page, 'end', aliceLine)
+  await expect(bob.page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(BODY + aliceLine)
+  for (const { page } of peers) await page.keyboard.press('Control+s')
+  await Promise.all(peers.map(({ page }) => saved(page, id, BODY + aliceLine)))
+  // Bob removes Alice's entire addition. Deletion ownership must be Bob's.
+  await bob.page.getByRole('textbox', { name: 'Markdown content' }).fill(BODY)
+  await expect(alice.page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(BODY)
+  for (const { page } of peers) await page.keyboard.press('Control+s')
+  await Promise.all(peers.map(({ page }) => saved(page, id, BODY)))
+  for (const { page } of peers) {
+    await page.reload()
+    await expect(page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(BODY)
+    if (page === bob.page) await page.setViewportSize({ width: 390, height: 844 })
+    await page.getByRole('button', { name: 'Version history', exact: true }).click()
+    const slider = page.getByRole('slider', { name: 'Version timeline' })
+    const changes = page.getByRole('article', { name: 'Version changes' })
+    const bobEdits = changes.getByRole('region', { name: `Edits by Editor ${bob.owner.slice(-12)}`, exact: true })
+    await expect(bobEdits.locator('del')).toContainText('Alice authored this line.')
+    const last = Number(await slider.getAttribute('max'))
+    let foundAlice = false
+    for (let index = 1; index < last; index++) {
+      await slider.fill(String(index))
+      const aliceEdits = changes.getByRole('region', { name: `Edits by Editor ${alice.owner.slice(-12)}`, exact: true })
+      if (await aliceEdits.count()) {
+        await expect(aliceEdits.locator('ins')).toContainText('Alice authored this line.')
+        foundAlice = true
+      }
+    }
+    expect(foundAlice).toBe(true)
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+    await page.screenshot({ path: test.info().outputPath(`history-attribution-${peers.indexOf(peers.find(peer => peer.page === page)!)}.png`), fullPage: true })
+  }
+})
+
+test('unavailable WebRTC explains the browser problem before sharing a private note', async ({ browser, accounts: peers }) => {
+  const alice = await peer(browser); peers.push(alice)
+  await alice.page.getByRole('button', { name: 'New note', exact: true }).first().click()
+  await alice.page.getByRole('textbox', { name: 'Markdown content' }).fill('Original remains private')
+  await alice.page.keyboard.press('Control+s')
+  await expect.poll(async () => (await notes(alice.page)).length).toBe(1)
+  await alice.page.evaluate(() => { Object.defineProperty(window, 'RTCPeerConnection', { value: undefined, configurable: true }) })
+  await alice.page.getByRole('button', { name: 'Collaborate', exact: true }).click()
+  await alice.page.getByRole('button', { name: 'Create shared copy' }).click()
+  await expect(alice.page.getByRole('alert')).toContainText('WebRTC')
+  expect((await notes(alice.page)).length).toBe(1)
+  expect((await notes(alice.page))[0].note.crdt?.version).toBe(1)
+  await expect(alice.page.getByRole('textbox', { name: 'Invitation link' })).toHaveCount(0)
+})
+
+test('pending invitation survives sign-in and reload until the recipient explicitly joins', async ({ browser, accounts: peers }) => {
+  const alice = await peer(browser); peers.push(alice)
+  const { id, link } = await createInvitation(alice.page)
+  const bob = await peer(browser, false, async page => {
+    await page.goto(link)
+    await expect(page.getByRole('button', { name: 'Connect Pubky to join', exact: true })).toBeVisible()
+    expect(new URL(page.url()).hash).toBe('')
+    await page.reload()
+    await expect(page.getByRole('button', { name: 'Connect Pubky to join', exact: true })).toBeVisible()
+    expect(new URL(page.url()).hash).toBe('')
+    await expect(alice.page.getByRole('button', { name: 'Allow collaborator' })).toHaveCount(0)
+    // peer() now signs in a fresh disposable identity on the fixture page and
+    // returns to the app without an invitation fragment, in this same tab.
+  }); peers.push(bob)
+  expect(new URL(bob.page.url()).hash).toBe('')
+  await expect(bob.page.getByRole('button', { name: 'Join collaboration', exact: true })).toBeVisible()
+  await bob.page.reload()
+  await expect(bob.page.getByRole('button', { name: 'Join collaboration', exact: true })).toBeVisible()
+  expect(await notes(bob.page)).toEqual([])
+  await expect(alice.page.getByRole('button', { name: 'Allow collaborator' })).toHaveCount(0)
+  await acceptInvitation(alice.page, bob.page)
+  await insert(bob.page, 'end', '\nJoined after signing in.')
+  const merged = `${BODY}\nJoined after signing in.`
+  for (const { page } of peers) await expect(page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(merged)
+  await Promise.all(peers.map(({ page }) => saved(page, id, merged)))
+  await bob.page.reload()
+  await connected(bob.page)
+  await expect(bob.page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(merged)
+  await expect(bob.page.getByRole('button', { name: 'Join collaboration', exact: true })).toHaveCount(0)
+  await expect(bob.page.getByRole('button', { name: 'Connect Pubky to join', exact: true })).toHaveCount(0)
+  await expect(alice.page.getByRole('button', { name: 'Allow collaborator' })).toHaveCount(0)
 })
 
 test('offline branches merge on reconnection and reload reuses the approved browser identity', async ({ browser, accounts: peers }) => {

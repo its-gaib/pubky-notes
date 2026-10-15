@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { CrdtNote, NotePatch } from '../lib/crdt'
+import type { CrdtNote, NoteEditor, NotePatch } from '../lib/crdt'
 import { checkpointNote, editNote, mergeNotes, readNoteVersion } from '../lib/crdt'
 import { createSharedNote, joinSharedNote, SharedNoteDocument, sharedNoteDescriptor } from '../lib/shared-note'
 import {
-  createGuestRoom, createHostRoom, fingerprint, invitationUrl, loadRoom, parseInvitation, startCollaboration,
+  createGuestRoom, createHostRoom, fingerprint, invitationUrl, loadRoom, parseInvitation, startCollaboration, webRtcAvailable, WEBRTC_UNAVAILABLE_MESSAGE, IDENTITY_UNAVAILABLE_MESSAGE,
 } from '../lib/collaboration'
-import type { CollaborationStatus, CollaborationTransport, Invitation, JoinRequest, StoredRoom } from '../lib/collaboration'
+import type { CollaborationOptions, CollaborationStatus, CollaborationTransport, Invitation, JoinRequest, StoredRoom } from '../lib/collaboration'
 import { SelectionPresence } from '../lib/collaboration/presence'
 import type { EditorSelection, RemoteSelection } from '../lib/collaboration/presence'
+import { clearPendingInvitation, readPendingInvitation, savePendingInvitation } from '../lib/collaboration/pending-invitation'
 
 interface Options {
   scope: string
@@ -15,6 +16,8 @@ interface Options {
   notes: CrdtNote[]
   activeId?: string
   displayName?: string
+  editorId?: string
+  identity?: CollaborationOptions['identity']
   persist(note: CrdtNote, scope: string, select?: boolean): Promise<void>
   beforeRemoteChange(doc: SharedNoteDocument, rendered?: SharedNoteDocument): (() => void) | undefined
 }
@@ -64,23 +67,10 @@ export function useCollaboration(options: Options) {
   const [view, setView] = useState<CollaborationView>(initial)
   const [remoteSelection, setRemoteSelection] = useState<RemoteSelection | null>(null)
   const [invitation, setInvitation] = useState<Invitation | null>(() => {
-    try { return parseInvitation(window.location.hash) } catch { return null }
+    try { return parseInvitation(window.location.hash) ?? readPendingInvitation() } catch { return null }
   })
-  useEffect(() => {
-    function consumeInvitation() {
-      if (!new URLSearchParams(window.location.hash.slice(1)).has('collaborate')) return
-      try { setInvitation(parseInvitation(window.location.hash)) }
-      catch { setView(previous => ({ ...previous, error: 'This collaboration invitation is invalid.' })) }
-      finally {
-        // Hash navigation can open an invitation in an already-mounted notebook.
-        // Never retain the bearer secret in the address bar after consuming it.
-        window.history.replaceState(null, '', window.location.pathname + window.location.search)
-      }
-    }
-    consumeInvitation()
-    window.addEventListener('hashchange', consumeInvitation)
-    return () => window.removeEventListener('hashchange', consumeInvitation)
-  }, [])
+  const invitationRef = useRef(invitation); invitationRef.current = invitation
+  const invitationEpoch = useRef(0)
   const current = useCallback((connection: LiveRoom) => connection.alive && live.current === connection &&
     latest.current.enabled && latest.current.scope === connection.room.scope, [])
   const stop = useCallback(() => {
@@ -96,8 +86,42 @@ export function useCollaboration(options: Options) {
   }, [])
   useEffect(() => { stop(); paused.current = ''; return stop }, [options.scope, options.enabled, stop])
 
+  useEffect(() => {
+    function consumeInvitation() {
+      if (!new URLSearchParams(window.location.hash.slice(1)).has('collaborate')) return
+      invitationEpoch.current++
+      try {
+        const next = parseInvitation(window.location.hash)
+        if (!next) throw new Error('Invalid invitation.')
+        invitationRef.current = next; setInvitation(next)
+        try { savePendingInvitation(next) }
+        catch {
+          clearPendingInvitation()
+          setView(previous => ({ ...previous, error: 'This browser cannot remember the invitation after a reload. Keep this tab open while signing in.' }))
+        }
+      } catch {
+        invitationRef.current = null; setInvitation(null); clearPendingInvitation()
+        setView(previous => ({ ...previous, error: 'This collaboration invitation is invalid.' }))
+      } finally {
+        // Stage the link before removing its bearer secret from the address bar.
+        window.history.replaceState(null, '', window.location.pathname + window.location.search)
+      }
+    }
+    consumeInvitation()
+    window.addEventListener('hashchange', consumeInvitation)
+    return () => window.removeEventListener('hashchange', consumeInvitation)
+  }, [])
+
   const attach = useCallback((room: StoredRoom, note?: CrdtNote) => {
     stop()
+    if (!webRtcAvailable() || !latest.current.identity) {
+      const unavailable = !webRtcAvailable()
+      paused.current = `${room.scope}:${room.descriptor.id}`
+      setView({ ...initial, noteId: room.descriptor.id, role: room.role,
+        status: { state: 'error', relayAvailable: false, issue: unavailable ? 'webrtc-unavailable' : 'identity-unavailable' },
+        error: unavailable ? WEBRTC_UNAVAILABLE_MESSAGE : IDENTITY_UNAVAILABLE_MESSAGE })
+      return
+    }
     paused.current = ''
     const connection: LiveRoom = { room, doc: note ? new SharedNoteDocument(note) : undefined, connected: false, alive: true }
     live.current = connection
@@ -179,7 +203,7 @@ export function useCollaboration(options: Options) {
           connection.presence?.receive(payload)
         } else throw new Error('Unsupported collaboration message.')
       },
-    })
+    }, { identity: latest.current.identity })
     // Reconcile periodically as well as on open. This repairs startup event
     // races and temporary send backpressure without requiring a page reload.
     connection.syncTimer = setInterval(() => {
@@ -239,6 +263,8 @@ export function useCollaboration(options: Options) {
 
   async function start(note: CrdtNote) {
     if (!latest.current.enabled) throw new Error('Connect Pubky before collaborating.')
+    if (!webRtcAvailable()) throw new Error(WEBRTC_UNAVAILABLE_MESSAGE)
+    if (!latest.current.identity) throw new Error(IDENTITY_UNAVAILABLE_MESSAGE)
     const scope = latest.current.scope, epoch = generation.current
     setView(previous => ({ ...previous, working: true, error: undefined }))
     try {
@@ -252,25 +278,40 @@ export function useCollaboration(options: Options) {
     } finally { if (scope === latest.current.scope) setView(previous => ({ ...previous, working: false })) }
   }
   async function join() {
-    if (!invitation || !latest.current.enabled) return
-    const scope = latest.current.scope, epoch = generation.current
+    const pending = invitationRef.current
+    if (!pending || !latest.current.enabled) return
+    if (!webRtcAvailable()) throw new Error(WEBRTC_UNAVAILABLE_MESSAGE)
+    if (!latest.current.identity) throw new Error(IDENTITY_UNAVAILABLE_MESSAGE)
+    const scope = latest.current.scope, epoch = generation.current, inviteEpoch = invitationEpoch.current
+    const canceled = () => scope !== latest.current.scope || !latest.current.enabled || epoch !== generation.current || inviteEpoch !== invitationEpoch.current
     setView(previous => ({ ...previous, working: true, error: undefined }))
     try {
-      const existing = latest.current.notes.find(note => note.id === invitation.descriptor.id)
-      if (existing && (existing.crdt?.version !== 2 || existing.crdt.lineage !== invitation.descriptor.lineage || existing.createdAt !== invitation.descriptor.createdAt)) {
+      const existing = latest.current.notes.find(note => note.id === pending.descriptor.id)
+      if (existing && (existing.crdt?.version !== 2 || existing.crdt.lineage !== pending.descriptor.lineage || existing.createdAt !== pending.descriptor.createdAt)) {
         throw new Error('This invitation conflicts with another note. Your existing note was retained.')
       }
       if (existing?.deleted) throw new Error('Restore your copy from Trash before joining again.')
-      const stored = await loadRoom(scope, invitation.descriptor.id)
-      const room = stored?.room === invitation.room && stored.hostKey === invitation.hostKey && stored.secret === invitation.secret
-        ? stored : await createGuestRoom(scope, invitation)
-      if (scope !== latest.current.scope || !latest.current.enabled || epoch !== generation.current) return
-      attach(room, existing); setInvitation(null)
+      const stored = await loadRoom(scope, pending.descriptor.id)
+      if (canceled()) return
+      const room = stored?.room === pending.room && stored.hostKey === pending.hostKey && stored.secret === pending.secret &&
+        stored.descriptor.createdAt === pending.descriptor.createdAt && stored.descriptor.lineage === pending.descriptor.lineage
+        ? stored : await createGuestRoom(scope, pending)
+      if (canceled()) return
+      if (!webRtcAvailable()) throw new Error(WEBRTC_UNAVAILABLE_MESSAGE)
+      attach(room, existing)
+      clearPendingInvitation(pending)
+      invitationRef.current = null; setInvitation(null)
     } finally { if (scope === latest.current.scope) setView(previous => ({ ...previous, working: false })) }
   }
+  function editorIdentity(): NoteEditor | undefined {
+    const id = latest.current.editorId
+    if (!id) return undefined
+    return { id, label: latest.current.displayName || `Editor ${id.slice(-12)}` }
+  }
   function edit(note: CrdtNote, patch: NotePatch): CrdtNote {
+    const author = editorIdentity()
     const connection = live.current
-    if (!connection || !current(connection) || connection.doc?.note.id !== note.id) return editNote(note, patch)
+    if (!connection || !current(connection) || connection.doc?.note.id !== note.id) return editNote(note, patch, author)
     connection.doc.mergeLocal(note)
     const before = connection.doc.getStateVector(), previous = connection.doc.note.crdt!.update
     let next: CrdtNote
@@ -280,7 +321,7 @@ export function useCollaboration(options: Options) {
       // those operations; diffing this full string against the advanced live
       // document would turn unseen peer insertions into local deletions.
       const { folder, deleted, ...textPatch } = patch
-      const edited = editNote(note, textPatch), merged = mergeNotes(connection.doc.note, edited)
+      const edited = editNote(note, textPatch, author), merged = mergeNotes(connection.doc.note, edited)
       // Stage explicit private changes against the latest personal map, and
       // validate the complete result before committing to the live document.
       const candidate = 'folder' in patch || 'deleted' in patch
@@ -291,7 +332,7 @@ export function useCollaboration(options: Options) {
         next = connection.doc.mergeLocal(candidate)
         restoreSelection?.()
       } finally { rendered.destroy() }
-    } else next = connection.doc.edit(patch)
+    } else next = connection.doc.edit(patch, author)
     connection.presence?.refresh()
     if (previous !== next.crdt!.update) sendDifference(connection, before)
     return next
@@ -309,7 +350,7 @@ export function useCollaboration(options: Options) {
     // received before this click. Save that text first so it remains recoverable.
     const currentNote = checkpointNote(connected ? mergeNotes(connected.doc!.note, note) : note)
     const text = readNoteVersion(currentNote, id)
-    const next = checkpointNote(editNote(currentNote, text), { restoredFrom: id })
+    const next = checkpointNote(editNote(currentNote, text, editorIdentity()), { restoredFrom: id })
     if (connected) {
       const before = connected.doc!.getStateVector()
       connected.doc!.mergeLocal(next)
@@ -331,7 +372,12 @@ export function useCollaboration(options: Options) {
   }
   function reconnect() {
     const connection = live.current
-    if (!connection || !current(connection)) return
+    if (!connection) {
+      const note = latest.current.notes.find(note => note.id === view.noteId)
+      if (['webrtc-unavailable', 'identity-unavailable'].includes(view.status?.issue ?? '') && note) void start(note).catch(error => setView(previous => ({ ...previous, error: error.message })))
+      return
+    }
+    if (!current(connection)) return
     setView(previous => ({ ...previous, error: undefined }))
     connection.transport?.reconnect()
   }
@@ -340,6 +386,12 @@ export function useCollaboration(options: Options) {
     if (!connection || !current(connection) || connection.room.descriptor.id !== noteId || latest.current.activeId !== noteId) return
     connection.presence?.update(selection)
   }, [current])
+  function dismissInvitation() {
+    invitationEpoch.current++
+    const pending = invitationRef.current
+    invitationRef.current = null; setInvitation(null)
+    if (pending) clearPendingInvitation(pending)
+  }
   return { view, invitation, start, join, edit, checkpoint, restoreVersion, approve, reject, stop, updateSelection, remoteSelection,
-    dismissInvitation: () => setInvitation(null), reconnect }
+    dismissInvitation, reconnect }
 }
