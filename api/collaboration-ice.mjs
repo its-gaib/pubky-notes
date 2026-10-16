@@ -5,6 +5,7 @@ const STUN = [{ urls: 'stun:stun.l.google.com:19302' }]
 const TTL_SECONDS = 600
 const CLOUDFLARE_URLS = new Set([
   'stun:stun.cloudflare.com:3478',
+  'stun:stun.cloudflare.com:443',
   'turn:turn.cloudflare.com:3478?transport=udp',
   'turn:turn.cloudflare.com:443?transport=udp',
   'turn:turn.cloudflare.com:3478?transport=tcp',

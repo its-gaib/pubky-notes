@@ -3,7 +3,11 @@ import type { Browser, BrowserContext, Page } from '@playwright/test'
 
 const BASE = 'http://127.0.0.1:4174'
 const BODY = '# Shared draft\n\nMiddle paragraph.\n\nLast paragraph.'
-type Peer = { context: BrowserContext; page: Page; owner: string; browserErrors: string[]; iceRequests: () => number }
+const TLS_ONLY = process.env.COLLAB_E2E_ICE_TRANSPORT === 'tls'
+if (process.env.COLLAB_E2E_ICE_TRANSPORT && !TLS_ONLY) throw new Error('COLLAB_E2E_ICE_TRANSPORT must be unset or tls.')
+if (TLS_ONLY && !process.env.COLLAB_E2E_ICE_ENDPOINT) throw new Error('TLS-only verification requires COLLAB_E2E_ICE_ENDPOINT.')
+type IceIssuance = { receivedAt: number; expiresAt: number }
+type Peer = { context: BrowserContext; page: Page; owner: string; browserErrors: string[]; iceRequests: () => number; iceIssuances: () => IceIssuance[] }
 type Note = { note: { id: string; title: string; content: string; folder?: string; crdt?: { version: number; update: string } }; published: unknown }
 type RelayFixture = { firstExpiryMs?: number }
 type IceResponse = { iceServers: RTCIceServer[]; relayAvailable: true; expiresAt: number }
@@ -75,7 +79,12 @@ async function relayCredentials(): Promise<IceResponse> {
       return { urls, username, credential }
     })
     if (!hasTurn) return fail()
-    return { iceServers, relayAvailable: true, expiresAt: result.expiresAt }
+    const selectedServers = TLS_ONLY ? iceServers.flatMap(server => {
+      const urls = server.urls.filter(value => value === 'turns:turn.cloudflare.com:443?transport=tcp')
+      return urls.length ? [{ ...server, urls }] : []
+    }) : iceServers
+    if (!selectedServers.length) return fail()
+    return { iceServers: selectedServers, relayAvailable: true, expiresAt: result.expiresAt }
   } catch { return fail() } // Never include provider bodies, headers, or credentials in diagnostics.
 }
 
@@ -84,9 +93,12 @@ async function peer(browser: Browser, relayOnly = false, beforeSignIn?: (page: P
   context.setDefaultTimeout(15_000)
   let issued = 0
   const iceRequests = () => issued
+  const issuances: IceIssuance[] = []
+  const iceIssuances = () => issuances.map(value => ({ ...value }))
   if (relayOnly) await context.route('**/api/collaboration-ice', async route => {
     const response = await relayCredentials()
     issued++
+    issuances.push({ receivedAt: Date.now(), expiresAt: response.expiresAt })
     if (issued === 1 && relayFixture.firstExpiryMs) response.expiresAt = Math.min(response.expiresAt, Date.now() + relayFixture.firstExpiryMs)
     await route.fulfill({ json: response })
   })
@@ -134,9 +146,9 @@ async function peer(browser: Browser, relayOnly = false, beforeSignIn?: (page: P
     })
     await page.goto(BASE)
     await expect(page.getByRole('button', { name: 'Disconnect from Pubky' })).toBeVisible()
-    return { context, page, owner, browserErrors, iceRequests }
+    return { context, page, owner, browserErrors, iceRequests, iceIssuances }
   } catch (error) {
-    await cleanup([{ context, page, owner: '', browserErrors, iceRequests }])
+    await cleanup([{ context, page, owner: '', browserErrors, iceRequests, iceIssuances }])
     throw error
   }
 }
@@ -196,19 +208,36 @@ async function connected(page: Page) {
 }
 
 async function relayed(page: Page, firstConnection = 0) {
-  await expect.poll(() => page.evaluate(async first => {
+  await expect.poll(() => page.evaluate(async ({ first, tlsOnly }) => {
     const state = window as typeof window & { __testConnections: RTCPeerConnection[] }
     for (const connection of state.__testConnections.slice(first)) {
       if (connection.connectionState !== 'connected') continue
       const stats = await connection.getStats()
       for (const report of stats.values()) {
         if (report.type !== 'candidate-pair' || report.state !== 'succeeded' || !report.nominated) continue
-        if (stats.get(report.localCandidateId)?.candidateType === 'relay'
-          && stats.get(report.remoteCandidateId)?.candidateType === 'relay') return true
+        const local = stats.get(report.localCandidateId)
+        if (local?.candidateType === 'relay' && stats.get(report.remoteCandidateId)?.candidateType === 'relay'
+          && (!tlsOnly || local.relayProtocol === 'tls')) return true
       }
     }
     return false
-  }, firstConnection), { message: 'Both selected ICE candidates must be actual TURN relay allocations' }).toBe(true)
+  }, { first: firstConnection, tlsOnly: TLS_ONLY }), {
+    message: TLS_ONLY ? 'Both peers must use actual TURN allocations reached over TLS on port 443'
+      : 'Both selected ICE candidates must be actual TURN relay allocations',
+  }).toBe(true)
+}
+
+async function replacedAllocations(peers: Peer[], originalConnections: number[]) {
+  await Promise.all(peers.map(async ({ page }, index) => {
+    await expect.poll(() => page.evaluate(count => {
+      const connections = (window as typeof window & { __testConnections: RTCPeerConnection[] }).__testConnections
+      return connections.length > count && connections.slice(0, count).every(connection => connection.connectionState === 'closed')
+    }, originalConnections[index]), { message: 'Renewal must close the old RTCPeerConnection and construct a replacement' }).toBe(true)
+    await connected(page)
+    await relayed(page, originalConnections[index])
+    await expect(page.getByRole('button', { name: 'Allow collaborator' })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Join collaboration', exact: true })).toHaveCount(0)
+  }))
 }
 
 async function createInvitation(alice: Page) {
@@ -696,20 +725,54 @@ test('real TURN collaboration renews credentials and replaces allocations withou
   await expect.poll(() => peers.every(account => account.iceRequests() >= 2), {
     timeout: 45_000, message: 'Both peers must obtain fresh TURN credentials before the initial advertised expiry',
   }).toBe(true)
-  await Promise.all(peers.map(async ({ page }, index) => {
-    await expect.poll(() => page.evaluate(count => {
-      const connections = (window as typeof window & { __testConnections: RTCPeerConnection[] }).__testConnections
-      return connections.length > count && connections.slice(0, count).every(connection => connection.connectionState === 'closed')
-    }, originalConnections[index]), { message: 'Renewal must close the old RTCPeerConnection and construct a replacement' }).toBe(true)
-    await connected(page)
-    await relayed(page, originalConnections[index])
-    await expect(page.getByRole('button', { name: 'Allow collaborator' })).toHaveCount(0)
-    await expect(page.getByRole('button', { name: 'Join collaboration', exact: true })).toHaveCount(0)
-    await expect(page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(before)
-  }))
+  await replacedAllocations(peers, originalConnections)
+  for (const { page } of peers) await expect(page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(before)
 
   await Promise.all([insert(alice.page, 'start', 'Alice after renewal\n'), insert(bob.page, 'end', '\nBob after renewal')])
   const merged = `Alice after renewal\n${before}\nBob after renewal`
   for (const { page } of peers) await expect(page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(merged)
   await Promise.all(peers.map(({ page }) => saved(page, id, merged)))
+})
+
+test('real TURN collaboration keeps syncing beyond the original 600-second credential lifetime', async ({ browser, accounts: peers }) => {
+  test.skip(process.env.COLLAB_E2E_LONG_TURN !== '1', 'Opt in with COLLAB_E2E_LONG_TURN=1 for actual credential-lifetime verification.')
+  test.setTimeout(13 * 60_000)
+  if (!process.env.COLLAB_E2E_ICE_ENDPOINT) throw new Error('Actual credential-lifetime verification requires COLLAB_E2E_ICE_ENDPOINT.')
+  // Keep the provider expiry unchanged and use real elapsed time throughout.
+  const alice = await peer(browser, true); peers.push(alice)
+  const bob = await peer(browser, true); peers.push(bob)
+  const id = await share(alice.page, bob.page)
+  await Promise.all(peers.map(({ page }) => relayed(page)))
+  const initial = peers.map(account => account.iceIssuances()[0])
+  expect(initial.every(value => value && value.expiresAt - value.receivedAt >= 570_000
+    && value.expiresAt - value.receivedAt <= 610_000), 'The provider must issue actual approximately 600-second credentials').toBe(true)
+  const originalConnections = await Promise.all(peers.map(({ page }) => page.evaluate(() =>
+    (window as typeof window & { __testConnections: RTCPeerConnection[] }).__testConnections.length)))
+  expect(originalConnections.every(count => count > 0)).toBe(true)
+  const firstExpiry = Math.min(...initial.map(value => value.expiresAt))
+  const afterInitialExpiry = Math.max(...initial.map(value => value.expiresAt)) + 15_000
+  let text = BODY, checkpoint = 0, renewalVerified = false
+  const exchange = async (label: string) => {
+    const addition = `\nTURN longevity ${++checkpoint}: ${label}`
+    await insert(peers[checkpoint % peers.length].page, 'end', addition)
+    text += addition
+    for (const { page } of peers) await expect(page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(text)
+    await Promise.all(peers.map(({ page }) => saved(page, id, text)))
+  }
+  await exchange('before renewal')
+  while (Date.now() < afterInitialExpiry) {
+    await alice.page.waitForTimeout(Math.min(30_000, afterInitialExpiry - Date.now()))
+    if (!renewalVerified && peers.every(account => account.iceRequests() >= 2)) {
+      await replacedAllocations(peers, originalConnections)
+      expect(Date.now(), 'Replacement allocations must be working before the initial credentials expire').toBeLessThan(firstExpiry)
+      renewalVerified = true
+    }
+    await exchange(renewalVerified ? 'after renewal' : 'waiting for renewal')
+    // Only timing/count metadata: never log ICE credentials, identifiers, or notes.
+    console.info(`TURN longevity checkpoint ${checkpoint}; renewal verified: ${renewalVerified}; seconds until original expiry: ${Math.max(0, Math.ceil((firstExpiry - Date.now()) / 1000))}`)
+  }
+  expect(renewalVerified, 'Both peers must renew and replace their allocations before the original expiry').toBe(true)
+  expect(Date.now()).toBeGreaterThanOrEqual(afterInitialExpiry)
+  await replacedAllocations(peers, originalConnections)
+  await exchange('both original credentials expired at least 15 seconds ago')
 })

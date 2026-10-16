@@ -231,7 +231,8 @@ const cloudflareEnv = {
   UPSTASH_REDIS_REST_TOKEN: configuredEnv.UPSTASH_REDIS_REST_TOKEN,
 }
 const cloudflareServers = [
-  { urls: ['stun:stun.cloudflare.com:3478'] },
+  // Cloudflare's live credential response includes both STUN ports.
+  { urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.cloudflare.com:443'] },
   {
     urls: [
       'turn:turn.cloudflare.com:3478?transport=udp',
@@ -449,6 +450,8 @@ test('managed TURN rejects malformed responses, unknown destinations, and oversi
     { iceServers: [{ ...relay, urls: Array(17).fill(relay.urls[0]) }] },
     { iceServers: [{ ...relay, urls: ['turn:127.0.0.1:3478?transport=udp'] }] },
     { iceServers: [{ ...relay, urls: ['turn:turn.cloudflare.com.attacker.example:3478?transport=udp'] }] },
+    { iceServers: [{ urls: ['stun:stun.cloudflare.com.attacker.example:443'] }, relay] },
+    { iceServers: [{ urls: ['stun:stun.cloudflare.com:53'] }, relay] },
     { iceServers: [{ ...relay, urls: ['turn:turn.cloudflare.com:53?transport=udp'] }] },
     { iceServers: [{ ...relay, urls: ['turns:turn.cloudflare.com:443?transport=udp'] }] },
     { iceServers: [{ ...relay, urls: [`${relay.urls[0]}&extra=1`] }] },
