@@ -58,16 +58,16 @@ function VerifiedIdentity({ owner, ownOwner, copy, compact }: Props) {
   }, [owner, ownOwner])
   const identifier = `pubky${owner}`
   const initials = name ? name.split(/\s+/u).slice(0, 2).map(word => [...word][0]).join('').toUpperCase() : owner.slice(0, 2).toUpperCase()
-  return <div className={`peer-identity${compact ? ' compact' : ''}`} aria-label="Verified collaborator identity">
+  return <div className={`peer-identity${compact ? ' compact' : ''}`} aria-label="Collaborator identity">
     <div className="peer-identity-heading">
       <span className="peer-avatar">{avatar ? <img src={avatar} alt="" onError={() => setAvatar('')} /> : <span aria-hidden="true">{initials}</span>}</span>
-      <div><strong dir="auto">{name || 'Pubky account'}</strong><span className="peer-verified"><ShieldCheck size={13} aria-hidden="true" />Verified Pubky account</span></div>
+      <div><strong dir="auto">{name || 'Pubky account'}</strong></div>
     </div>
-    <button type="button" className="peer-identifier" title="Copy verified Pubky identifier" aria-label="Copy verified Pubky identifier" onClick={() => copy(identifier)}><span dir="ltr">{identifier}</span><Copy size={13} aria-hidden="true" /></button>
+    <button type="button" className="peer-identifier" title="Copy Pubky identifier" aria-label="Copy Pubky identifier" onClick={() => copy(identifier)}><span dir="ltr">{identifier}</span><Copy size={13} aria-hidden="true" /></button>
     {profileState === 'loading' && <p className="hint">Loading public profile…</p>}
     {profileState === 'unavailable' && <p className="hint">Public profile unavailable. Use the Pubky identifier to recognize this person.</p>}
     {follow === 'loading' ? <p className="hint">Checking whether you follow this person…</p>
-      : follow === 'following' ? <p className="peer-followed">You follow this person.</p>
+      : follow === 'following' ? <p className="peer-followed"><ShieldCheck size={13} aria-hidden="true" />You follow this person.</p>
       : <p className="peer-follow-warning"><span>{follow === 'not-following' ? 'You don’t follow this person.' : 'Could not check whether you follow this person.'}</span> Check their Pubky identifier; names and pictures can be copied.</p>}
   </div>
 }

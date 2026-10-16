@@ -47,7 +47,7 @@ describe('persistent collaboration bar', () => {
     expect(document.activeElement).toBe(editor)
     expect(screen.queryByRole('button', { name: 'Allow collaborator' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Join collaboration' })).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'Copy verified Pubky identifier' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Copy Pubky identifier' }))
     expect(actions.copy).toHaveBeenCalledExactlyOnceWith(`pubky${peerOwner}`)
     fireEvent.click(screen.getByRole('button', { name: 'Shared research' }))
     expect(actions.openNote).toHaveBeenCalledOnce()

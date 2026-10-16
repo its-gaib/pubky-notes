@@ -296,7 +296,7 @@ async function acceptInvitation(alice: Page, bob: Page) {
   for (const [page, owner] of [[alice, guestOwner], [bob, hostOwner]] as const) {
     const bar = page.getByRole('region', { name: 'Active collaborators', exact: true })
     await expect(bar).toBeVisible()
-    await expect(bar.getByRole('button', { name: 'Copy verified Pubky identifier' })).toHaveText(`pubky${owner}`)
+    await expect(bar.getByRole('button', { name: 'Copy Pubky identifier' })).toHaveText(`pubky${owner}`)
     await expect(bar.getByText('You don’t follow this person.')).toBeVisible()
     await expect(page.getByRole('button', { name: 'Allow collaborator' })).toHaveCount(0)
     await expect(page.getByRole('button', { name: 'Join collaboration', exact: true })).toHaveCount(0)
@@ -342,8 +342,8 @@ async function groupConnected(peers: Peer[]) {
   try {
     for (const own of peers) {
       const bar = own.page.getByRole('region', { name: 'Active collaborators', exact: true })
-      await expect(bar.getByRole('button', { name: 'Copy verified Pubky identifier' })).toHaveCount(peers.length - 1, { timeout: 90_000 })
-      for (const other of peers.filter(peer => peer !== own)) await expect(bar.getByRole('button', { name: 'Copy verified Pubky identifier' }).filter({ hasText: `pubky${other.owner}` })).toHaveCount(1)
+      await expect(bar.getByRole('button', { name: 'Copy Pubky identifier' })).toHaveCount(peers.length - 1, { timeout: 90_000 })
+      for (const other of peers.filter(peer => peer !== own)) await expect(bar.getByRole('button', { name: 'Copy Pubky identifier' }).filter({ hasText: `pubky${other.owner}` })).toHaveCount(1)
     }
   } catch (error) {
     const diagnostics = await Promise.all(peers.map(async ({ page }) => ({ ...await page.evaluate(() => {
