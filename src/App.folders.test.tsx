@@ -30,13 +30,12 @@ async function open(records = [row('First'), row('Second')], folders: string[] =
   await act(async () => { fireEvent.click(screen.getByRole('button', { name: `Open note ${records[0].note.title}` })) })
   await waitFor(() => expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe(records[0].note.title))
 }
-function folderMenu(path: string, action: string) {
-  fireEvent.click(screen.getByRole('button', { name: `Folder actions for ${path}` }))
-  fireEvent.click(screen.getByRole('menuitem', { name: action }))
+function renameFolder(path: string) {
+  fireEvent.click(folder(path))
+  if (!screen.queryByRole('textbox', { name: 'Folder name' })) fireEvent.click(folder(path))
 }
-function noteMenu(title: string) {
-  fireEvent.click(screen.getByRole('button', { name: `Note actions for ${title}` }))
-  fireEvent.click(screen.getByRole('menuitem', { name: 'Move to…' }))
+function moveNote(title: string) {
+  fireEvent.click(screen.getByRole('button', { name: `Move note ${title}` }))
 }
 function folder(path: string) { return screen.getByRole('button', { name: `Open folder ${path}` }) }
 function folderName() { return screen.getByRole('textbox', { name: 'Folder name' }) as HTMLInputElement }
@@ -129,7 +128,7 @@ describe('sidebar folder management', { timeout: 15_000 }, () => {
     expect(mocks.publish).not.toHaveBeenCalled()
   })
 
-  it('keeps the active editor when browsing Trash and opens a restored note from its sidebar menu', async () => {
+  it('keeps the active editor when browsing Trash and opens a restored note from its sidebar icon', async () => {
     const deleted = row('Recoverable', 'Work')
     deleted.note.deleted = true
     await open([row('First'), deleted])
@@ -142,8 +141,7 @@ describe('sidebar folder management', { timeout: 15_000 }, () => {
     expect(screen.getByRole('button', { name: 'Open note First' })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Notebook options' }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'Trash' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Note actions for Recoverable' }))
-    await act(async () => { fireEvent.click(screen.getByRole('menuitem', { name: 'Restore' })) })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Restore note Recoverable' })) })
     await waitFor(() => expect(screen.queryByRole('navigation', { name: 'Deleted notes' })).toBeNull())
     await flush()
     const restored = (await readLocalNotebook(scopeForSession(session))).records.find(record => record.note.id === 'Recoverable')?.note
@@ -160,7 +158,7 @@ describe('sidebar folder management', { timeout: 15_000 }, () => {
     await open([row('First'), row('Second', undefined, true)], ['Work'])
     const noteUrl = window.location.pathname
     expect(document.querySelector('.editor-bottom button.folder-location')).toBeNull()
-    noteMenu('Second')
+    moveNote('Second')
     const destination = screen.getByRole('combobox', { name: 'Move note to' })
     expectInline(destination)
     fireEvent.change(destination, { target: { value: 'Work' } })
@@ -184,7 +182,7 @@ describe('sidebar folder management', { timeout: 15_000 }, () => {
     expect(folder('Work')).toBeTruthy()
     cleanup()
     await open(undefined, ['Work'])
-    folderMenu('Work', 'New subfolder')
+    fireEvent.click(screen.getByRole('button', { name: 'New subfolder in Work' }))
     expectInline(folderName())
     fireEvent.change(folderName(), { target: { value: 'Ideas' } })
     await submit('Create folder')
@@ -219,7 +217,7 @@ describe('sidebar folder management', { timeout: 15_000 }, () => {
     const original = row('First', 'Work', true)
     await open([original, row('Second', 'Work/Ideas'), row('Third', 'Workshop')], ['Work/Empty'])
     const noteUrl = window.location.pathname
-    folderMenu('Work', 'Rename')
+    renameFolder('Work')
     fireEvent.change(folderName(), { target: { value: 'Projects' } })
     await submit('Rename folder')
     expect(mocks.save.mock.calls.map(([, note]) => [note.id, note.folder, note.content]).sort()).toEqual([['First', 'Projects', 'Content of First'], ['Second', 'Projects/Ideas', 'Content of Second']])
@@ -235,7 +233,7 @@ describe('sidebar folder management', { timeout: 15_000 }, () => {
 
   it('keeps edits made while a folder rename is open', async () => {
     await open([row('First', 'Work')])
-    folderMenu('Work', 'Rename')
+    renameFolder('Work')
     fireEvent.change(folderName(), { target: { value: 'Projects' } })
     fireEvent.change(screen.getByRole('textbox', { name: 'Markdown content' }), { target: { value: 'Latest unsaved text.' } })
     await submit('Rename folder')
@@ -247,7 +245,7 @@ describe('sidebar folder management', { timeout: 15_000 }, () => {
   it('keeps a renamed subtree locally when the homeserver fails and retries its pending notes', async () => {
     await open([row('First', 'Work'), row('Second', 'Work/Ideas')])
     mocks.save.mockRejectedValue(new Error('Homeserver offline'))
-    folderMenu('Work', 'Rename')
+    renameFolder('Work')
     fireEvent.change(folderName(), { target: { value: 'Projects' } })
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Rename folder' })) })
     await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Folder name' })).toBeNull())
@@ -376,7 +374,7 @@ describe('sidebar folder management', { timeout: 15_000 }, () => {
     expect(mocks.save).not.toHaveBeenCalled()
     expect(folder('Work/Ideas')).toBeTruthy()
     expect(folder('Archive/Work')).toBeTruthy()
-    folderMenu('Work', 'Rename')
+    renameFolder('Work')
     fireEvent.change(folderName(), { target: { value: 'Archive' } })
     fireEvent.click(screen.getByRole('button', { name: 'Rename folder' }))
     expect(screen.getAllByRole('alert').some(alert => alert.textContent?.includes('already exists'))).toBe(true)
@@ -384,21 +382,18 @@ describe('sidebar folder management', { timeout: 15_000 }, () => {
     expect(mocks.save).not.toHaveBeenCalled()
   })
 
-  it('supports keyboard folder moves and dismisses sidebar menus on Escape and outside clicks', async () => {
+  it('supports keyboard folder moves directly from the sidebar icon', async () => {
     const user = userEvent.setup()
     await open([row('First', 'Work/Ideas')], ['Archive'])
-    const trigger = screen.getByRole('button', { name: 'Folder actions for Work' })
-    fireEvent.click(trigger)
-    expect(document.activeElement).toBe(screen.getByRole('menuitem', { name: 'New subfolder' }))
-    fireEvent.keyDown(document, { key: 'ArrowDown' })
-    expect(document.activeElement).toBe(screen.getByRole('menuitem', { name: 'Rename' }))
-    fireEvent.keyDown(document, { key: 'Escape' })
+    const move = screen.getByRole('button', { name: 'Move folder Work' })
+    move.focus()
+    await user.keyboard('{Enter}')
     expect(screen.queryByRole('menu')).toBeNull()
-    expect(document.activeElement).toBe(trigger)
-    fireEvent.click(trigger)
-    fireEvent.pointerDown(screen.getByRole('textbox', { name: 'Note title' }))
-    expect(screen.queryByRole('menu')).toBeNull()
-    folderMenu('Work', 'Move to…')
+    expect(document.activeElement).toBe(screen.getByRole('combobox', { name: 'Move folder to' }))
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('combobox', { name: 'Move folder to' })).toBeNull()
+    move.focus()
+    await user.keyboard('{Enter}')
     const destination = screen.getByRole('combobox', { name: 'Move folder to' })
     expectInline(destination)
     expect(within(destination).queryByRole('option', { name: 'Work/Ideas' })).toBeNull()

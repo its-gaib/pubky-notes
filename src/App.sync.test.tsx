@@ -356,8 +356,7 @@ describe('durable local notes and account synchronization', () => {
     render(<App />)
     await screen.findByText('Saved to Pubky')
     expect(screen.queryByRole('button', { name: 'Delete note' })).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'Note actions for Recoverable note' }))
-    fireEvent.click(screen.getByRole('menuitem', { name: 'Move to Trash' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Move note Recoverable note to Trash' }))
     expect(screen.queryByRole('dialog')).toBeNull()
     await screen.findByText('Moved to Trash.')
     await saveNow()
@@ -389,8 +388,7 @@ describe('durable local notes and account synchronization', () => {
     render(<App />)
     await readyGuest()
     expect(title()).toBe('Keep this note')
-    fireEvent.click(screen.getByRole('button', { name: 'Note actions for Selected for Trash' }))
-    fireEvent.click(screen.getByRole('menuitem', { name: 'Move to Trash' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Move note Selected for Trash to Trash' }))
     expect(screen.queryByRole('dialog')).toBeNull()
     await waitFor(async () => {
       const records = (await readLocalNotebook(GUEST_SCOPE)).records

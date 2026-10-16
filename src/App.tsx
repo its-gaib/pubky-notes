@@ -2,7 +2,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import type { ChangeEvent, CSSProperties, DragEvent, ReactNode } from 'react'
 import type { JsonValue, Session } from '@synonymdev/pubky'
 import QRCode from 'qrcode'
-import { ArrowDownToLine, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight, Code2, Copy, FileText, Folder, Globe2, Heading2, History, Link, List, LoaderCircle, LockKeyhole, PenLine, Plus, Search, Trash2, X, MoreHorizontal, FolderPlus, Bold, Italic, Quote, ExternalLink, UsersRound } from 'lucide-react'
+import { ArrowDownToLine, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight, Code2, Copy, FileText, Folder, FolderInput, Globe2, Heading2, History, Link, List, LoaderCircle, LockKeyhole, PenLine, Plus, Search, Trash2, Undo2, X, MoreHorizontal, FolderPlus, Bold, Italic, Quote, ExternalLink, UsersRound } from 'lucide-react'
 import Markdown from './components/Markdown'
 import AccountProfile from './components/AccountProfile'
 import RemoteSelection from './components/RemoteSelection'
@@ -1131,11 +1131,11 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
             {renaming ? folderNameForm() : <><div className="folder-row" style={{ paddingLeft: Math.min(30, depth * 8) }}>
               {hasChildren ? <button className="folder-toggle" disabled={locked || searching} aria-label={`${expanded ? 'Collapse' : 'Expand'} folder ${path}`} aria-expanded={expanded} onClick={() => toggleFolder(path)}><ChevronRight size={13} style={{ transform: expanded ? 'rotate(90deg)' : undefined }} /></button> : <span className="folder-toggle" />}
               <button className={`folder-select ${selectedFolder === path ? 'active' : ''}`} aria-label={`Open folder ${path}`} title={selectedFolder === path ? `${path} · click to rename` : path} disabled={locked} draggable={!locked} onDragStart={event => startDrag(event, 'folder', path)} onDragEnd={endDrag} onClick={() => openFolder(path)}><Folder size={15} /><span>{folderLabel(path)}</span></button>
-            </div><button className="icon-button folder-delete" aria-label={`Delete folder ${path}`} title={empty ? `Delete folder ${path}` : 'Only empty folders can be deleted'} disabled={locked || !empty} onClick={() => void deleteFolder(path)}><Trash2 size={14} /></button><SidebarActions label={`Folder actions for ${path}`} disabled={locked} items={[
-              { label: 'New subfolder', action: () => manageFolder('create', path) },
-              { label: 'Rename', action: () => manageFolder('rename', path) },
-              { label: 'Move to…', action: () => openMove(path, 'folder') },
-            ]} /></>}
+            </div><div className="sidebar-row-actions">
+              <button type="button" className="icon-button" aria-label={`New subfolder in ${path}`} title={`New subfolder in ${path}`} disabled={locked} onClick={() => manageFolder('create', path)}><FolderPlus size={15} /></button>
+              <button type="button" className="icon-button" aria-label={`Move folder ${path}`} title={`Move folder ${path}`} disabled={locked} onClick={() => openMove(path, 'folder')}><FolderInput size={15} /></button>
+              <button type="button" className="icon-button row-delete" aria-label={`Delete folder ${path}`} title={empty ? `Delete folder ${path}` : 'Only empty folders can be deleted'} disabled={locked || !empty} onClick={() => void deleteFolder(path)}><Trash2 size={15} /></button>
+            </div></>}
             {moveControl('folder', path)}
           </div>
           {folderEditor?.kind === 'create' && folderEditor.path === path && <div className="new-subfolder" style={{ paddingLeft: Math.min(30, (depth + 1) * 8) }}>{folderNameForm()}</div>}
@@ -1154,7 +1154,12 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
       <button className={`tree-note ${row.note.id === note?.id ? 'active' : ''}`} style={{ paddingLeft: 24 + Math.min(30, depth * 8) }} aria-label={`Open note ${title}`} title={title} disabled={locked} draggable={!locked && !row.note.deleted && row.note.id !== exampleId.current} onDragStart={event => startDrag(event, 'note', row.note.id)} onDragEnd={endDrag} onClick={() => void switchNote(row.note.id)}>
         <FileText size={15} /><span>{title}</span>{row.note.crdt?.version === 2 && <UsersRound size={13} aria-label="Collaborative note" />}<span className={`note-visibility ${row.published ? 'is-public' : ''}`} title={visibility} role="img" aria-label={visibility}>{row.published ? <Globe2 size={13} aria-hidden="true" /> : <LockKeyhole size={13} aria-hidden="true" />}</span>
       </button>
-      {row.note.id !== exampleId.current && <SidebarActions label={`Note actions for ${title}`} disabled={locked} items={row.note.deleted ? [{ label: 'Restore', action: () => void restoreNote(row.note.id) }] : [{ label: 'Move to…', action: () => openMove(row.note.id) }, { label: 'Move to Trash', action: () => void remove(row.note.id) }]} />}
+      {row.note.id !== exampleId.current && <div className="sidebar-row-actions">
+        {row.note.deleted ? <button type="button" className="icon-button" aria-label={`Restore note ${title}`} title={`Restore note ${title}`} disabled={locked} onClick={() => void restoreNote(row.note.id)}><Undo2 size={15} /></button> : <>
+          <button type="button" className="icon-button" aria-label={`Move note ${title}`} title={`Move note ${title}`} disabled={locked} onClick={() => openMove(row.note.id)}><FolderInput size={15} /></button>
+          <button type="button" className="icon-button row-delete" aria-label={`Move note ${title} to Trash`} title={`Move note ${title} to Trash`} disabled={locked} onClick={() => void remove(row.note.id)}><Trash2 size={15} /></button>
+        </>}
+      </div>}
       {moveControl('note', row.note.id)}
     </div>
   }

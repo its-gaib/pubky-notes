@@ -96,7 +96,7 @@ button svg { pointer-events: none; }
 .root-drop-zone { flex: 1 0 44px; min-height: 44px; padding: 10px 6px; border: 1px solid transparent; border-radius: 5px; color: #6661af; font-size: 13px; }
 .root-drop-zone.drop-available { border-color: #b9b3d5; border-style: dashed; }
 .root-drop-zone.drop-target { background: #e8e5f8; border-color: #9186c0; }
-.folder-entry { display: grid; grid-template-columns: minmax(0, 1fr) 24px 26px; align-items: start; min-width: 0; border-radius: 5px; }
+.folder-entry { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; min-width: 0; border-radius: 5px; }
 .sidebar-actions { display: contents; }
 .row-actions-button.icon-button { grid-column: 2; width: 28px; height: 32px; color: #767582; }
 .sidebar-actions-menu { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 2px; margin: 0 0 5px; padding: 4px; border: 1px solid #e0deea; border-radius: 6px; background: #fff; }
@@ -111,9 +111,8 @@ button svg { pointer-events: none; }
 .folder-select > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .folder-select:hover { background: #eaeae8; color: #444753; }
 .folder-select.active { background: #eae9f5; color: #6661af; font-weight: 550; }
-.tree-note-entry { display: grid; grid-template-columns: minmax(0, 1fr) 26px; align-items: start; min-width: 0; border-radius: 5px; }
+.tree-note-entry { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; min-width: 0; border-radius: 5px; }
 .tree-note-entry.selected { background: #eae9f5; }
-.tree-note-entry .row-actions-button { width: 26px; }
 .tree-note { display: flex; align-items: center; gap: 6px; width: 100%; min-width: 0; min-height: 33px; padding: 6px 4px; border: 0; border-radius: 5px; background: transparent; color: #666c79; text-align: left; font-size: 14px; line-height: 1.4; }
 .tree-note > span:not(.note-visibility) { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tree-note > svg { flex-shrink: 0; stroke-width: 1.7; }
@@ -122,10 +121,10 @@ button svg { pointer-events: none; }
 .note-visibility svg { width: 13px; height: 13px; stroke-width: 1.8; }
 .tree-note:hover { color: #444753; background: #eaeae8; }
 .tree-note.active { color: #6661af; background: #eae9f5; }
-.folder-entry .row-actions-button.icon-button { grid-column: 3; width: 26px; }
-.folder-delete.icon-button { grid-column: 2; width: 24px; height: 32px; padding: 0; color: #767582; }
-.folder-delete.icon-button:disabled { opacity: .3; cursor: not-allowed; }
-.folder-delete.icon-button:hover:not(:disabled) { color: #b44949; background: #f8eaea; }
+.sidebar-row-actions { display: flex; align-items: center; }
+.sidebar-row-actions .icon-button { width: 26px; height: 33px; padding: 0; color: #767582; }
+.sidebar-row-actions .row-delete:disabled { opacity: .3; }
+.sidebar-row-actions .row-delete:hover:not(:disabled) { color: #b44949; background: #f8eaea; }
 .folder-select[draggable="true"], .tree-note[draggable="true"] { cursor: grab; }
 .folder-select[draggable="true"]:active, .tree-note[draggable="true"]:active { cursor: grabbing; }
 .folder-entry.drop-target, .tree-root.drop-target { background: #e8e5f8; outline: 1px solid #9186c0; outline-offset: -1px; }
