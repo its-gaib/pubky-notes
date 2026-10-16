@@ -59,7 +59,7 @@ function validateSignal(value: unknown): asserts value is Signal {
     || (signal.kind === 'identity' && signal.role !== 'guest')
     || (signal.kind === 'offer' && signal.role !== 'host')
     || (signal.kind === 'answer' && signal.role !== 'guest')
-    || (signal.kind === 'reject' && (signal.role !== 'host' || signal.payload !== ''))
+    || (signal.kind === 'reject' && (signal.role !== 'host' || !['', 'room-full', 'account-already-joined'].includes(signal.payload)))
     || (signal.kind !== 'hello' && !signal.targetSession)
     || (signal.kind === 'ice' && encoder.encode(signal.payload).length > 4096)) throw new Error('Invalid signaling message')
 }

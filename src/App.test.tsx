@@ -211,6 +211,28 @@ describe('sign-in candidate lifecycle', () => {
 })
 
 describe('private saving and explicit publication', () => {
+  it('inserts a chosen table at the saved selection, preserves surrounding text, and renders its dimensions', async () => {
+    mocks.restoreSession.mockResolvedValue(candidateSession())
+    render(<App />)
+    await screen.findByRole('button', { name: 'Disconnect from Pubky' })
+    const content = await screen.findByRole('textbox', { name: 'Markdown content' }) as HTMLTextAreaElement
+    await waitFor(() => expect(content.value).toBe(savedNote.content))
+    fireEvent.change(content, { target: { value: 'Before chosen After' } })
+    content.focus(); content.setSelectionRange(7, 13)
+    fireEvent.click(screen.getByRole('button', { name: 'Insert table' }))
+    fireEvent.click(screen.getByRole('gridcell', { name: '4 columns, 3 rows' }))
+    expect(content.value).toMatch(/^Before \n\n\| Header 1 \| Header 2 \| Header 3 \| Header 4 \|/)
+    expect(content.value).toMatch(/\n\n After$/)
+    expect(content.value).not.toContain('chosen')
+    await waitFor(() => expect(content.value.slice(content.selectionStart, content.selectionEnd)).toBe('Header 1'))
+    expect(document.activeElement).toBe(content)
+    fireEvent.click(screen.getByRole('button', { name: 'Preview' }))
+    const table = screen.getByRole('table')
+    expect(within(table).getAllByRole('row')).toHaveLength(3)
+    expect(within(table).getAllByRole('columnheader')).toHaveLength(4)
+    expect(within(table).getAllByRole('cell')).toHaveLength(8)
+  })
+
   it('keeps the empty-notebook sample unsaved and uses it as the template for new notes', async () => {
     const session = candidateSession()
     mocks.restoreSession.mockResolvedValue(session)

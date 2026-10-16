@@ -3,16 +3,18 @@
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ComponentProps } from 'react'
+import type { GroupCollaborationStatus } from '../lib/collaboration'
 import type { CollaborationView } from '../hooks/useCollaboration'
 import CollaborationPanel, { collaborationStatusLabel } from './CollaborationPanel'
 
+const group: Pick<GroupCollaborationStatus, 'peers' | 'participantCount' | 'maxParticipants' | 'creatorOnline'> = { peers: [], participantCount: 1, maxParticipants: 10, creatorOnline: true }
 const initial: CollaborationView = { peerReceived: false, working: false }
 function props(overrides: Partial<ComponentProps<typeof CollaborationPanel>> = {}): ComponentProps<typeof CollaborationPanel> {
   return { invitation: false, view: initial, signedIn: true, disabled: false,
     note: { id: 'note', title: 'Private draft', content: 'Words', createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-01T00:00:00.000Z' },
     close: vi.fn(), connect: vi.fn(), start: vi.fn(), join: vi.fn(), retry: vi.fn(), disconnect: vi.fn(), copy: vi.fn(), ...overrides }
 }
-const waiting: CollaborationView = { ...initial, noteId: 'shared', role: 'host', link: 'https://notes.example/#collaborate=secret', status: { state: 'waiting', relayAvailable: false } }
+const waiting: CollaborationView = { ...initial, noteId: 'shared', role: 'host', link: 'https://notes.example/#collaborate=secret', status: { ...group, state: 'waiting', relayAvailable: false } }
 afterEach(cleanup)
 
 describe('inline collaboration', () => {
@@ -34,7 +36,7 @@ describe('inline collaboration', () => {
   it('offers sign-in for an invitation and shows automatic joining without another action afterward', () => {
     const actions = props({ invitation: true, signedIn: false })
     const { rerender } = render(<CollaborationPanel {...actions} />)
-    expect(screen.getByText(/shared note saves privately.*both browsers must be online/)).toBeTruthy()
+    expect(screen.getByText(/shared note saves privately.*creator must be online/)).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Connect Pubky to join' }))
     expect(actions.connect).toHaveBeenCalledOnce()
     expect(actions.join).not.toHaveBeenCalled()
@@ -61,7 +63,7 @@ describe('inline collaboration', () => {
     const renderPanel = (view: CollaborationView) => <><textarea aria-label="Editor" /><CollaborationPanel {...actions} view={view} /></>
     const { rerender } = render(renderPanel(waiting))
     screen.getByRole('textbox', { name: 'Editor' }).focus()
-    rerender(renderPanel({ ...waiting, status: { state: 'connected', relayAvailable: true, peerIdentity: 'y'.repeat(52) } }))
+    rerender(renderPanel({ ...waiting, status: { ...group, state: 'connected', relayAvailable: true, peerIdentity: 'y'.repeat(52) } }))
     expect(document.activeElement).toBe(screen.getByRole('textbox', { name: 'Editor' }))
     expect(screen.queryByRole('dialog')).toBeNull()
     expect(screen.getByRole('status').textContent).toBe('Connected')
@@ -72,7 +74,7 @@ describe('inline collaboration', () => {
 
   it('explains a transport failure before the invitation document has been saved and allows retry', () => {
     const actions = props({ invitation: true, view: { ...initial, noteId: 'shared', role: 'guest',
-      status: { state: 'connecting', relayAvailable: false, issue: 'direct-connection-failed' } } })
+      status: { ...group, state: 'connecting', relayAvailable: false, issue: 'direct-connection-failed' } } })
     render(<CollaborationPanel {...actions} />)
     expect(screen.getByRole('status').textContent).toBe('Connection problem')
     expect(screen.getByRole('alert').textContent).toContain('The TURN relay needed to sync edits between these networks is unavailable')
@@ -95,20 +97,20 @@ describe('inline collaboration', () => {
   })
 
   it('shows an actionable direct-connection failure throughout automatic retries, then clears on success', () => {
-    const actions = props({ view: { ...waiting, status: { state: 'connecting', relayAvailable: false, issue: 'direct-connection-failed' } } })
+    const actions = props({ view: { ...waiting, status: { ...group, state: 'connecting', relayAvailable: false, issue: 'direct-connection-failed' } } })
     const { rerender } = render(<CollaborationPanel {...actions} />)
     expect(screen.getByRole('alert').textContent).toContain('The TURN relay needed to sync edits between these networks is unavailable')
     expect(screen.getByRole('status').textContent).toBe('Connection problem')
     fireEvent.click(screen.getByRole('button', { name: 'Retry connection' }))
     expect(actions.retry).toHaveBeenCalledOnce()
-    rerender(<CollaborationPanel {...actions} view={{ ...waiting, status: { state: 'connected', relayAvailable: true } }} />)
+    rerender(<CollaborationPanel {...actions} view={{ ...waiting, status: { ...group, state: 'connected', relayAvailable: true } }} />)
     expect(screen.queryByRole('alert')).toBeNull()
     expect(screen.queryByRole('button', { name: 'Retry connection' })).toBeNull()
     expect(screen.getByRole('status').textContent).toBe('Connected')
   })
 
   it('explains missing WebRTC without suggesting a TURN relay can fix the browser', () => {
-    const actions = props({ view: { ...waiting, status: { state: 'error', relayAvailable: false, issue: 'webrtc-unavailable' } } })
+    const actions = props({ view: { ...waiting, status: { ...group, state: 'error', relayAvailable: false, issue: 'webrtc-unavailable' } } })
     render(<CollaborationPanel {...actions} />)
     expect(screen.getByRole('alert').textContent).toContain('WebRTC, which is disabled or unavailable in this browser')
     expect(screen.getByRole('alert').textContent).toContain('Tor Browser does not support this connection method')
@@ -118,7 +120,7 @@ describe('inline collaboration', () => {
   })
 
   it('explains an unfinished handshake separately from TURN availability', () => {
-    render(<CollaborationPanel {...props({ view: { ...waiting, status: { state: 'connecting', relayAvailable: false, issue: 'handshake-failed' } } })} />)
+    render(<CollaborationPanel {...props({ view: { ...waiting, status: { ...group, state: 'connecting', relayAvailable: false, issue: 'handshake-failed' } } })} />)
     expect(screen.getByRole('alert').textContent).toContain('Check the other browser for an error')
     expect(screen.getByRole('alert').textContent).not.toContain('TURN')
     const details = screen.getByText('Details').closest('details')!
@@ -126,16 +128,29 @@ describe('inline collaboration', () => {
   })
 
   it('shows the guest connection status without connection codes or an approval step', () => {
-    const actions = props({ view: { ...waiting, role: 'guest', link: undefined, ownFingerprint: '4321 DCBA', status: { state: 'connecting', relayAvailable: true, peerIdentity: 'y'.repeat(52) } } })
+    const actions = props({ view: { ...waiting, role: 'guest', link: undefined, ownFingerprint: '4321 DCBA', status: { ...group, state: 'connecting', relayAvailable: true, peerIdentity: 'y'.repeat(52) } } })
     const { rerender } = render(<CollaborationPanel {...actions} />)
     expect(screen.getByRole('status').textContent).toBe('Connecting…')
     expect(screen.queryByText('4321 DCBA')).toBeNull()
     expect(screen.queryByRole('button', { name: 'Retry connection' })).toBeNull()
     expect(screen.queryByText('Waiting for approval')).toBeNull()
-    rerender(<CollaborationPanel {...actions} view={{ ...waiting, status: { state: 'connected', relayAvailable: true } }} />)
+    rerender(<CollaborationPanel {...actions} view={{ ...waiting, status: { ...group, state: 'connected', relayAvailable: true } }} />)
     expect(screen.getByRole('status').textContent).toBe('Connected')
     expect(screen.queryByRole('button', { name: 'Retry connection' })).toBeNull()
-    expect(collaborationStatusLabel({ ...waiting, status: { state: 'disconnected', relayAvailable: false } })).toBe('Disconnected')
+    expect(collaborationStatusLabel({ ...waiting, status: { ...group, state: 'disconnected', relayAvailable: false } })).toBe('Disconnected')
   })
 
+})
+
+it('explains a full group without suggesting a connection retry frees a place', () => {
+  render(<CollaborationPanel {...props({ invitation: true, view: { ...initial, status: { ...group, state: 'error', relayAvailable: true, participantCount: 10, issue: 'room-full' } } })} />)
+  expect(screen.getByRole('alert').textContent).toContain('limit of 10 people, including its creator')
+  expect(screen.getByRole('alert').textContent).toContain('new shared copy')
+})
+
+it('allows guests to share the invitation and explains joining while the creator is offline', () => {
+  render(<CollaborationPanel {...props({ view: { ...waiting, role: 'guest', status: { ...group, state: 'connected', relayAvailable: true, participantCount: 3, creatorOnline: false } } })} />)
+  expect(screen.getByRole('button', { name: 'Copy invitation link' })).toBeTruthy()
+  expect(screen.getByText('3 of 10 participant places used, including the creator. Places stay assigned to this group.')).toBeTruthy()
+  expect(screen.getByText(/creator is offline.*Existing participants can keep syncing/)).toBeTruthy()
 })

@@ -5,7 +5,7 @@ import { frameMessage, MAX_MESSAGE_BYTES, MessageAssembler } from './framing'
 import { openSignal, ReplayGuard, sealSignal } from './signaling'
 import { startCollaboration, WEBRTC_UNAVAILABLE_MESSAGE } from './transport'
 import { advertisePresence, supportsPresence } from './presence'
-import type { CollaborationCallbacks, CollaborationIdentity, Invitation, StoredRoom } from './types'
+import type { CollaborationCallbacks, CollaborationIdentity, CollaborationOptions, Invitation, StoredRoom } from './types'
 import { createIdentityProof, IDENTITY_FAILED_MESSAGE, IDENTITY_UNAVAILABLE_MESSAGE, verifyIdentityProof } from './identity'
 import { testIdentity } from './identity.test-helpers'
 import { HttpRelaySocket } from './http-relay'
@@ -267,13 +267,13 @@ describe('transport admission and lifetime', () => {
     vi.unstubAllGlobals()
   })
 
-  function start(room: StoredRoom, iceServers: RTCIceServer[] | null = []) {
+  function start(room: StoredRoom, iceServers: RTCIceServer[] | null = [], options: CollaborationOptions = {}) {
     vi.stubGlobal('WebSocket', FakeSocket)
     vi.stubGlobal('RTCPeerConnection', FakePeer)
     FakeSocket.instances = []
     FakePeer.instances = []
     const callbacks: CollaborationCallbacks = { onStatus: vi.fn(), onMessage: vi.fn(), onError: vi.fn() }
-    const transport = startCollaboration(room, callbacks, { identity: proofIdentity(room), signalingUrl: 'ws://127.0.0.1:4444', ...(iceServers === null ? {} : { iceEndpoint: null, rtcConfiguration: { iceServers } }) })
+    const transport = startCollaboration(room, callbacks, { identity: proofIdentity(room), signalingUrl: 'ws://127.0.0.1:4444', ...(iceServers === null ? {} : { iceEndpoint: null, rtcConfiguration: { iceServers } }), ...options })
     active.push(transport)
     return { transport, callbacks }
   }
@@ -308,7 +308,7 @@ describe('transport admission and lifetime', () => {
     return hello
   }
 
-  async function authenticateHost(ws: FakeSocket, host: StoredRoom, guest: StoredRoom) {
+  async function authenticateHost(ws: FakeSocket, host: StoredRoom, guest: StoredRoom, waitForIdentity = true) {
     let hello: Awaited<ReturnType<typeof openSignal>>
     await vi.waitFor(async () => { hello = (await published(ws, host)).find(signal => signal.kind === 'hello') ?? null; expect(hello).toBeTruthy() })
     const session = randomToken(16), challenge = randomToken(24)
@@ -316,7 +316,7 @@ describe('transport admission and lifetime', () => {
       publicKey: host.hostKey, peerKey: guest.identity.publicKey, session, peerSession: hello!.session, challenge: JSON.parse(hello!.payload).challenge })
     ws.receive(await sealSignal(host, { kind: 'challenge', to: guest.identity.publicKey, session,
       targetSession: hello!.session, payload: JSON.stringify({ challenge, proof }) }), host.room)
-    await vi.waitFor(async () => { expect((await published(ws, host)).some(signal => signal.kind === 'identity')).toBe(true) })
+    if (waitForIdentity) await vi.waitFor(async () => { expect((await published(ws, host)).some(signal => signal.kind === 'identity')).toBe(true) })
     return { session, hello: hello! }
   }
 
@@ -328,6 +328,94 @@ describe('transport admission and lifetime', () => {
       targetSession: offer!.session, payload: 'v=0\r\n' }), host.room)
     await vi.waitFor(() => expect(FakePeer.instances.at(-1)?.remoteDescription?.type).toBe('answer'))
   }
+
+  it('authorizes a fixed mesh peer only after its account proof and without legacy room admission', async () => {
+    const { host, guest } = await pair()
+    await deleteRoom(host.scope, host.descriptor.id)
+    let release!: () => void
+    const authorize = vi.fn(() => new Promise<void>(resolve => { release = resolve }))
+    const { callbacks, transport } = start(host, [], { pair: { key: guest.identity.publicKey, authorize } })
+    const ws = await socket(), other = { ...guest, identity: await createIdentity() }
+    ws.receive(await sealSignal(other, helloFields(host)), host.room)
+    const hello = await authenticateGuest(ws, host, guest)
+    await vi.waitFor(() => expect(authorize).toHaveBeenCalledExactlyOnceWith(proofIdentity(guest).owner))
+    expect(FakePeer.instances).toHaveLength(0)
+    expect((await published(ws, other))).toHaveLength(0)
+    expect(vi.mocked(callbacks.onStatus).mock.calls.some(([status]) => status.peerIdentity)).toBe(false)
+    await expect(transport.send(new Uint8Array([1]))).rejects.toThrow('not connected')
+    release()
+    await vi.waitFor(() => expect(FakePeer.instances).toHaveLength(1))
+    FakePeer.instances[0].channel!.open()
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'connected', peerIdentity: proofIdentity(guest).owner, peerSession: hello.session }))
+    expect(await loadRoom(host.scope, host.descriptor.id)).toBeUndefined()
+  })
+
+  it.each(['reconnect', 'dispose'] as const)('ignores mesh authorization that completes after %s', async cancel => {
+    const { host, guest } = await pair()
+    let release!: () => void
+    const authorize = vi.fn(() => new Promise<void>(resolve => { release = resolve }))
+    const { callbacks, transport } = start(host, [], { pair: { key: guest.identity.publicKey, authorize } })
+    const ws = await socket()
+    await authenticateGuest(ws, host, guest)
+    await vi.waitFor(() => expect(authorize).toHaveBeenCalledOnce())
+    transport[cancel]()
+    release()
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(FakePeer.instances).toHaveLength(0)
+    expect(vi.mocked(callbacks.onStatus).mock.calls.some(([status]) => status.peerIdentity)).toBe(false)
+    expect((await published(ws, guest)).some(signal => signal.kind === 'offer')).toBe(false)
+  })
+
+  it('rejects an unexpected mesh Pubky identity before calling admission', async () => {
+    const { host, guest } = await pair(), authorize = vi.fn(async () => {})
+    const { callbacks } = start(host, [], { pair: { key: guest.identity.publicKey, owner: testIdentity().owner, authorize } })
+    await authenticateGuest(await socket(), host, guest)
+    await vi.waitFor(() => expect(callbacks.onError).toHaveBeenCalledWith(expect.objectContaining({ message: IDENTITY_FAILED_MESSAGE })))
+    expect(authorize).not.toHaveBeenCalled()
+    expect(FakePeer.instances).toHaveLength(0)
+  })
+
+  it.each(['room-full', 'account-already-joined'] as const)('sends authenticated mesh admission rejection %s without creating a peer', async code => {
+    const { host, guest } = await pair()
+    const authorize = vi.fn(async () => { throw Object.assign(new Error('Admission refused'), { code }) })
+    const { callbacks } = start(host, [], { pair: { key: guest.identity.publicKey, authorize } })
+    const ws = await socket()
+    await authenticateGuest(ws, host, guest)
+    await vi.waitFor(async () => expect((await published(ws, guest)).find(signal => signal.kind === 'reject')?.payload).toBe(code))
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'error', issue: code }))
+    expect(FakePeer.instances).toHaveLength(0)
+  })
+
+  it('requires guest-side mesh authorization before publishing identity or accepting SDP', async () => {
+    const { host, guest } = await pair()
+    let release!: () => void
+    const authorize = vi.fn(() => new Promise<void>(resolve => { release = resolve }))
+    const { callbacks } = start(guest, [], { pair: { key: host.hostKey, authorize } })
+    const ws = await socket()
+    const { session, hello } = await authenticateHost(ws, host, guest, false)
+    await vi.waitFor(() => expect(authorize).toHaveBeenCalledExactlyOnceWith(proofIdentity(host).owner))
+    expect((await published(ws, host)).some(signal => signal.kind === 'identity')).toBe(false)
+    expect(FakePeer.instances).toHaveLength(0)
+    release()
+    await vi.waitFor(async () => expect((await published(ws, host)).some(signal => signal.kind === 'identity')).toBe(true))
+    ws.receive(await sealSignal(host, { kind: 'offer', to: guest.identity.publicKey, session, targetSession: hello.session, payload: 'v=0\r\n' }), host.room)
+    await vi.waitFor(() => expect(FakePeer.instances).toHaveLength(1))
+    expect((await loadRoom(guest.scope, guest.descriptor.id))?.hostIdentity).toBeUndefined()
+    expect(callbacks.onError).not.toHaveBeenCalled()
+  })
+
+  it('uses shared ICE configuration without issuing an edge-specific endpoint request', async () => {
+    const { host, guest } = await pair()
+    const iceServers = [{ urls: 'turn:relay.example:3478', username: 'temporary', credential: 'temporary' }]
+    const getIceConfiguration = vi.fn(async () => ({ iceServers, relayAvailable: true, expiresAt: Date.now() + 600_000 }))
+    const fetch = vi.fn(); vi.stubGlobal('fetch', fetch)
+    start(host, null, { pair: { key: guest.identity.publicKey, authorize: async () => {} }, getIceConfiguration })
+    await authenticateGuest(await socket(), host, guest)
+    await vi.waitFor(() => expect(FakePeer.instances).toHaveLength(1))
+    expect(getIceConfiguration).toHaveBeenCalledOnce()
+    expect(fetch).not.toHaveBeenCalled()
+    expect(FakePeer.instances[0].configuration.iceServers).toEqual(iceServers)
+  })
 
   it.each(['reconnect', 'dispose'] as const)('processes the answer while HTTP ICE delivery waits, and cancels stale delivery on %s', async cancel => {
     const { host, guest } = await pair()

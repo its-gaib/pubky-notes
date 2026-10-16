@@ -7,6 +7,7 @@ import { HttpRelaySocket } from './http-relay'
 import type { SignalingSocket } from './http-relay'
 import { MAX_SIGNAL_BYTES, openSignal, ReplayGuard, sealSignal } from './signaling'
 import { advertisePresence, supportsPresence } from './presence'
+import { validIceServers } from './ice-cache'
 import type { Signal, SignalKind } from './signaling'
 import type { CollaborationCallbacks, CollaborationOptions, CollaborationStatus, CollaborationTransport, StoredRoom } from './types'
 
@@ -31,16 +32,6 @@ function signalingUrl(value: string): string {
   return url.href
 }
 
-function validIceServers(value: unknown): value is RTCIceServer[] {
-  return Array.isArray(value) && value.length <= 12 && value.every(server => {
-    if (!server || typeof server !== 'object') return false
-    const urls = typeof server.urls === 'string' ? [server.urls] : server.urls
-    return Array.isArray(urls) && urls.length > 0 && urls.length <= 8 && urls.every(url => typeof url === 'string' && url.length <= 512 && /^(stun|stuns|turn|turns):/.test(url))
-      && (server.username === undefined || (typeof server.username === 'string' && server.username.length <= 1024))
-      && (server.credential === undefined || (typeof server.credential === 'string' && server.credential.length <= 1024))
-  })
-}
-
 /** Signaling carries encrypted, identity-signed connection metadata, never note bytes. */
 export function startCollaboration(room: StoredRoom, callbacks: CollaborationCallbacks, options: CollaborationOptions = {}): CollaborationTransport {
   let disposed = false
@@ -60,6 +51,8 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
     ownProof?: CustomPop; ownIdentity?: VerifiedIdentity; reply?: string
   } | undefined
   const identity = options.identity ? { ...options.identity } : undefined
+  const pair = options.pair ? { ...options.pair } : undefined
+  let pairOwner = pair?.owner
   let presenceSupported = false
   let state: CollaborationStatus['state'] = 'connecting'
   let issue: CollaborationStatus['issue']
@@ -94,7 +87,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
 
   function status(next: CollaborationStatus['state']) {
     state = next
-    if (!disposed) callbacks.onStatus({ state, relayAvailable, presenceSupported, ...(issue ? { issue } : {}), ...(peerFingerprint ? { peerFingerprint } : {}), ...(peerIdentity ? { peerIdentity } : {}) })
+    if (!disposed) callbacks.onStatus({ state, relayAvailable, presenceSupported, ...(issue ? { issue } : {}), ...(peerFingerprint ? { peerFingerprint } : {}), ...(peerIdentity ? { peerIdentity } : {}), ...(verifiedPair ? { peerSession: verifiedPair.session } : {}) })
   }
 
   function report(error: unknown) {
@@ -157,12 +150,20 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
     iceRequest = request
     request.promise = (async (): Promise<IceRefreshResult> => {
       request.timeout = setTimeout(() => request.controller.abort(), 5_000)
+      let abort!: () => void
+      const cancelled = new Promise<never>((_resolve, reject) => {
+        abort = () => reject(new Error('Relay configuration request cancelled'))
+        request.controller.signal.addEventListener('abort', abort, { once: true })
+      })
       try {
-        const response = await fetch(options.iceEndpoint ?? '/api/collaboration-ice', {
-          method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Pubky-Notes-Collaboration': '1' }, body: '{}', signal: request.controller.signal,
-        })
-        if (!response.ok) throw new Error('Relay configuration unavailable')
-        const result = await response.json() as { iceServers?: unknown; relayAvailable?: unknown; expiresAt?: unknown }
+        const result = await Promise.race([(async (): Promise<{ iceServers?: unknown; relayAvailable?: unknown; expiresAt?: unknown }> => {
+          if (options.getIceConfiguration) return options.getIceConfiguration()
+          const response = await fetch(options.iceEndpoint ?? '/api/collaboration-ice', {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Pubky-Notes-Collaboration': '1' }, body: '{}', signal: request.controller.signal,
+          })
+          if (!response.ok) throw new Error('Relay configuration unavailable')
+          return response.json()
+        })(), cancelled])
         if (disposed || generation !== iceGeneration) return 'cancelled'
         if (request.controller.signal.aborted || !validIceServers(result.iceServers) || typeof result.relayAvailable !== 'boolean') throw new Error('Invalid relay configuration')
         const available = result.relayAvailable && result.iceServers.some(server => (typeof server.urls === 'string' ? [server.urls] : server.urls).some(url => /^turns?:/.test(url)))
@@ -186,6 +187,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
         return 'failed'
       } finally {
         clearTimeout(request.timeout)
+        request.controller.signal.removeEventListener('abort', abort)
         if (iceRequest === request) iceRequest = undefined
       }
     })()
@@ -387,11 +389,15 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
 
   async function offer(signal: Signal) {
     const authenticated = verifiedPair
-    const stored = await loadRoom(room.scope, room.descriptor.id)
-    if (disposed || !authenticated || authenticated !== verifiedPair || !identityValid()
-      || stored?.room !== room.room || stored.approvedPeer !== signal.from || stored.approvedPeerIdentity !== authenticated.owner) return
-    room.approvedPeer = stored.approvedPeer
-    room.approvedPeerIdentity = stored.approvedPeerIdentity
+    if (pair) {
+      if (disposed || !authenticated || !identityValid() || authenticated.key !== pair.key || authenticated.owner !== pairOwner) return
+    } else {
+      const stored = await loadRoom(room.scope, room.descriptor.id)
+      if (disposed || !authenticated || authenticated !== verifiedPair || !identityValid()
+        || stored?.room !== room.room || stored.approvedPeer !== signal.from || stored.approvedPeerIdentity !== authenticated.owner) return
+      room.approvedPeer = stored.approvedPeer
+      room.approvedPeerIdentity = stored.approvedPeerIdentity
+    }
     await refreshIce()
     if (disposed || authenticated !== verifiedPair || !identityValid()) return
     peerFingerprint = await fingerprint(signal.from)
@@ -407,14 +413,16 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
   }
 
   async function receive(signal: Signal) {
-    if (disposed || !identity) return
+    if (disposed || !identity || (pair && signal.from !== pair.key)) return
     if (signal.kind === 'hello' && room.role === 'host') {
       const guestChallenge = parseChallenge(signal.payload)
-      const stored = await loadRoom(room.scope, room.descriptor.id)
-      if (disposed || stored?.room !== room.room) return
-      room.approvedPeer = stored.approvedPeer
-      room.approvedPeerIdentity = stored.approvedPeerIdentity
-      if (room.approvedPeer && room.approvedPeer !== signal.from) {
+      if (!pair) {
+        const stored = await loadRoom(room.scope, room.descriptor.id)
+        if (disposed || stored?.room !== room.room) return
+        room.approvedPeer = stored.approvedPeer
+        room.approvedPeerIdentity = stored.approvedPeerIdentity
+      }
+      if (!pair && room.approvedPeer && room.approvedPeer !== signal.from) {
         await publish('reject', signal.from, signal.session)
         return
       }
@@ -443,8 +451,12 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
       denied = true
       closePeer()
       resetIdentity()
+      if (pair && signal.payload === 'room-full') issue = 'room-full'
+      if (pair && signal.payload === 'account-already-joined') issue = 'account-already-joined'
       status('error')
-      report(new Error('This document already has a collaborator'))
+      report(new Error(pair && signal.payload === 'room-full' ? 'This document already has 10 participants, including its creator. Existing participants keep their places while offline.'
+        : pair && signal.payload === 'account-already-joined' ? 'This Pubky account is already collaborating from another browser.'
+          : 'This document already has a collaborator'))
       return
     }
     if (signal.kind === 'challenge' && room.role === 'guest') {
@@ -457,7 +469,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
         return
       }
       const startedSession = localSession
-      const other = verifyIdentityProof(proof, proofContext(signal, localChallenge, false), room.hostIdentity)
+      const other = verifyIdentityProof(proof, proofContext(signal, localChallenge, false), pair ? pairOwner : room.hostIdentity)
       closePeer()
       clearTimeout(identityTimer)
       verifiedPair = undefined
@@ -466,8 +478,10 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
       exchange = attempt
       const own = await createIdentityProof(identity, proofContext(signal, challenge, true))
       if (disposed || exchange !== attempt || localSession !== startedSession) return
-      await pinHostIdentity(room, other.owner)
+      if (pair) await pair.authorize(other.owner)
+      else await pinHostIdentity(room, other.owner)
       if (disposed || exchange !== attempt || localSession !== startedSession) return
+      if (pair) pairOwner = other.owner
       bindIdentity(signal, other, own.verified)
       if (!identityValid()) return
       attempt.reply = JSON.stringify({ proof: own.proof })
@@ -482,7 +496,28 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
       if (identityValid() && verifiedPair?.key === signal.from && verifiedPair.session === signal.session) return
       const value: unknown = JSON.parse(signal.payload)
       if (!value || typeof value !== 'object' || Object.keys(value).join(',') !== 'proof') throw new Error(IDENTITY_FAILED_MESSAGE)
-      const other = verifyIdentityProof((value as { proof: unknown }).proof, proofContext(signal, attempt.challenge, false), room.approvedPeerIdentity)
+      const other = verifyIdentityProof((value as { proof: unknown }).proof, proofContext(signal, attempt.challenge, false), pair ? pairOwner : room.approvedPeerIdentity)
+      if (pair) {
+        try { await pair.authorize(other.owner) } catch (error) {
+          if (disposed || exchange !== attempt || attempt.localSession !== localSession) return
+          const rawCode = error instanceof Error && 'code' in error ? error.code : undefined
+          const code = rawCode === 'ROOM_FULL' ? 'room-full' : rawCode === 'ACCOUNT_ALREADY_JOINED' ? 'account-already-joined' : rawCode
+          if (code === 'room-full' || code === 'account-already-joined') {
+            issue = code
+            await publish('reject', signal.from, signal.session, code)
+            if (disposed || exchange !== attempt || attempt.localSession !== localSession) return
+            resetIdentity()
+            status('error')
+          }
+          throw error
+        }
+        if (disposed || exchange !== attempt || attempt.localSession !== localSession) return
+        pairOwner = other.owner
+        bindIdentity(signal, other, attempt.ownIdentity)
+        if (!identityValid()) return
+        await offer(signal)
+        return
+      }
       // Consuming this exchange prevents a second proof from replacing the approved identity.
       bindIdentity(signal, other, attempt.ownIdentity)
       if (!identityValid()) return

@@ -2,11 +2,11 @@
 
 The website stays on Vercel. By default, browsers exchange encrypted, signed connection setup messages through `https://httprelay.pubky.app/inbox/`, the public [Pubky HTTP relay](https://github.com/pubky/http-relay) also used by the SDK. This needs no new account or service provisioning. Optional WebSocket signaling remains available for an owned service. Document updates travel over WebRTC. A TURN relay is needed on networks where a direct connection cannot be established. TURN carries encrypted WebRTC traffic; it does not receive the application encryption keys.
 
-The HTTP adapter splits setup envelopes into bounded temporary chunks that fit the relay's 2 KiB inbox limit, then uses explicit acknowledgements. Inbox identifiers are derived from random room IDs and browser public keys. The relay can observe connection timing and network metadata but does not receive document text or Pubky sessions. Uncollected messages expire according to the relay's TTL. This public rendezvous service has no application-specific uptime guarantee; its URL can be changed using `VITE_COLLAB_SIGNAL_URL`.
+The HTTP adapter splits setup envelopes into bounded temporary chunks that fit the relay's 2 KiB inbox limit, then uses explicit acknowledgements. Each admitted pair derives its own child room from the original random room ID and both browser public keys; directional inboxes stay separate. Initial discovery uses bounded, signed announcements in separate striped rendezvous inboxes with randomized retries, never a shared-inbox delivery acknowledgement. A fair scheduler allows at most two long polls per origin and rotates idle reads, leaving HTTP/1.1 connections available for uploads and acknowledgements. The relay can observe connection timing and network metadata but does not receive document text or Pubky sessions. Uncollected messages expire according to the relay's TTL. This public rendezvous service has no application-specific uptime guarantee; its URL can be changed using `VITE_COLLAB_SIGNAL_URL`.
 
 The old public y-webrtc WebSocket defaults were not operational during verification and are not used by the default deployment. Custom WSS signaling also needs its exact origin added to `connect-src` in `vercel.json`; HTTPS rendezvous is already allowed.
 
-The first version requires overlapping online time to exchange edits. Each participant saves their own complete private document through their own Pubky session. Neither the signaling service nor TURN provides an offline document mailbox.
+Groups support at most ten admitted accounts, including the creator. Each browser connects to at most nine admitted peers (45 connections across a full group). The creator must be online to admit new accounts; already admitted peers can reconnect and edit without the creator using their stored, signed roster. This version permits one browser key per account and keeps offline members’ places. Participants require overlapping online time to exchange edits. Each participant saves their own complete private document through their own Pubky session. Neither the signaling service nor TURN provides an offline document mailbox.
 
 ## Current relay availability
 
@@ -37,6 +37,8 @@ node scripts/collaboration-signaling.mjs
 
 Put a TLS reverse proxy on a persistent server in front of the loopback listener and connect browsers to `wss://your-signaling-host/`. Set `COLLABORATION_SIGNALING_TRUST_LOOPBACK_PROXY=1` only when that proxy overwrites `X-Forwarded-For` with the actual single client IP; the service trusts this header only from loopback connections. Otherwise it uses the socket IP for connection quotas. The origin allowlist is required when binding outside loopback.
 
+The executable defaults to 128 connections per IP to accommodate a ten-person mesh behind one NAT, while retaining its overall connection and message limits. Set `COLLABORATION_SIGNALING_MAX_CLIENTS_PER_IP` to tune this bound (1–1000).
+
 The relay implements the small `subscribe`, `unsubscribe`, `publish`, and `ping` JSON protocol used by the app. It bounds payloads, connections, subscriptions, outgoing buffers, and message rates, and removes subscriptions on disconnect. It does not log messages or retain them. Topic names and traffic metadata are visible to the signaling operator; connection details inside the envelopes are encrypted by the app.
 
 This server keeps room membership in one process. Run one instance or add a shared pub/sub layer before scaling to multiple instances. Deploying independent in-memory instances behind a load balancer will strand peers on different instances. Vercel's WebSocket support does not automatically supply shared room state; this standalone server is intended for a persistent host, not an unmodified serverless room implementation.
@@ -51,7 +53,7 @@ X-Pubky-Notes-Collaboration: 1
 {}
 ```
 
-The response is `{ iceServers: RTCIceServer[], relayAvailable: boolean, expiresAt?: number }`. `expiresAt` is Unix time in **milliseconds**. While connected, the browser requests fresh credentials before expiration and reconnects with them to establish a fresh TURN allocation. This can briefly pause live sync; the pinned participant does not need approval again. Temporary refresh failures keep the existing connection while its credentials remain valid and retry with bounded delays. A new connection after expiration also requests fresh credentials. The response is never cacheable. If no relay is configured, it contains only a public STUN address.
+The response is `{ iceServers: RTCIceServer[], relayAvailable: boolean, expiresAt?: number }`. `expiresAt` is Unix time in **milliseconds**. All connections in one browser share a bounded credential cache, so joining nine peers does not require nine API issuances. While connected, the browser requests fresh credentials before expiration and reconnects with them to establish a fresh TURN allocation. This can briefly pause live sync; the pinned participant does not need approval again. Temporary refresh failures keep the existing connection while its credentials remain valid and retry with bounded delays. A new connection after expiration also requests fresh credentials. The response is never cacheable. If no relay is configured, it contains only a public STUN address.
 
 ### Managed Cloudflare TURN
 

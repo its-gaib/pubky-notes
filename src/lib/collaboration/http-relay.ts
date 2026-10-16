@@ -1,6 +1,7 @@
 import { encodeBytes, randomToken } from './credentials'
 import { MAX_SIGNAL_BYTES } from './signaling'
 import type { StoredRoom } from './types'
+import { pollRelay } from './http-poll'
 
 const CHUNK_BYTES = 1500
 const MAX_CHUNKS = Math.ceil(MAX_SIGNAL_BYTES / CHUNK_BYTES)
@@ -111,8 +112,9 @@ export class HttpRelaySocket implements SignalingSocket {
 
   private url(id: string): string { return `${this.baseUrl.replace(/\/$/, '')}/${id}` }
 
-  private async request(url: string, options: RequestInit, signal: AbortSignal): Promise<Response> {
-    const response = await fetch(url, { ...options, credentials: 'omit', cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer', signal })
+  private async request(url: string, options: RequestInit, signal: AbortSignal, poll = false): Promise<Response> {
+    const init: RequestInit & { signal: AbortSignal } = { ...options, credentials: 'omit', cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer', signal }
+    const response = await (poll ? pollRelay(url, init) : fetch(url, init))
     if (!response.ok && response.status !== 408) throw new Error('Collaboration rendezvous is unavailable')
     return response
   }
@@ -132,7 +134,8 @@ export class HttpRelaySocket implements SignalingSocket {
       }
       const manifest: RelayManifest = { version: 1, transfer, parts, bytes: message.length }
       await this.request(inbox, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify(manifest) }, signal)
-      const acknowledged = await this.request(`${inbox}/await`, {}, signal)
+      let acknowledged: Response
+      do { acknowledged = await this.request(`${inbox}/await`, {}, signal, true) } while (acknowledged.status === 408)
       if (!acknowledged.ok) throw new Error('Collaborator did not receive connection details; retrying')
     } finally {
       // The receiver also deletes chunks. Best effort cleanup covers aborted sends;
@@ -145,7 +148,7 @@ export class HttpRelaySocket implements SignalingSocket {
     const inbox = this.url(await relayInboxId(this.room.room, this.room.identity.publicKey))
     while (!this.stopped) {
       try {
-        const response = await this.request(inbox, {}, AbortSignal.any([this.abort.signal, AbortSignal.timeout(30_000)]))
+        const response = await this.request(inbox, {}, AbortSignal.any([this.abort.signal, AbortSignal.timeout(30_000)]), true)
         if (response.status === 408) continue
         const manifest = parseRelayManifest(JSON.parse(await readBoundedBody(response, 2048)))
         const signal = AbortSignal.any([this.abort.signal, AbortSignal.timeout(20_000)])

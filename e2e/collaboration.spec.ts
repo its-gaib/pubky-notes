@@ -338,9 +338,87 @@ async function share(alice: Page, bob: Page) {
   return id
 }
 
-async function saved(page: Page, id: string, content: string) {
+async function groupConnected(peers: Peer[]) {
+  try {
+    for (const own of peers) {
+      const bar = own.page.getByRole('region', { name: 'Active collaborators', exact: true })
+      await expect(bar.getByRole('button', { name: 'Copy verified Pubky identifier' })).toHaveCount(peers.length - 1, { timeout: 90_000 })
+      for (const other of peers.filter(peer => peer !== own)) await expect(bar.getByRole('button', { name: 'Copy verified Pubky identifier' }).filter({ hasText: `pubky${other.owner}` })).toHaveCount(1)
+    }
+  } catch (error) {
+    const diagnostics = await Promise.all(peers.map(async ({ page }) => ({ ...await page.evaluate(() => {
+      const state = window as typeof window & { __testConnections: RTCPeerConnection[]; __testChannels: RTCDataChannel[] }
+      return { connections: state.__testConnections.map(connection => ({ state: connection.connectionState, ice: connection.iceConnectionState, signaling: connection.signalingState })),
+        channels: state.__testChannels.map(channel => channel.readyState),
+        messages: [...document.querySelectorAll('.inline-error, .collaboration-panel-status')].map(node => node.textContent) }
+    }), relayRequests: relayRequests.get(page) })))
+    console.info('Group connection diagnostics:', JSON.stringify(diagnostics))
+    throw error
+  }
+}
+
+test('three participants join simultaneously, merge edits, and reconnect without the creator', async ({ browser, accounts: peers }) => {
+  test.setTimeout(180_000)
+  // This same scenario can exercise public signaling and Cloudflare TURN by
+  // supplying the two existing COLLAB_E2E_* environment variables.
+  const forceRelay = !!process.env.COLLAB_E2E_ICE_ENDPOINT
+  for (let index = 0; index < 3; index++) peers.push(await peer(browser, forceRelay))
+  const [alice, bob, carol] = peers
+  const { id, link } = await createInvitation(alice.page)
+  await Promise.all([bob.page.goto(link), carol.page.goto(link)])
+  await groupConnected(peers)
+  for (const { page } of peers) await expect(page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(BODY)
+  if (forceRelay) for (const { page } of peers) await relayed(page)
+  await Promise.all([insert(alice.page, 'start', 'Alice group edit\n'), insert(bob.page, 'end', '\nBob group edit'), insert(carol.page, 'end', '\nCarol group edit')])
+  await expect.poll(async () => new Set(await Promise.all(peers.map(({ page }) => page.getByRole('textbox', { name: 'Markdown content' }).inputValue()))).size).toBe(1)
+  const merged = await alice.page.getByRole('textbox', { name: 'Markdown content' }).inputValue()
+  for (const name of ['Alice', 'Bob', 'Carol']) expect(merged).toContain(`${name} group edit`)
+  await Promise.all(peers.map(({ page }) => saved(page, id, merged)))
+  await alice.page.getByRole('button', { name: 'Disconnect collaboration', exact: true }).click()
+  await groupConnected([bob, carol])
+  await insert(bob.page, 'end', '\nCreator is offline.')
+  const withoutCreator = `${merged}\nCreator is offline.`
+  await expect(carol.page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(withoutCreator)
+  await Promise.all([saved(bob.page, id, withoutCreator), saved(carol.page, id, withoutCreator)])
+  await Promise.all([bob.page.reload(), carol.page.reload()])
+  await groupConnected([bob, carol])
+  await insert(carol.page, 'end', '\nReconnected independently.')
+  const reconnected = `${withoutCreator}\nReconnected independently.`
+  await expect(bob.page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(reconnected)
+  await Promise.all([saved(bob.page, id, reconnected), saved(carol.page, id, reconnected)])
+  expect(await alice.page.getByRole('textbox', { name: 'Markdown content' }).inputValue()).toBe(merged)
+  await bob.page.setViewportSize({ width: 390, height: 844 })
+  expect(await bob.page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+  await bob.page.screenshot({ path: test.info().outputPath('group-roster-mobile.png'), fullPage: true })
+})
+
+test('ten people form a mesh and an eleventh cannot receive the shared document', async ({ browser, accounts: peers }) => {
+  test.setTimeout(300_000)
+  for (let index = 0; index < 11; index++) peers.push(await peer(browser))
+  const [creator, ...guests] = peers
+  const { id, link } = await createInvitation(creator.page)
+  // Ten simultaneous announcements race for nine places. Every admission is
+  // identity checked before the creator atomically commits its signed roster.
+  await Promise.all(guests.map(({ page }) => page.goto(link)))
+  await expect.poll(async () => (await Promise.all(guests.map(({ page }) => page.getByRole('region', { name: 'Active collaborators', exact: true }).count()))).filter(Boolean).length,
+    { timeout: 180_000 }).toBe(9)
+  const admitted: Peer[] = [creator], denied: Peer[] = []
+  for (const guest of guests) (await guest.page.getByRole('region', { name: 'Active collaborators', exact: true }).count() ? admitted : denied).push(guest)
+  expect(denied).toHaveLength(1)
+  await groupConnected(admitted)
+  await expect(denied[0].page.getByRole('alert')).toContainText('10')
+  expect((await notes(denied[0].page)).some(row => row.note.id === id)).toBe(false)
+  await insert(admitted[9].page, 'end', '\nThe tenth participant can edit.')
+  for (const { page } of admitted) await expect(page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(`${BODY}\nThe tenth participant can edit.`)
+  await Promise.all(admitted.map(({ page }) => saved(page, id, `${BODY}\nThe tenth participant can edit.`)))
+  await creator.page.setViewportSize({ width: 390, height: 844 })
+  expect(await creator.page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+  await creator.page.screenshot({ path: test.info().outputPath('ten-person-roster-mobile.png'), fullPage: true })
+})
+
+async function saved(page: Page, id: string, content: string, timeout = 20_000) {
   await expect.poll(async () => (await notes(page)).find(row => row.note.id === id)?.note.content,
-    { message: 'The actual private homeserver file must contain the converged text' }).toBe(content)
+    { message: 'The actual private homeserver file must contain the converged text', timeout }).toBe(content)
 }
 
 async function insert(page: Page, edge: 'start' | 'end', text: string) {
@@ -523,6 +601,11 @@ test('pending invitation survives signed-out reload and automatically joins afte
 })
 
 test('offline branches merge on reconnection and reload reuses the approved browser identity', async ({ browser, accounts: peers }) => {
+    test.setTimeout(240_000)
+    // Reading a completed PUT does not mean its final UNLOCK has finished. Going
+    // offline or reloading can interrupt that release, so allow the 60-second
+    // homeserver lease to expire and the next background save to retry.
+    const interruptedSaveTimeout = 100_000
     const alice = await peer(browser); peers.push(alice)
     const bob = await peer(browser); peers.push(bob)
     const id = await share(alice.page, bob.page)
@@ -543,7 +626,7 @@ test('offline branches merge on reconnection and reload reuses the approved brow
     await Promise.all(peers.map(({ page }) => connected(page)))
     const merged = `Alice while Bob was away\n${BODY}\nBob edited offline`
     for (const { page } of peers) await expect(page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(merged)
-    await Promise.all(peers.map(({ page }) => saved(page, id, merged)))
+    await Promise.all(peers.map(({ page }) => saved(page, id, merged, interruptedSaveTimeout)))
 
     await Promise.all(peers.map(({ page }) => page.reload()))
     await Promise.all(peers.map(({ page }) => connected(page)))
@@ -553,7 +636,7 @@ test('offline branches merge on reconnection and reload reuses the approved brow
     }
     await insert(bob.page, 'end', '\nAfter reload')
     await expect(alice.page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(`${merged}\nAfter reload`)
-    await Promise.all(peers.map(({ page }) => saved(page, id, `${merged}\nAfter reload`)))
+    await Promise.all(peers.map(({ page }) => saved(page, id, `${merged}\nAfter reload`, interruptedSaveTimeout)))
 })
 
 test('live collaborator cursors follow native selections, CRDT edits, wrapping, and scrolling without persisting presence', async ({ browser, accounts: peers }) => {

@@ -110,7 +110,7 @@ export default function HistoryPanel({ entries, current, readVersion, readChange
         <h2><History size={16} /> History</h2>
         <button className="icon-button" onClick={closeHistory} aria-label="Close history" title="Close history"><X size={18} /></button>
       </header>
-      <p className="history-description">Versions are saved after you pause typing or save. {collaborative ? 'Saved versions stay private; edit attribution is shared with your collaborator.' : 'Your history stays private.'}</p>
+      <p className="history-description">Versions are saved after you pause typing or save. {collaborative ? 'Saved versions stay private; edit attribution is shared with your collaborators.' : 'Your history stays private.'}</p>
       {entries.length > 0 && <>
         <div className="history-timeline">
           <button className="history-play" onClick={togglePlayback} disabled={entries.length < 2} aria-label={playing ? 'Pause history' : 'Play history'} title={playing ? 'Pause history' : 'Play history'}>

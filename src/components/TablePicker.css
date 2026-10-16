@@ -1,0 +1,33 @@
+.table-picker {
+  position: fixed;
+  z-index: 80;
+  width: min(288px, calc(100vw - 16px));
+  padding: 15px;
+  overflow: auto;
+  box-sizing: border-box;
+  border: 1px solid var(--line, #e5e5eb);
+  border-radius: 10px;
+  background: #fff;
+  color: #343440;
+  box-shadow: 0 8px 28px #25223826;
+}
+.table-picker > strong { display: block; font-size: 14px; }
+.table-picker-size { display: block; margin: 5px 0 10px; color: #646473; font-size: 12px; }
+.table-picker-grid { display: grid; gap: 4px; }
+.table-picker-grid > [role="row"] { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 4px; }
+.table-picker-grid [role="gridcell"] {
+  width: 100%;
+  aspect-ratio: 1;
+  padding: 0;
+  border: 1px solid #cccbd7;
+  border-radius: 3px;
+  background: #faf9fc;
+  cursor: pointer;
+}
+.table-picker-grid [aria-selected="true"] { background: #e9e2ff; border-color: #8a72bd; }
+.table-picker-grid [role="gridcell"]:focus-visible { outline: 2px solid #68528e; outline-offset: 1px; }
+.table-picker p { margin: 10px 0; font-size: 12px; color: #646473; line-height: 1.5; }
+.table-picker-fields { display: flex; gap: 12px; margin-bottom: 12px; }
+.table-picker-fields label { display: flex; flex: 1; flex-direction: column; gap: 5px; min-width: 0; font-size: 12px; }
+.table-picker-fields input { width: 100%; min-width: 0; box-sizing: border-box; padding: 7px 9px; border: 1px solid #cccbd7; border-radius: 5px; background: #fff; }
+.table-picker form > button { width: 100%; }

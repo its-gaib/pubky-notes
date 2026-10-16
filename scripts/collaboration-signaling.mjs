@@ -120,9 +120,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const host = process.env.COLLABORATION_SIGNALING_HOST ?? '127.0.0.1'
   const port = Number(process.env.COLLABORATION_SIGNALING_PORT ?? 4444)
   const configuredOrigins = process.env.COLLABORATION_SIGNALING_ORIGINS?.split(',').map((origin) => origin.trim()).filter(Boolean)
+  const maxClientsPerIp = Number(process.env.COLLABORATION_SIGNALING_MAX_CLIENTS_PER_IP ?? 128)
   if (!LOOPBACK.has(host) && !configuredOrigins?.length) throw new Error('Set COLLABORATION_SIGNALING_ORIGINS before listening outside loopback')
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid signaling port')
-  const signaling = createSignalingServer({ allowedOrigins: configuredOrigins, trustLoopbackProxy: process.env.COLLABORATION_SIGNALING_TRUST_LOOPBACK_PROXY === '1' })
+  if (!Number.isInteger(maxClientsPerIp) || maxClientsPerIp < 1 || maxClientsPerIp > 1000) throw new Error('Invalid signaling connection limit')
+  const signaling = createSignalingServer({ allowedOrigins: configuredOrigins, maxClientsPerIp, trustLoopbackProxy: process.env.COLLABORATION_SIGNALING_TRUST_LOOPBACK_PROXY === '1' })
   signaling.server.listen(port, host, () => console.log(`Collaboration signaling listening on ${host}:${port}`))
   for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => signaling.close().then(() => process.exit(0)))
 }

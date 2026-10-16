@@ -1,4 +1,5 @@
 import type { Invitation, SharedDescriptor, StoredRoom } from './types'
+import type { SignedMembership } from './membership'
 
 const DATABASE = 'pubky-notes:collaboration:v1'
 const ROOM_BYTES = 24
@@ -183,4 +184,33 @@ export async function pinHostIdentity(room: StoredRoom, owner: string): Promise<
 export async function deleteRoom(scope: string, noteId: string): Promise<void> {
   requireScope(scope)
   await transaction('readwrite', store => store.delete([scope, noteId]))
+}
+
+/** Compare-and-swap keeps signed room membership consistent across creator tabs.
+ * Signing/verification happens before this short transaction, never inside it. */
+export async function compareAndSwapMembership(room: StoredRoom, expectedSignature: string | undefined, membership: SignedMembership): Promise<boolean> {
+  requireScope(room.scope)
+  const db = await openDatabase()
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('rooms', 'readwrite')
+    const store = tx.objectStore('rooms')
+    const request = store.get([room.scope, room.descriptor.id])
+    let saved = false
+    let failure: Error | undefined
+    request.onsuccess = () => {
+      const current = request.result as StoredRoom | undefined
+      if (!current || current.room !== room.room || current.secret !== room.secret || current.hostKey !== room.hostKey
+        || current.descriptor.createdAt !== room.descriptor.createdAt || current.descriptor.lineage !== room.descriptor.lineage
+        || (current.hostIdentity && current.hostIdentity !== membership.members[0].owner)) {
+        failure = new Error('This collaboration was closed or its creator identity changed')
+        tx.abort()
+        return
+      }
+      if (current.membership?.signature !== expectedSignature) return
+      store.put({ ...current, membership, hostIdentity: membership.members[0].owner })
+      saved = true
+    }
+    tx.oncomplete = () => resolve(saved)
+    tx.onabort = tx.onerror = () => reject(failure ?? tx.error ?? new Error('Unable to save collaboration membership'))
+  })
 }

@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useCollaboration } from './useCollaboration'
 import { initializeNote, listNoteVersions, readNoteVersion, readNoteVersionChanges } from '../lib/crdt'
 import { createSharedNote, joinSharedNote, SharedNoteDocument, sharedNoteDescriptor } from '../lib/shared-note'
-import type { CollaborationCallbacks, StoredRoom } from '../lib/collaboration'
+import type { CollaborationCallbacks, GroupCollaborationCallbacks, CollaborationPeer, StoredRoom } from '../lib/collaboration'
 import type { Invitation } from '../lib/collaboration'
 import { encodeBytes, invitationUrl as actualInvitationUrl, parseInvitation as actualParseInvitation } from '../lib/collaboration/credentials'
 import { PENDING_INVITATION_KEY, readPendingInvitation, savePendingInvitation } from '../lib/collaboration/pending-invitation'
@@ -24,6 +24,12 @@ vi.mock('../lib/collaboration', () => ({
 
 const identity = { owner: 'y'.repeat(52), createProof: async () => ({ grant: 'unit-test-grant', pop: 'unit-test-proof' }) }
 let callbacks: CollaborationCallbacks
+let groupCallbacks: GroupCollaborationCallbacks
+const firstPeer: CollaborationPeer = { key: 'peer-key', owner: 'b'.repeat(52), session: 'peer-session', fingerprint: 'PEER KEY', presenceSupported: true }
+const secondPeer: CollaborationPeer = { key: 'second-key', owner: 'c'.repeat(52), session: 'second-session', fingerprint: 'SECOND KEY', presenceSupported: true }
+function groupStatus(peers: CollaborationPeer[], creatorOnline = true) {
+  groupCallbacks.onStatus({ state: peers.length ? 'connected' : 'waiting', relayAvailable: true, peers, participantCount: 3, maxParticipants: 10, creatorOnline })
+}
 beforeEach(() => {
   vi.useFakeTimers(); vi.stubGlobal('crypto', webcrypto)
   sessionStorage.clear(); window.history.replaceState(null, '', '/')
@@ -33,8 +39,23 @@ beforeEach(() => {
   mocks.send.mockReset().mockResolvedValue(undefined)
   mocks.dispose.mockReset(); mocks.load.mockReset().mockResolvedValue(null)
   mocks.reconnect.mockReset()
-  mocks.start.mockReset().mockImplementation((_room: StoredRoom, next: CollaborationCallbacks) => {
-    callbacks = next
+  mocks.start.mockReset().mockImplementation((_room: StoredRoom, next: GroupCollaborationCallbacks) => {
+    groupCallbacks = next
+    let announced = false
+    callbacks = {
+      onStatus(status) {
+        announced = true
+        next.onStatus({ ...status, peers: status.state === 'connected' ? [{ ...firstPeer, fingerprint: status.peerFingerprint, presenceSupported: status.presenceSupported ?? false }] : [], participantCount: 2, maxParticipants: 10, creatorOnline: status.state === 'connected' })
+      },
+      onMessage(message) {
+        if (!announced) {
+          announced = true
+          groupStatus([firstPeer])
+        }
+        return next.onMessage(message, firstPeer.key)
+      },
+      onError: next.onError,
+    }
     return { send: mocks.send, dispose: mocks.dispose, reconnect: mocks.reconnect }
   })
 })
@@ -499,14 +520,14 @@ describe('collaboration cursor hook', () => {
     const { result, shared, persist, peer, presence, renders } = await setup(true, true)
     const before = renders()
     await act(async () => { await callbacks.onMessage(presence(6, 11)); await vi.advanceTimersByTimeAsync(50) })
-    expect(result.current.remoteSelection).toMatchObject({ noteId: shared.id, start: 6, end: 11 })
+    expect(result.current.remoteSelections[0] ?? null).toMatchObject({ noteId: shared.id, start: 6, end: 11 })
     expect(renders() - before).toBeLessThanOrEqual(3)
-    const first = result.current.remoteSelection
+    const first = result.current.remoteSelections[0] ?? null
     await act(async () => { await callbacks.onMessage(presence(6, 11)); await vi.advanceTimersByTimeAsync(50) })
-    expect(result.current.remoteSelection).toBe(first)
+    expect(result.current.remoteSelections[0] ?? null).toBe(first)
     await act(async () => { await callbacks.onMessage(presence(2, 5)); await vi.advanceTimersByTimeAsync(50) })
-    expect(result.current.remoteSelection).toMatchObject({ start: 2, end: 5 })
-    expect(result.current.remoteSelection).not.toBe(first)
+    expect(result.current.remoteSelections[0] ?? null).toMatchObject({ start: 2, end: 5 })
+    expect(result.current.remoteSelections[0] ?? null).not.toBe(first)
     expect(persist).not.toHaveBeenCalled()
     peer.destroy()
   })
@@ -522,7 +543,7 @@ describe('collaboration cursor hook', () => {
     expect(mocks.send).toHaveBeenCalledOnce()
     expect(mocks.send.mock.calls[0][0][0]).toBe(3)
     expect(decodePresence(mocks.send.mock.calls[0][0].subarray(1))?.label).toBe('Alice')
-    expect(result.current.remoteSelection).toMatchObject({ noteId: shared.id, start: 6, end: 11, label: 'Bob' })
+    expect(result.current.remoteSelections[0] ?? null).toMatchObject({ noteId: shared.id, start: 6, end: 11, label: 'Bob' })
     expect(persist).not.toHaveBeenCalled()
     expect(JSON.stringify(shared)).toBe(original)
     await act(async () => { result.current.updateSelection(shared.id, null); await vi.advanceTimersByTimeAsync(50) })
@@ -538,7 +559,7 @@ describe('collaboration cursor hook', () => {
       await vi.advanceTimersByTimeAsync(100)
     })
     expect(mocks.send).not.toHaveBeenCalled()
-    expect(result.current.remoteSelection).toBeNull()
+    expect(result.current.remoteSelections[0] ?? null).toBeNull()
     peer.destroy()
   })
 
@@ -547,15 +568,15 @@ describe('collaboration cursor hook', () => {
     await act(async () => { await callbacks.onMessage(presence()); await vi.advanceTimersByTimeAsync(50) })
     let local = shared
     act(() => { local = result.current.edit(shared, { content: `Prefix ${shared.content}` }) })
-    expect(result.current.remoteSelection?.start).toBe(13)
+    expect(result.current.remoteSelections[0]?.start).toBe(13)
     peer.edit({ content: `${peer.note.content}!` })
     await act(async () => { await callbacks.onMessage(new Uint8Array([1, ...peer.getUpdate()])) })
-    expect(result.current.remoteSelection?.start).toBe(13)
+    expect(result.current.remoteSelections[0]?.start).toBe(13)
     expect(persist).toHaveBeenCalledOnce()
     const replica = new SharedNoteDocument(local)
     replica.edit({ content: `Own ${replica.note.content}` })
     rerender({ ...props, notes: [replica.note] })
-    expect(result.current.remoteSelection?.start).toBe(17)
+    expect(result.current.remoteSelections[0]?.start).toBe(17)
     peer.destroy(); replica.destroy()
   })
 
@@ -563,19 +584,19 @@ describe('collaboration cursor hook', () => {
     const { result, props, rerender, shared, peer, presence, persist } = await setup()
     await act(async () => { await callbacks.onMessage(presence()); await vi.advanceTimersByTimeAsync(50) })
     rerender({ ...props, activeId: 'another-note' })
-    expect(result.current.remoteSelection).toBeNull()
+    expect(result.current.remoteSelections[0] ?? null).toBeNull()
     await act(async () => { await vi.advanceTimersByTimeAsync(50) })
     expect(decodePresence(mocks.send.mock.calls.at(-1)![0].subarray(1))?.selection).toBeNull()
     rerender(props)
     await act(async () => { await callbacks.onMessage(presence()); await vi.advanceTimersByTimeAsync(50) })
-    expect(result.current.remoteSelection).not.toBeNull()
+    expect(result.current.remoteSelections[0] ?? null).not.toBeNull()
     act(() => { callbacks.onStatus({ state: 'disconnected', relayAvailable: false }) })
-    expect(result.current.remoteSelection).toBeNull()
+    expect(result.current.remoteSelections[0] ?? null).toBeNull()
     act(() => { callbacks.onStatus({ state: 'connected', relayAvailable: false, presenceSupported: true }) })
     await act(async () => { await callbacks.onMessage(presence()); await vi.advanceTimersByTimeAsync(50) })
     Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
     act(() => { document.dispatchEvent(new Event('visibilitychange')) })
-    expect(result.current.remoteSelection).toBeNull()
+    expect(result.current.remoteSelections[0] ?? null).toBeNull()
     Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
     act(() => { document.dispatchEvent(new Event('visibilitychange')); result.current.updateSelection(shared.id, { field: 'content', start: 2, end: 2 }) })
     rerender({ ...props, scope: 'bob', enabled: false })
@@ -583,8 +604,107 @@ describe('collaboration cursor hook', () => {
     await act(async () => { await callbacks.onMessage(presence()); await vi.advanceTimersByTimeAsync(30_000) })
     expect(mocks.send).not.toHaveBeenCalled()
     expect(persist).not.toHaveBeenCalled()
-    expect(result.current.remoteSelection).toBeNull()
+    expect(result.current.remoteSelections[0] ?? null).toBeNull()
     expect(mocks.dispose).toHaveBeenCalledOnce()
     peer.destroy()
+  })
+})
+
+describe('group collaboration', () => {
+  it('reconciles each newly connected peer and targets replies and receipts to their sender', async () => {
+    const { peer, persist } = await setup()
+    act(() => groupStatus([firstPeer, secondPeer]))
+    expect(mocks.send.mock.calls.filter(([message]) => message[0] === 0).map(([, target]) => target)).toEqual([secondPeer.key])
+    mocks.send.mockClear()
+    await act(async () => { await groupCallbacks.onMessage(new Uint8Array([0]), secondPeer.key) })
+    expect(mocks.send.mock.calls.filter(([message]) => message[0] === 1).map(([, target]) => target)).toEqual([secondPeer.key])
+    peer.edit({ content: 'Updated by another participant' })
+    await act(async () => { await groupCallbacks.onMessage(new Uint8Array([1, ...peer.getUpdate()]), firstPeer.key) })
+    expect(persist).toHaveBeenCalledOnce()
+    expect(mocks.send.mock.calls.filter(([message]) => message[0] === 2).map(([, target]) => target)).toEqual([firstPeer.key])
+    peer.destroy()
+  })
+
+  it('only reports receipt after every currently connected session acknowledges the exact document', async () => {
+    const { result, shared, peer } = await setup()
+    act(() => groupStatus([firstPeer, secondPeer]))
+    const receiptFor = async (doc: SharedNoteDocument) => new Uint8Array([2, ...new TextEncoder().encode(
+      Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', doc.getUpdate() as Uint8Array<ArrayBuffer>)), byte => byte.toString(16).padStart(2, '0')).join(''),
+    )])
+    const receipt = await receiptFor(peer)
+    await act(async () => { await groupCallbacks.onMessage(receipt, firstPeer.key) })
+    expect(result.current.view.peerReceived).toBe(false)
+    await act(async () => { await groupCallbacks.onMessage(receipt, secondPeer.key) })
+    expect(result.current.view.peerReceived).toBe(true)
+    let edited = shared
+    act(() => { edited = result.current.edit(shared, { content: 'A later checkpoint' }) })
+    expect(result.current.view.peerReceived).toBe(false)
+    await act(async () => { await groupCallbacks.onMessage(receipt, firstPeer.key); await groupCallbacks.onMessage(receipt, secondPeer.key) })
+    expect(result.current.view.peerReceived).toBe(false)
+    const next = new SharedNoteDocument(edited), nextReceipt = await receiptFor(next)
+    await act(async () => { await groupCallbacks.onMessage(nextReceipt, firstPeer.key); await groupCallbacks.onMessage(nextReceipt, secondPeer.key) })
+    expect(result.current.view.peerReceived).toBe(true)
+    await act(async () => groupStatus([firstPeer, { ...secondPeer, session: 'reconnected-session' }]))
+    expect(result.current.view.peerReceived).toBe(false)
+    await act(async () => groupStatus([]))
+    expect(result.current.view.peerReceived).toBe(false)
+    peer.destroy(); next.destroy()
+  })
+
+  it('serializes saves from different peers while their cursors remain independent', async () => {
+    const { result, shared, peer, persist, presence } = await setup()
+    act(() => groupStatus([firstPeer, secondPeer]))
+    const other = new SharedNoteDocument(shared)
+    peer.edit({ content: `First ${shared.content}` })
+    other.edit({ content: `${shared.content} second` })
+    let finish!: () => void
+    persist.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve }))
+    let first!: Promise<void>, second!: Promise<void>
+    act(() => {
+      first = Promise.resolve(groupCallbacks.onMessage(new Uint8Array([1, ...peer.getUpdate()]), firstPeer.key))
+      second = Promise.resolve(groupCallbacks.onMessage(new Uint8Array([1, ...other.getUpdate()]), secondPeer.key))
+    })
+    expect(persist).toHaveBeenCalledOnce()
+    expect(persist.mock.calls[0][0].content).toBe(`First ${shared.content}`)
+    await act(async () => {
+      await groupCallbacks.onMessage(presence(1, 3), firstPeer.key)
+      await groupCallbacks.onMessage(presence(4, 5), secondPeer.key)
+      await vi.advanceTimersByTimeAsync(50)
+    })
+    expect(result.current.remoteSelections.map(selection => selection.peerKey)).toEqual([firstPeer.key, secondPeer.key])
+    expect(persist).toHaveBeenCalledOnce()
+    await act(async () => { finish(); await Promise.all([first, second]) })
+    expect(persist).toHaveBeenCalledTimes(2)
+    expect(persist.mock.calls[1][0].content).toBe(`First ${shared.content} second`)
+    expect(mocks.send.mock.calls.filter(([message]) => message[0] === 2).map(([, target]) => target)).toEqual([firstPeer.key, secondPeer.key])
+    act(() => groupStatus([secondPeer], false))
+    expect(result.current.remoteSelections.map(selection => selection.peerKey)).toEqual([secondPeer.key])
+    expect(result.current.view.status?.creatorOnline).toBe(false)
+    expect(result.current.view.status?.state).toBe('connected')
+    peer.destroy(); other.destroy()
+  })
+
+  it('discards queued work and cursor state belonging to a replaced peer session', async () => {
+    const { result, shared, peer, persist, presence } = await setup()
+    act(() => groupStatus([firstPeer, secondPeer]))
+    let finish!: () => void
+    persist.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve }))
+    peer.edit({ content: 'First persisted update' })
+    const other = new SharedNoteDocument(shared)
+    other.edit({ content: 'Retired session must not be applied' })
+    let first!: Promise<void>, old!: Promise<void>
+    act(() => {
+      first = Promise.resolve(groupCallbacks.onMessage(new Uint8Array([1, ...peer.getUpdate()]), firstPeer.key))
+      old = Promise.resolve(groupCallbacks.onMessage(new Uint8Array([1, ...other.getUpdate()]), secondPeer.key))
+    })
+    await act(async () => { await groupCallbacks.onMessage(presence(), secondPeer.key); await vi.advanceTimersByTimeAsync(50) })
+    expect(result.current.remoteSelections).toHaveLength(1)
+    act(() => groupStatus([firstPeer, { ...secondPeer, session: 'replacement' }]))
+    expect(result.current.remoteSelections).toHaveLength(0)
+    await act(async () => { finish(); await Promise.all([first, old]) })
+    expect(persist).toHaveBeenCalledOnce()
+    expect(persist.mock.calls[0][0].content).toBe('First persisted update')
+    expect(mocks.send.mock.calls.filter(([message]) => message[0] === 2).map(([, target]) => target)).toEqual([firstPeer.key])
+    peer.destroy(); other.destroy()
   })
 })

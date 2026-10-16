@@ -5,7 +5,7 @@ import { createSharedNote, joinSharedNote, SharedNoteDocument, sharedNoteDescrip
 import {
   createGuestRoom, createHostRoom, fingerprint, invitationUrl, loadRoom, parseInvitation, startCollaboration, webRtcAvailable, WEBRTC_UNAVAILABLE_MESSAGE, IDENTITY_UNAVAILABLE_MESSAGE,
 } from '../lib/collaboration'
-import type { CollaborationOptions, CollaborationStatus, CollaborationTransport, Invitation, StoredRoom } from '../lib/collaboration'
+import type { CollaborationOptions, CollaborationPeer, GroupCollaborationStatus, GroupCollaborationTransport, Invitation, StoredRoom } from '../lib/collaboration'
 import { SelectionPresence } from '../lib/collaboration/presence'
 import type { EditorSelection, RemoteSelection } from '../lib/collaboration/presence'
 import { clearPendingInvitation, readPendingInvitation, savePendingInvitation } from '../lib/collaboration/pending-invitation'
@@ -21,21 +21,28 @@ interface Options {
   persist(note: CrdtNote, scope: string, select?: boolean): Promise<void>
   beforeRemoteChange(doc: SharedNoteDocument, rendered?: SharedNoteDocument): (() => void) | undefined
 }
+interface LivePeer {
+  descriptor: CollaborationPeer
+  presence: SelectionPresence
+  receivedHash?: string
+}
+export interface PeerSelection extends RemoteSelection { peerKey: string }
 interface LiveRoom {
   room: StoredRoom
   doc?: SharedNoteDocument
-  transport?: CollaborationTransport
+  transport?: GroupCollaborationTransport
   connected: boolean
   alive: boolean
   syncTimer?: ReturnType<typeof setInterval>
   persistedUpdate?: string
-  presence?: SelectionPresence
-  peerFingerprint?: string
+  peers: Map<string, LivePeer>
+  messageQueue?: Promise<void>
+  receiptRevision: number
 }
 export interface CollaborationView {
   noteId?: string
   role?: 'host' | 'guest'
-  status?: CollaborationStatus
+  status?: GroupCollaborationStatus
   link?: string
   error?: string
   ownFingerprint?: string
@@ -64,7 +71,7 @@ export function useCollaboration(options: Options) {
   const generation = useRef(0)
   const paused = useRef('')
   const [view, setView] = useState<CollaborationView>(initial)
-  const [remoteSelection, setRemoteSelection] = useState<RemoteSelection | null>(null)
+  const [remoteSelections, setRemoteSelections] = useState<PeerSelection[]>([])
   const [invitation, setInvitation] = useState<Invitation | null>(() => {
     try { return parseInvitation(window.location.hash) ?? readPendingInvitation() } catch { return null }
   })
@@ -80,9 +87,9 @@ export function useCollaboration(options: Options) {
     live.current = null
     if (connection) {
       paused.current = `${connection.room.scope}:${connection.room.descriptor.id}`
-      connection.alive = false; clearInterval(connection.syncTimer); connection.presence?.dispose(); connection.transport?.dispose(); connection.doc?.destroy()
+      connection.alive = false; clearInterval(connection.syncTimer); connection.peers.forEach(peer => peer.presence.dispose()); connection.peers.clear(); connection.transport?.dispose(); connection.doc?.destroy()
     }
-    setRemoteSelection(null)
+    setRemoteSelections([])
     setView(initial)
   }, [])
   useEffect(() => { stop(); paused.current = ''; return stop }, [options.scope, options.enabled, stop])
@@ -119,98 +126,148 @@ export function useCollaboration(options: Options) {
       const unavailable = !webRtcAvailable()
       paused.current = `${room.scope}:${room.descriptor.id}`
       setView({ ...initial, noteId: room.descriptor.id, role: room.role,
-        status: { state: 'error', relayAvailable: false, issue: unavailable ? 'webrtc-unavailable' : 'identity-unavailable' },
+        status: { state: 'error', relayAvailable: false, peers: [], participantCount: 0, maxParticipants: 10, creatorOnline: false, issue: unavailable ? 'webrtc-unavailable' : 'identity-unavailable' },
         error: unavailable ? WEBRTC_UNAVAILABLE_MESSAGE : IDENTITY_UNAVAILABLE_MESSAGE })
       return
     }
     paused.current = ''
-    const connection: LiveRoom = { room, doc: note ? new SharedNoteDocument(note) : undefined, connected: false, alive: true }
+    const connection: LiveRoom = { room, doc: note ? new SharedNoteDocument(note) : undefined, connected: false, alive: true, peers: new Map(), receiptRevision: 0 }
     live.current = connection
     setView({ ...initial, noteId: room.descriptor.id, role: room.role,
-      link: room.role === 'host' ? invitationUrl(room, window.location.origin) : undefined })
+      link: invitationUrl(room, window.location.origin) })
     void fingerprint(room.identity.publicKey).then(ownFingerprint => {
       if (current(connection)) setView(previous => ({ ...previous, ownFingerprint }))
     }).catch(() => undefined)
-    const send = async (message: Uint8Array) => {
-      if (current(connection) && connection.connected) await connection.transport!.send(message)
+    const peerCurrent = (peerKey: string, peer: LivePeer) => current(connection) && connection.peers.get(peerKey) === peer
+    const send = async (message: Uint8Array, peerKey?: string, peer?: LivePeer) => {
+      if (current(connection) && connection.connected && (!peer || (peerKey && peerCurrent(peerKey, peer)))) {
+        await connection.transport?.send(message, peerKey)
+      }
     }
-    connection.presence = new SelectionPresence({
-      document: () => connection.doc,
-      label: () => latest.current.displayName,
-      fingerprint: () => connection.peerFingerprint,
-      send: payload => send(packet(3, payload)),
-      publish: selection => {
-        // Callers may derive a fresh notes array on every render. Resolving an
-        // unchanged cursor during that reconciliation must not trigger another render.
-        if (current(connection)) setRemoteSelection(previous => sameRemoteSelection(previous, selection) ? previous : selection)
-      },
-    })
-    connection.presence.setActive(latest.current.activeId === room.descriptor.id && document.visibilityState !== 'hidden')
+    const refreshPresence = () => connection.peers.forEach(peer => peer.presence.refresh())
+    const invalidateReceipt = () => {
+      connection.receiptRevision++
+      if (current(connection)) setView(previous => previous.peerReceived ? { ...previous, peerReceived: false } : previous)
+    }
+    const updateReceipt = async () => {
+      if (!connection.doc || !connection.peers.size) return
+      const revision = connection.receiptRevision, expected = await digest(connection.doc.getUpdate())
+      if (!current(connection) || revision !== connection.receiptRevision) return
+      const received = connection.peers.size > 0 && [...connection.peers.values()].every(peer => peer.receivedHash === expected)
+      setView(previous => previous.peerReceived === received ? previous : { ...previous, peerReceived: received })
+    }
+    const report = (error: unknown) => {
+      if (current(connection)) setView(previous => ({ ...previous, error: error instanceof Error ? error.message : 'Collaboration could not sync.' }))
+    }
+    async function receiveDocument(message: Uint8Array, peerKey: string, peer: LivePeer) {
+      if (!peerCurrent(peerKey, peer)) return
+      const type = message[0], payload = message.subarray(1)
+      if (type === 0) {
+        if (connection.doc) await send(packet(1, connection.doc.getUpdate(payload.length ? payload : undefined)), peerKey, peer)
+      } else if (type === 1) {
+        const first = !connection.doc
+        const restoreSelection = connection.doc ? latest.current.beforeRemoteChange(connection.doc) : undefined
+        if (!connection.doc) connection.doc = new SharedNoteDocument(joinSharedNote(room.descriptor, payload))
+        else connection.doc.applyPeerUpdate(payload)
+        invalidateReceipt()
+        refreshPresence()
+        if (!current(connection)) return
+        const next = connection.doc.note
+        // Capture the receipt before yielding. A local edit during the durable
+        // write must never be acknowledged as part of this received snapshot.
+        const receivedUpdate = connection.doc.getUpdate()
+        if (connection.persistedUpdate !== next.crdt!.update) {
+          const saving = latest.current.persist(next, room.scope, first)
+          try { restoreSelection?.() } finally { await saving }
+          if (!current(connection)) return
+          connection.persistedUpdate = next.crdt!.update
+        } else restoreSelection?.()
+        if (!current(connection)) return
+        const pending = invitationRef.current
+        if (pending && pending.room === room.room && pending.hostKey === room.hostKey && pending.secret === room.secret
+          && pending.descriptor.id === room.descriptor.id && pending.descriptor.lineage === room.descriptor.lineage
+          && pending.descriptor.createdAt === room.descriptor.createdAt) {
+          clearPendingInvitation(pending)
+          invitationRef.current = null; setInvitation(null)
+        }
+        // Only the sender receives this device-persistence receipt. It does
+        // not assert persistence by any other participant or homeserver.
+        const receivedHash = await digest(receivedUpdate)
+        await send(packet(2, encoder.encode(receivedHash)), peerKey, peer)
+        if (first) await send(packet(0, connection.doc.getStateVector()), peerKey, peer)
+        await updateReceipt()
+      } else if (type === 2) {
+        const acknowledged = new TextDecoder().decode(payload)
+        if (payload.length !== 64 || !/^[0-9a-f]{64}$/.test(acknowledged) || !connection.doc) throw new Error('Invalid collaboration acknowledgement.')
+        peer.receivedHash = acknowledged
+        await updateReceipt()
+      } else throw new Error('Unsupported collaboration message.')
+    }
     connection.transport = startCollaboration(room, {
       onStatus(status) {
         if (!current(connection)) return
-        const wasConnected = connection.connected
-        connection.connected = status.state === 'connected'
-        connection.peerFingerprint = status.peerFingerprint
-        connection.presence?.setConnected(connection.connected && status.presenceSupported === true)
-        setView(previous => ({ ...previous, status, ...(connection.connected ? { error: undefined } : { peerReceived: false }) }))
-        if (connection.connected && !wasConnected) {
-          void send(packet(0, connection.doc?.getStateVector())).catch(error => {
-            if (current(connection)) setView(previous => ({ ...previous, error: error.message }))
-          })
-        }
-      },
-      onError(error) { if (current(connection)) setView(previous => ({ ...previous, error: error.message })) },
-      async onMessage(message) {
-        if (!current(connection)) return
-        if (!message.length) throw new Error('Invalid collaboration message.')
-        const type = message[0], payload = message.subarray(1)
-        if (type === 0) {
-          if (connection.doc) await send(packet(1, connection.doc.getUpdate(payload.length ? payload : undefined)))
-        } else if (type === 1) {
-          const first = !connection.doc
-          const restoreSelection = connection.doc ? latest.current.beforeRemoteChange(connection.doc) : undefined
-          if (!connection.doc) connection.doc = new SharedNoteDocument(joinSharedNote(room.descriptor, payload))
-          else connection.doc.applyPeerUpdate(payload)
-          connection.presence?.refresh()
-          if (!current(connection)) return
-          const next = connection.doc.note
-          // Snapshot the receipt now, but let persistence synchronously update
-          // the editor before yielding to hashing or another browser input task.
-          const receivedUpdate = connection.doc.getUpdate()
-          // A duplicate can follow a failed local write. Only skip snapshots
-          // that this connection has already durably persisted.
-          if (connection.persistedUpdate !== next.crdt!.update) {
-            const saving = latest.current.persist(next, room.scope, first)
-            try { restoreSelection?.() } finally { await saving }
-            if (!current(connection)) return
-            connection.persistedUpdate = next.crdt!.update
-          } else restoreSelection?.()
-          if (!current(connection)) return
-          // Keep the invitation recoverable until the received document is durable.
-          // A failed handshake or local write must not strand an empty guest room on reload.
-          const pending = invitationRef.current
-          if (pending && pending.room === room.room && pending.hostKey === room.hostKey && pending.secret === room.secret
-            && pending.descriptor.id === room.descriptor.id && pending.descriptor.lineage === room.descriptor.lineage
-            && pending.descriptor.createdAt === room.descriptor.createdAt) {
-            clearPendingInvitation(pending)
-            invitationRef.current = null; setInvitation(null)
+        const incoming = new Map(status.peers.map(peer => [peer.key, peer]))
+        let changed = false
+        for (const [key, peer] of connection.peers) {
+          if (incoming.get(key)?.session !== peer.descriptor.session || incoming.get(key)?.owner !== peer.descriptor.owner) {
+            connection.peers.delete(key); peer.presence.dispose(); changed = true
           }
-          // This acknowledges device persistence, not the other person's homeserver.
-          const receivedHash = await digest(receivedUpdate)
-          if (!current(connection)) return
-          await send(packet(2, encoder.encode(receivedHash)))
-          if (first) await send(packet(0, connection.doc.getStateVector()))
-        } else if (type === 2) {
-          if (payload.length !== 64 || !connection.doc) throw new Error('Invalid collaboration acknowledgement.')
-          const acknowledged = new TextDecoder().decode(payload)
-          const expected = await digest(connection.doc.getUpdate())
-          if (current(connection) && acknowledged === expected) setView(previous => ({ ...previous, peerReceived: true }))
-        } else if (type === 3) {
-          // Presence validates and coalesces its small payload before decoding.
-          // It never reaches the note persistence or acknowledgement paths.
-          connection.presence?.receive(payload)
-        } else throw new Error('Unsupported collaboration message.')
+        }
+        const added: [string, LivePeer][] = []
+        for (const descriptor of status.peers) {
+          let peer = connection.peers.get(descriptor.key)
+          if (!peer) {
+            const key = descriptor.key
+            const presence = new SelectionPresence({
+              document: () => connection.doc,
+              label: () => latest.current.displayName,
+              fingerprint: () => descriptor.fingerprint || descriptor.owner,
+              send: payload => send(packet(3, payload), key, peer),
+              publish: selection => {
+                if (!current(connection)) return
+                setRemoteSelections(previous => {
+                  const old = previous.find(value => value.peerKey === key)
+                  if (sameRemoteSelection(old ?? null, selection)) return previous
+                  const others = previous.filter(value => value.peerKey !== key)
+                  return selection ? [...others, { ...selection, peerKey: key }] : others
+                })
+              },
+            })
+            peer = { descriptor, presence }
+            connection.peers.set(key, peer); added.push([key, peer]); changed = true
+          }
+          peer.presence.setActive(latest.current.activeId === room.descriptor.id && document.visibilityState !== 'hidden')
+          peer.presence.setConnected(descriptor.presenceSupported)
+        }
+        connection.connected = connection.peers.size > 0
+        if (changed) invalidateReceipt()
+        setView(previous => ({ ...previous, status, ...(connection.connected ? { error: undefined } : { peerReceived: false }) }))
+        // A new edge needs reconciliation even while the rest of the group
+        // remains connected. Existing peers are not needlessly restarted.
+        for (const [key, peer] of added) void send(packet(0, connection.doc?.getStateVector()), key, peer).catch(report)
+        if (changed) void updateReceipt().catch(report)
+      },
+      onError: report,
+      onMessage(message, peerKey) {
+        if (!current(connection)) return
+        if (!message.length) return Promise.reject(new Error('Invalid collaboration message.'))
+        const peer = connection.peers.get(peerKey)
+        if (!peer) return
+        if (message[0] === 3) {
+          // Presence has its own bounded coalescing; a slow durable note write
+          // must not block nine independent cursor updates.
+          peer.presence.receive(message.subarray(1))
+          return
+        }
+        // Every pair has an independent incoming queue. Serialize document
+        // writes across pairs so an older save cannot overwrite a newer merge.
+        // Start the first receive synchronously to preserve native selection.
+        const run = () => receiveDocument(message, peerKey, peer)
+        const receiving = connection.messageQueue ? connection.messageQueue.then(run) : run()
+        const settled = receiving.catch(() => undefined)
+        connection.messageQueue = settled
+        void settled.then(() => { if (connection.messageQueue === settled) connection.messageQueue = undefined })
+        return receiving
       },
     }, { identity: latest.current.identity })
     // Reconcile periodically as well as on open. This repairs startup event
@@ -226,6 +283,7 @@ export function useCollaboration(options: Options) {
 
   const sendDifference = useCallback((connection: LiveRoom, before: Uint8Array) => {
     if (!current(connection) || !connection.doc) return
+    connection.receiptRevision++
     setView(previous => ({ ...previous, peerReceived: false }))
     if (connection.connected) void connection.transport!.send(packet(1, connection.doc.getUpdate(before))).catch(error => {
       if (current(connection)) setView(previous => ({ ...previous, error: error.message }))
@@ -241,7 +299,7 @@ export function useCollaboration(options: Options) {
     try {
       const before = connection.doc.getStateVector(), previous = connection.doc.note.crdt!.update
       connection.doc.mergeLocal(note)
-      connection.presence?.refresh()
+      connection.peers.forEach(peer => peer.presence.refresh())
       if (previous !== connection.doc.note.crdt!.update) sendDifference(connection, before)
     } catch (error) {
       stop(); setView({ ...initial, error: error instanceof Error ? error.message : 'Collaboration could not resume.' })
@@ -251,7 +309,7 @@ export function useCollaboration(options: Options) {
   useEffect(() => {
     const updateActive = () => {
       const connection = live.current
-      if (connection && current(connection)) connection.presence?.setActive(latest.current.activeId === connection.room.descriptor.id && document.visibilityState !== 'hidden')
+      if (connection && current(connection)) connection.peers.forEach(peer => peer.presence.setActive(latest.current.activeId === connection.room.descriptor.id && document.visibilityState !== 'hidden'))
     }
     updateActive()
     document.addEventListener('visibilitychange', updateActive)
@@ -376,7 +434,7 @@ export function useCollaboration(options: Options) {
         restoreSelection?.()
       } finally { rendered.destroy() }
     } else next = connection.doc.edit(patch, author)
-    connection.presence?.refresh()
+    connection.peers.forEach(peer => peer.presence.refresh())
     if (previous !== next.crdt!.update) sendDifference(connection, before)
     return next
   }
@@ -397,7 +455,7 @@ export function useCollaboration(options: Options) {
     if (connected) {
       const before = connected.doc!.getStateVector()
       connected.doc!.mergeLocal(next)
-      connected.presence?.refresh()
+      connected.peers.forEach(peer => peer.presence.refresh())
       sendDifference(connected, before)
     }
     return next
@@ -416,7 +474,7 @@ export function useCollaboration(options: Options) {
   const updateSelection = useCallback((noteId: string, selection: EditorSelection | null) => {
     const connection = live.current
     if (!connection || !current(connection) || connection.room.descriptor.id !== noteId || latest.current.activeId !== noteId) return
-    connection.presence?.update(selection)
+    connection.peers.forEach(peer => peer.presence.update(selection))
   }, [current])
   function dismissInvitation() {
     invitationEpoch.current++
@@ -424,6 +482,6 @@ export function useCollaboration(options: Options) {
     invitationRef.current = null; setInvitation(null)
     if (pending) clearPendingInvitation(pending)
   }
-  return { view, invitation, start, join, edit, checkpoint, restoreVersion, stop, updateSelection, remoteSelection,
+  return { view, invitation, start, join, edit, checkpoint, restoreVersion, stop, updateSelection, remoteSelections,
     dismissInvitation, reconnect }
 }

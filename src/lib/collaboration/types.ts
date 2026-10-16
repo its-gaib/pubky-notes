@@ -20,6 +20,7 @@ export interface StoredRoom extends Invitation {
   approvedPeerIdentity?: string
   /** Verified account identity of the invitation's pinned host browser. */
   hostIdentity?: string
+  membership?: import('./membership').SignedMembership
 }
 
 export type ConnectionState = 'connecting' | 'waiting' | 'connected' | 'disconnected' | 'error'
@@ -27,9 +28,11 @@ export interface CollaborationStatus {
   state: ConnectionState
   relayAvailable: boolean
   /** A failed connection attempt remains visible through automatic retries. */
-  issue?: 'webrtc-unavailable' | 'identity-unavailable' | 'identity-verification-failed' | 'handshake-failed' | 'direct-connection-failed' | 'connection-failed'
+  issue?: 'webrtc-unavailable' | 'identity-unavailable' | 'identity-verification-failed' | 'handshake-failed' | 'direct-connection-failed' | 'connection-failed' | 'room-full' | 'account-already-joined'
   peerFingerprint?: string
   peerIdentity?: string
+  /** Remote session whose account proof was verified for this connection. */
+  peerSession?: string
   /** Negotiated through authenticated SDP; absent for older app versions. */
   presenceSupported?: boolean
 }
@@ -48,7 +51,47 @@ export interface CollaborationOptions {
   iceTransportPolicy?: RTCIceTransportPolicy
   /** Override only in tests or when an application provides its own TURN config. */
   iceEndpoint?: string | null
+  /** Internal mesh edge: admission follows direct verification of the fixed peer. */
+  pair?: { key: string; owner?: string; authorize(owner: string): Promise<void> }
+  /** Shared temporary credentials prevent one TURN API request per mesh edge. */
+  getIceConfiguration?: () => Promise<CollaborationIceConfiguration>
 }
+
+export interface CollaborationIceConfiguration {
+  iceServers: RTCIceServer[]
+  relayAvailable: boolean
+  expiresAt: number
+}
+
+export interface CollaborationPeer {
+  key: string
+  owner: string
+  session: string
+  fingerprint?: string
+  presenceSupported: boolean
+}
+
+export interface GroupCollaborationStatus extends CollaborationStatus {
+  peers: CollaborationPeer[]
+  participantCount: number
+  maxParticipants: 10
+  creatorOnline: boolean
+}
+
+export interface GroupCollaborationCallbacks {
+  onStatus(status: GroupCollaborationStatus): void
+  onMessage(message: Uint8Array, peerKey: string): void | Promise<void>
+  onError(error: Error): void
+}
+
+export interface GroupCollaborationTransport {
+  send(message: Uint8Array, peerKey?: string): Promise<void>
+  reconnect(): void
+  dispose(): void
+}
+
+export type GroupCallbacks = GroupCollaborationCallbacks
+export type GroupTransport = GroupCollaborationTransport
 
 export interface CollaborationIdentity {
   owner: string
