@@ -64,6 +64,44 @@ describe('Mermaid previews', () => {
     expect(screen.getAllByText(/Additional diagrams are shown as source/)).toHaveLength(2)
   })
 
+  it.each([
+    ['unchanged Markdown during background sync', 'Before the diagram', 'After the diagram'],
+    ['surrounding prose changes', 'Updated introduction', 'Updated conclusion'],
+  ])('keeps the completed diagram visible across %s', (_, introduction, conclusion) => {
+    const content = (before: string, after: string) => `${before}\n\n\x60\x60\x60mermaid\nflowchart LR\n A --> B\n\x60\x60\x60\n\n${after}`
+    const view = render(<Markdown content={content('Before the diagram', 'After the diagram')} />)
+    finish(job())
+    const display = screen.getByTitle('Mermaid diagram') as HTMLIFrameElement
+    const renderedDocument = display.srcdoc
+
+    view.rerender(<Markdown content={content(introduction, conclusion)} />)
+
+    expect(screen.queryByTitle('Mermaid diagram')).toBe(display)
+    expect(display.isConnected).toBe(true)
+    expect(display.srcdoc).toBe(renderedDocument)
+    expect(screen.queryByTitle('Rendering Mermaid diagram')).toBeNull()
+    expect(screen.getByText(introduction)).toBeTruthy()
+    expect(screen.getByText(conclusion)).toBeTruthy()
+  })
+
+  it('renders fresh output when the Mermaid fence changes and ignores the previous job', () => {
+    const content = (target: string) => `\x60\x60\x60mermaid\nflowchart LR\n A --> ${target}\n\x60\x60\x60`
+    const view = render(<Markdown content={content('B')} />)
+    const previous = job()
+    finish(previous)
+
+    view.rerender(<Markdown content={content('C')} />)
+    const current = job()
+    expect(current.token).not.toBe(previous.token)
+    finish(previous)
+    expect(screen.queryByTitle('Mermaid diagram')).toBeNull()
+
+    const updatedSvg = svg.replace('Start', 'Updated diagram')
+    finish(current, { svg: updatedSvg })
+    expect((screen.getByTitle('Mermaid diagram') as HTMLIFrameElement).srcdoc).toContain(updatedSvg)
+    expect(screen.queryByTitle('Rendering Mermaid diagram')).toBeNull()
+  })
+
   it('ignores output before the handshake and from a previous source or unmounted preview', () => {
     const view = render(<MermaidDiagram source="flowchart LR\n A --> B" />)
     const previous = job()

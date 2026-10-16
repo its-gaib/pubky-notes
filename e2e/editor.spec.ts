@@ -42,7 +42,7 @@ test('table picker preserves the insertion point and supports custom dimensions 
   await expect(page.getByRole('table').getByRole('columnheader')).toHaveCount(12)
 })
 
-test('Mermaid renders in Preview under production CSP and preserves source on syntax errors', async ({ page }) => {
+test('Mermaid preview stays mounted across unrelated updates under production CSP and preserves source on syntax errors', async ({ page }) => {
   const configuration = JSON.parse(readFileSync(new URL('../vercel.json', import.meta.url), 'utf8'))
   const policy = configuration.headers.flatMap((entry: { headers: { key: string; value: string }[] }) => entry.headers)
     .find((header: { key: string }) => header.key.toLowerCase() === 'content-security-policy').value
@@ -71,6 +71,26 @@ test('Mermaid renders in Preview under production CSP and preserves source on sy
   await expect(page.locator('iframe[title="Rendering Mermaid diagram"]')).toHaveCount(0)
   await page.getByText('Diagram source', { exact: true }).click()
   await expect(page.locator('.mermaid-source code')).toContainText('Idea --> Draft --> Publish')
+  const display = page.locator('iframe[title="Mermaid diagram"]')
+  const originalFrame = await display.elementHandle()
+  expect(originalFrame).not.toBeNull()
+  const expectPreviewPreserved = async () => {
+    expect(await display.evaluate((node, original) => node === original, originalFrame!)).toBe(true)
+    await expect(page.locator('iframe[title="Rendering Mermaid diagram"]')).toHaveCount(0)
+    await expect(diagram.locator('svg')).toBeVisible()
+    await expect(diagram.locator('svg')).toContainText('Publish')
+    await expect(page.locator('.mermaid-source code')).toBeVisible()
+  }
+  // Metadata and layout changes rerender App without changing the diagram.
+  // Remounting the Markdown renderer would discard both the iframe and the
+  // native <details> expansion state, just as periodic sync updates used to.
+  await page.getByRole('textbox', { name: 'Note title', exact: true }).fill('Diagram preview stability')
+  await expectPreviewPreserved()
+  await page.getByRole('button', { name: 'Collapse sidebar', exact: true }).click()
+  await expectPreviewPreserved()
+  await page.getByRole('button', { name: 'Expand sidebar', exact: true }).click()
+  await expectPreviewPreserved()
+  await originalFrame!.dispose()
   await page.screenshot({ path: test.info().outputPath('mermaid-preview.png') })
   await page.getByRole('button', { name: 'Write', exact: true }).click()
   await expect(editor).toHaveValue(source)
