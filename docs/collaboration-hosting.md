@@ -10,6 +10,8 @@ The first version requires overlapping online time to exchange edits. Each parti
 
 ## Current relay availability
 
+Cloudflare TURN was activated on `https://pubky-notes.vercel.app` on 2026-10-16. Production credential issuance and four live Chromium tests passed using disposable testnet accounts, public Pubky signaling, and direct ICE disabled. These covered relayed editing, accelerated credential renewal, and TURN over TLS on port 443. A 10.4-minute TLS session also verified renewal with the actual 600-second credential lifetime: both original connections closed, replacement relay allocations carried edits without repeated participant approval, and both private copies saved converged edits at least 15 seconds after both original credentials expired. Other deployments still need their own provider configuration and verification.
+
 The endpoint supports Cloudflare Realtime TURN and coturn, but neither is activated by deploying this code alone. With no server-side TURN configuration, `POST /api/collaboration-ice` returns STUN only and `relayAvailable: false`. Direct connections can work, but restrictive networks may fail to connect. Verify the deployed endpoint and an actual relayed connection before describing a deployment as having a working relay fallback.
 
 The current [OpenRelay instructions](https://www.metered.ca/tools/openrelay/) require a free account for browser credentials. Their same page still documents a public static-auth endpoint; on 2026-10-14, our forced-relay Chromium check gathered no relay candidates from it, and TCP connections to ports 80 and 443 timed out from this development machine. This does not establish global service availability, but it does not justify configuring it as a working fallback. The identical browser check succeeded through the local coturn fixture, selecting a relay-to-relay candidate pair and delivering a synthetic message.
@@ -65,7 +67,7 @@ This option runs credential issuance on Vercel while Cloudflare carries the rela
 
 Remove any `COLLABORATION_TURN_SECRET` and `COLLABORATION_TURN_URLS` values when selecting Cloudflare. Also remove both `UPSTASH_REDIS_REST_*` variables when selecting `vercel`; even an empty leftover Redis variable is rejected. Mixed or incomplete provider/limiter configurations fail closed. The provider selector must be explicit for Cloudflare. The endpoint requires Vercel's injected `VERCEL=1` marker for native firewall mode; do not set that marker manually on another host. The API cannot create or inspect the firewall rule, so configuring and verifying that rule is a deployment prerequisite.
 
-After the configured limiter and origin checks, the endpoint calls Cloudflare's fixed HTTPS credential API with a ten-minute TTL. It rejects redirects, times out after five seconds, bounds the response to 16 KiB, and accepts only the documented Cloudflare STUN/TURN addresses and transports on ports 3478, 443, 80, and 5349. It returns only validated temporary ICE credentials, with expiry measured conservatively from the request start. Provider errors and long-term secrets are not returned to browsers. Custom Cloudflare TURN domains are not supported by this adapter.
+After the configured limiter and origin checks, the endpoint calls Cloudflare's fixed HTTPS credential API with a ten-minute TTL. It rejects redirects, times out after five seconds, bounds the response to 16 KiB, and accepts only explicitly allowlisted Cloudflare STUN/TURN addresses and transports on ports 3478, 443, 80, and 5349. It returns only validated temporary ICE credentials, with expiry measured conservatively from the request start. Provider errors and long-term secrets are not returned to browsers. Custom Cloudflare TURN domains are not supported by this adapter.
 
 Redeploy after adding the variables, then verify the production endpoint returns `relayAvailable: true`. Finish activation by testing a real connection with `iceTransportPolicy: 'relay'` and confirming the selected candidate pair in `getStats()` uses a relay. A successful credential response alone does not prove traffic can traverse the relay.
 
@@ -157,6 +159,10 @@ COLLAB_E2E_ICE_ENDPOINT=https://pubky-notes.vercel.app/api/collaboration-ice \
 ```
 
 These tests force relay candidates and check actual editing and replacement allocations after credential renewal. The renewal test shortens only the first response's advertised expiry to exercise the real timer quickly; it does not test Cloudflare's server-side expiry policy. Managed-credential traces are disabled, and errors omit credential responses. The tests use disposable local accounts and synthetic notes even when Cloudflare carries the encrypted traffic.
+
+Set `COLLAB_E2E_ICE_TRANSPORT=tls` to restrict the browser to Cloudflare TURN over TLS on port 443 and verify `relayProtocol: tls` in the selected candidate stats. Set `COLLAB_E2E_SIGNAL_URL=https://httprelay.pubky.app/inbox/` to exercise the public signaling service as well.
+
+For a real credential-lifetime check, also set `COLLAB_E2E_LONG_TURN=1` and select `--grep 'original 600-second'`. This opt-in test leaves the provider's expiry unchanged, exchanges and saves edits throughout the session, checks that replacement relay allocations work before expiry, and continues at least 15 seconds beyond both original credential expiries. Allow approximately eleven minutes for this test; it is skipped in ordinary runs.
 
 The infrastructure regression suite runs with:
 
