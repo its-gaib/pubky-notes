@@ -169,8 +169,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   const [needsSync, setNeedsSync] = useState(false)
   const [busy, setBusy] = useState(false)
   const [toast, setToast] = useState<{ message: string; error?: boolean } | null>(null)
-  const [modal, setModal] = useState<'auth' | 'share' | 'delete' | 'help' | null>(null)
-  const [deleteIdentity, setDeleteIdentity] = useState<string | null>(null)
+  const [modal, setModal] = useState<'auth' | 'share' | 'help' | null>(null)
   const [collaborationOpen, setCollaborationOpen] = useState(false)
   const [historyIdentity, setHistoryIdentity] = useState<string | null>(null)
   const [authUrl, setAuthUrl] = useState('')
@@ -223,7 +222,6 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     ? canOpenRoute && !routeLoading ? records.find(row => row.note.id === route.id && row.note.id !== exampleId.current) : undefined
     : route.kind === 'home' ? records.find(row => row.note.id === activeId) ?? records.find(row => !row.note.deleted) : undefined
   const note = active?.note
-  const deleteTarget = deleteIdentity ? records.find(row => historyKey(scope, row.note) === deleteIdentity) : undefined
   const noteIdentity = note ? historyKey(scope, note) : null
   const historyOpen = !!noteIdentity && historyIdentity === noteIdentity
   const history = useMemo(() => {
@@ -661,17 +659,6 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   async function switchNote(id: string) {
     try { await flushLocal(); activeIdRef.current = id; setActiveId(id); setMenuOpen(false); if (id !== exampleId.current) navigateToNote(id); else navigateRoute('/'); await setLocalActiveId(scopeRef.current, id) } catch (error) { notice(errorMessage(error), true) }
   }
-  async function confirmDeleteNote(id: string) {
-    const capturedScope = scopeRef.current
-    const target = recordsRef.current.find(row => row.note.id === id)?.note
-    if (!target || target.deleted) return
-    const identity = historyKey(capturedScope, target)
-    await switchNote(id)
-    if (scopeRef.current === capturedScope && activeIdRef.current === id && recordsRef.current.some(row => historyKey(capturedScope, row.note) === identity && !row.note.deleted)) {
-      setDeleteIdentity(identity)
-      setModal('delete')
-    }
-  }
   function openFolder(path: string) {
     if (path && selectedFolder === path && !busyRef.current && !initializing) {
       manageFolder('rename', path)
@@ -988,19 +975,24 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
       } else notice(errorMessage(error), true)
     } finally { setBusy(false) }
   }
-  async function remove() {
+  async function remove(id: string) {
+    if (busyRef.current || initializing) return
     const capturedScope = scopeRef.current
-    if (!deleteIdentity || !recordsRef.current.some(row => historyKey(capturedScope, row.note) === deleteIdentity && !row.note.deleted)) return
-    setBusy(true)
+    const selected = recordsRef.current.find(row => row.note.id === id)?.note
+    if (!selected || selected.deleted) return
+    const identity = historyKey(capturedScope, selected)
+    busyRef.current = true; setBusy(true)
     try {
       await flushLocal()
       if (scopeRef.current !== capturedScope) return
-      const target = recordsRef.current.find(row => historyKey(capturedScope, row.note) === deleteIdentity && !row.note.deleted)
+      const target = recordsRef.current.find(row => historyKey(capturedScope, row.note) === identity && !row.note.deleted)
       if (!target) throw new Error('This note is no longer available.')
       await applyChangedNote(editNote(target.note, { deleted: true }), capturedScope)
-      activeIdRef.current = ''; setActiveId(''); setModal(null); navigateRoute('/', true)
+      if (scopeRef.current !== capturedScope) return
+      if (activeIdRef.current === id) { activeIdRef.current = ''; setActiveId(''); navigateRoute('/', true) }
       notice(target.published ? 'Moved to Trash. The public copy is removed when synchronization succeeds.' : 'Moved to Trash.')
-    } catch (error) { notice(errorMessage(error), true) } finally { setBusy(false) }
+    } catch (error) { if (scopeRef.current === capturedScope) notice(errorMessage(error), true) }
+    finally { if (scopeRef.current === capturedScope) { busyRef.current = false; setBusy(false) } }
   }
   async function restoreNote(id: string) {
     const target = recordsRef.current.find(row => row.note.id === id)?.note
@@ -1162,7 +1154,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
       <button className={`tree-note ${row.note.id === note?.id ? 'active' : ''}`} style={{ paddingLeft: 24 + Math.min(30, depth * 8) }} aria-label={`Open note ${title}`} title={title} disabled={locked} draggable={!locked && !row.note.deleted && row.note.id !== exampleId.current} onDragStart={event => startDrag(event, 'note', row.note.id)} onDragEnd={endDrag} onClick={() => void switchNote(row.note.id)}>
         <FileText size={15} /><span>{title}</span>{row.note.crdt?.version === 2 && <UsersRound size={13} aria-label="Collaborative note" />}<span className={`note-visibility ${row.published ? 'is-public' : ''}`} title={visibility} role="img" aria-label={visibility}>{row.published ? <Globe2 size={13} aria-hidden="true" /> : <LockKeyhole size={13} aria-hidden="true" />}</span>
       </button>
-      {row.note.id !== exampleId.current && <SidebarActions label={`Note actions for ${title}`} disabled={locked} items={row.note.deleted ? [{ label: 'Restore', action: () => void restoreNote(row.note.id) }] : [{ label: 'Move to…', action: () => openMove(row.note.id) }, { label: 'Move to Trash', action: () => void confirmDeleteNote(row.note.id) }]} />}
+      {row.note.id !== exampleId.current && <SidebarActions label={`Note actions for ${title}`} disabled={locked} items={row.note.deleted ? [{ label: 'Restore', action: () => void restoreNote(row.note.id) }] : [{ label: 'Move to…', action: () => openMove(row.note.id) }, { label: 'Move to Trash', action: () => void remove(row.note.id) }]} />}
       {moveControl('note', row.note.id)}
     </div>
   }
@@ -1223,7 +1215,6 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     {toast && <div className={`toast ${toast.error ? 'error' : ''}`} role={toast.error ? 'alert' : 'status'}><span>{toast.message}</span><button className="icon-button" onClick={() => setToast(null)} aria-label="Dismiss notification"><X size={15} /></button></div>}
     {modal === 'auth' && <Modal title="Connect Pubky" close={closeModal}><p className="modal-intro">Sign in with your existing identity in <strong>Pubky Ring</strong>. Your keys stay in your wallet.</p>{qr ? <img className="qr-code" src={qr} alt="Scan with Pubky Ring to authorize this notebook" width={240} height={240} /> : !authError ? <div className="auth-loading"><LoaderCircle className="spin" /><p>Preparing your connection…</p></div> : null}{authUrl && <><a className="button primary auth-link" href={authUrl}>Open Pubky Ring <ExternalLink size={15} /></a><button className="button secondary auth-link" onClick={() => void copy(authUrl)}><Copy size={15} /> Copy authorization link</button><p className="auth-instructions">Scan the code in Ring, or open the link on your phone. Approve access to this app’s private and public note folders.</p></>}{authError && <p className="inline-error" role="alert">{authError}</p>}{(authError || authUrl) && <button className="button ghost small" disabled={authStarting} onClick={() => void connect()}>Generate a fresh link</button>}<p className="hint">{IS_TESTNET ? 'Local testnet' : 'Mainnet'} · Need an identity? <a href="https://pubky.org" target="_blank" rel="noreferrer">Get Pubky Ring</a>. Your local drafts will join your saved notes and upload privately after login.</p></Modal>}
     {modal === 'share' && note && <Modal title="Share note" close={closeModal}>{!session ? <><p>Connect Pubky to save this note and publish a public copy. Local drafts are saved on this device and upload privately after login.</p><button className="button primary" onClick={() => void connect()}>Connect Pubky <ChevronRight size={15} /></button></> : <><div className="share-status"><span className={`visibility-badge ${active?.published ? 'public' : ''}`}>{active?.published ? <Globe2 size={14} /> : <LockKeyhole size={14} />}{active?.published ? 'Public copy published' : 'Only in your private notebook'}</span></div><p>Your draft stays under <code>/priv</code>. Publishing puts a copy under <code>/pub</code>, where anyone can read, discover, and download it.</p>{active?.published && <><label className="field-label" htmlFor="public-link">PUBLIC NOTE LINK</label><div className="copy-link"><input id="public-link" readOnly value={noteUrl(owner, note.id, 'pub')} onFocus={event => event.target.select()} /><button className="icon-button" onClick={() => void copy(noteUrl(owner, note.id, 'pub'))} aria-label="Copy public note link"><Copy size={17} /></button></div><p className="hint">{publicChanged ? 'Your private draft has changes that are not public yet.' : 'Your public copy is up to date.'}</p></>}<p className="hint">Unpublishing removes the public copy from your homeserver. Copies already downloaded may remain elsewhere.</p><div className="modal-actions">{active?.published && <button className="button secondary" disabled={busy} onClick={() => void sharing('unpublish')}>Unpublish</button>}<button className="button primary" disabled={busy || (!!active?.published && !publicChanged)} onClick={() => void sharing('publish')}>{busy ? <LoaderCircle className="spin" size={15} /> : <Globe2 size={15} />}{active?.published ? 'Update public copy' : 'Publish public copy'}</button></div></>}</Modal>}
-    {modal === 'delete' && deleteTarget && <Modal title="Move note to Trash?" close={closeModal}><p>“{deleteTarget.note.title || 'Untitled note'}” will move to Trash. Its private text and editing history remain recoverable{deleteTarget.published ? '; the public copy is removed after synchronization' : ''}.</p><div className="modal-actions"><button className="button secondary" onClick={closeModal}>Keep note</button><button className="button danger" disabled={busy} onClick={() => void remove()}><Trash2 size={15} />Move to Trash</button></div></Modal>}
     {modal === 'help' && <Modal title="Help" close={closeModal}><div className="help-item"><LockKeyhole size={20} /><div><h3>Privacy</h3><p>Notes autosave to your Pubky homeserver under <code>/priv/notes/</code>. This restricts access, but is not end-to-end encryption: your homeserver operator can read the data.</p></div></div><div className="help-item"><Globe2 size={20} /><div><h3>Sharing</h3><p>Publish a public snapshot using Share. Later edits stay private until you choose Update public copy.</p></div></div><div className="help-item"><Code2 size={20} /><div><h3>Editing</h3><p>Write Markdown, preview as you go, and import or export <code>.md</code> files. Press Ctrl/⌘ + S to save immediately. Remote images are shown as text to protect reader privacy.</p></div></div><p className="hint">Drafts save on this device, then merge with your homeserver when connected. Local drafts upload privately after login. Trash retains private text and editing history. Clear browser data only after your notes have synced; overlapping edits may need cleanup.</p><a href="https://pubky.org/developer-guide.md" target="_blank" rel="noreferrer" className="button secondary small">Pubky documentation <ExternalLink size={14} /></a></Modal>}
   </div>
 }
