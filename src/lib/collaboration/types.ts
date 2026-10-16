@@ -22,7 +22,7 @@ export interface StoredRoom extends Invitation {
   hostIdentity?: string
 }
 
-export type ConnectionState = 'connecting' | 'waiting' | 'approval' | 'connected' | 'disconnected' | 'error'
+export type ConnectionState = 'connecting' | 'waiting' | 'connected' | 'disconnected' | 'error'
 export interface CollaborationStatus {
   state: ConnectionState
   relayAvailable: boolean
@@ -34,15 +34,8 @@ export interface CollaborationStatus {
   presenceSupported?: boolean
 }
 
-export interface JoinRequest {
-  peerId: string
-  fingerprint: string
-  owner: string
-}
-
 export interface CollaborationCallbacks {
   onStatus(status: CollaborationStatus): void
-  onRequest(request: JoinRequest): void
   onMessage(message: Uint8Array): void | Promise<void>
   onError(error: Error): void
 }
@@ -64,8 +57,6 @@ export interface CollaborationIdentity {
 
 export interface CollaborationTransport {
   send(message: Uint8Array): Promise<void>
-  approve(peerId: string): Promise<void>
-  reject(peerId: string): void
   reconnect(): void
   dispose(): void
 }

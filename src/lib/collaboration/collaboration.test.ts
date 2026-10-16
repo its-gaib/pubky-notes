@@ -8,6 +8,7 @@ import { advertisePresence, supportsPresence } from './presence'
 import type { CollaborationCallbacks, CollaborationIdentity, Invitation, StoredRoom } from './types'
 import { createIdentityProof, IDENTITY_FAILED_MESSAGE, IDENTITY_UNAVAILABLE_MESSAGE, verifyIdentityProof } from './identity'
 import { testIdentity } from './identity.test-helpers'
+import { HttpRelaySocket } from './http-relay'
 
 const identities = new Map<string, CollaborationIdentity>()
 function proofIdentity(room: StoredRoom): CollaborationIdentity {
@@ -73,7 +74,7 @@ describe('collaboration credentials and invitation boundaries', () => {
     expect(() => decodeBytes('a'.repeat(256), 16)).toThrow()
   })
 
-  it('atomically admits only one guest even when two host tabs approve concurrently', async () => {
+  it('atomically admits only one guest even when two host tabs admit concurrently', async () => {
     const { host, guest } = await pair()
     const other = await createIdentity()
     const anotherTab = (await loadRoom(host.scope, host.descriptor.id))!
@@ -237,6 +238,7 @@ class FakeChannel extends EventTarget {
 
 class FakePeer {
   static instances: FakePeer[] = []
+  createdAt = Date.now()
   connectionState = 'new'
   signalingState = 'stable'
   localDescription?: RTCSessionDescriptionInit
@@ -255,6 +257,8 @@ class FakePeer {
   close() { this.connectionState = 'closed'; this.onconnectionstatechange?.() }
 }
 
+type TestSocket = Pick<FakeSocket, 'sent' | 'receive'>
+
 describe('transport admission and lifetime', () => {
   const active: ReturnType<typeof startCollaboration>[] = []
   afterEach(() => {
@@ -268,7 +272,7 @@ describe('transport admission and lifetime', () => {
     vi.stubGlobal('RTCPeerConnection', FakePeer)
     FakeSocket.instances = []
     FakePeer.instances = []
-    const callbacks: CollaborationCallbacks = { onStatus: vi.fn(), onRequest: vi.fn(), onMessage: vi.fn(), onError: vi.fn() }
+    const callbacks: CollaborationCallbacks = { onStatus: vi.fn(), onMessage: vi.fn(), onError: vi.fn() }
     const transport = startCollaboration(room, callbacks, { identity: proofIdentity(room), signalingUrl: 'ws://127.0.0.1:4444', ...(iceServers === null ? {} : { iceEndpoint: null, rtcConfiguration: { iceServers } }) })
     active.push(transport)
     return { transport, callbacks }
@@ -281,13 +285,13 @@ describe('transport admission and lifetime', () => {
     return ws
   }
 
-  async function published(ws: FakeSocket, recipient: StoredRoom) {
+  async function published(ws: TestSocket, recipient: StoredRoom) {
     const values = await Promise.all(ws.sent.map(packet => JSON.parse(packet)).filter(packet => packet.type === 'publish')
       .map(packet => openSignal(packet.data, recipient, new ReplayGuard())))
     return values.filter(value => value !== null)
   }
 
-  async function authenticateGuest(ws: FakeSocket, host: StoredRoom, guest: StoredRoom, hello = helloFields(host), identity = proofIdentity(guest)) {
+  async function authenticateGuest(ws: TestSocket, host: StoredRoom, guest: StoredRoom, hello = helloFields(host), identity = proofIdentity(guest)) {
     ws.receive(await sealSignal(guest, hello), host.room)
     let challenge: Awaited<ReturnType<typeof openSignal>>
     await vi.waitFor(async () => {
@@ -325,6 +329,56 @@ describe('transport admission and lifetime', () => {
     await vi.waitFor(() => expect(FakePeer.instances.at(-1)?.remoteDescription?.type).toBe('answer'))
   }
 
+  it.each(['reconnect', 'dispose'] as const)('processes the answer while HTTP ICE delivery waits, and cancels stale delivery on %s', async cancel => {
+    const { host, guest } = await pair()
+    vi.stubGlobal('WebSocket', FakeSocket)
+    vi.stubGlobal('RTCPeerConnection', FakePeer)
+    FakePeer.instances = []
+    vi.stubGlobal('fetch', vi.fn((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new Error('Aborted')), { once: true })
+    })))
+    let http!: HttpRelaySocket, releaseOffer!: () => void, rejectIce!: (error: Error) => void
+    const offerAck = new Promise<void>(resolve => { releaseOffer = resolve })
+    const iceAck = new Promise<void>((_resolve, reject) => { rejectIce = reject })
+    const sent: string[] = []
+    vi.spyOn(HttpRelaySocket.prototype, 'send').mockImplementation(function (this: HttpRelaySocket) { http = this })
+    vi.spyOn(HttpRelaySocket.prototype, 'publish').mockImplementation(async message => {
+      sent.push(message)
+      const signal = await openSignal(JSON.parse(message).data, guest, new ReplayGuard())
+      if (signal?.kind === 'offer') await offerAck
+      if (signal?.kind === 'ice') await iceAck
+    })
+    const setLocalDescription = FakePeer.prototype.setLocalDescription
+    vi.spyOn(FakePeer.prototype, 'setLocalDescription').mockImplementation(async function (this: FakePeer, description) {
+      await setLocalDescription.call(this, description)
+      for (let index = 0; index < 2; index++) this.onicecandidate?.({ candidate: { toJSON: () => ({ candidate: `candidate:${index}`, sdpMid: '0' }) } } as RTCPeerConnectionIceEvent)
+    })
+    const addIceCandidate = vi.spyOn(FakePeer.prototype, 'addIceCandidate')
+    const callbacks: CollaborationCallbacks = { onStatus: vi.fn(), onMessage: vi.fn(), onError: vi.fn() }
+    const transport = startCollaboration(host, callbacks, { identity: proofIdentity(host), signalingUrl: 'https://relay.example/inbox/', iceEndpoint: null, rtcConfiguration: { iceServers: [] } })
+    active.push(transport)
+    await vi.waitFor(() => expect(http).toBeDefined())
+    const ws: TestSocket = { sent, receive: (data, topic) => http.onmessage?.({ data: JSON.stringify({ type: 'publish', topic, data }) } as MessageEvent) }
+    await authenticateGuest(ws, host, guest)
+    await vi.waitFor(async () => expect((await published(ws, guest)).some(signal => signal.kind === 'offer')).toBe(true))
+    expect((await published(ws, guest)).filter(signal => signal.kind === 'ice')).toHaveLength(0)
+    releaseOffer()
+    await vi.waitFor(async () => expect((await published(ws, guest)).filter(signal => signal.kind === 'ice')).toHaveLength(1))
+    const offer = (await published(ws, guest)).find(signal => signal.kind === 'offer')!
+    ws.receive(await sealSignal(guest, { kind: 'answer', to: host.hostKey, session: offer.targetSession, targetSession: offer.session, payload: 'v=0\r\n' }), host.room)
+    const incoming = { candidate: 'candidate:remote', sdpMid: '0' }
+    ws.receive(await sealSignal(guest, { kind: 'ice', to: host.hostKey, session: offer.targetSession, targetSession: offer.session, payload: JSON.stringify(incoming) }), host.room)
+    await vi.waitFor(() => expect(FakePeer.instances[0].remoteDescription?.type).toBe('answer'))
+    await vi.waitFor(() => expect(addIceCandidate).toHaveBeenCalledWith(incoming))
+    transport[cancel]()
+    const statuses = vi.mocked(callbacks.onStatus).mock.calls.length
+    rejectIce(new Error('Obsolete ICE delivery failed'))
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect((await published(ws, guest)).filter(signal => signal.kind === 'ice')).toHaveLength(1)
+    expect(callbacks.onError).not.toHaveBeenCalled()
+    expect(callbacks.onStatus).toHaveBeenCalledTimes(statuses)
+  })
+
   function relayResponse(credential: string, expiresAt = Date.now() + 600_000) {
     return new Response(JSON.stringify({ iceServers: [{ urls: 'turn:relay.example:3478', username: 'test', credential }], relayAvailable: true, expiresAt }))
   }
@@ -357,7 +411,6 @@ describe('transport admission and lifetime', () => {
     await expect(transport.send(new Uint8Array([1]))).rejects.toThrow('not connected')
     await authenticateGuest(ws, host, guest)
     await vi.waitFor(() => expect(FakePeer.instances).toHaveLength(2))
-    expect(callbacks.onRequest).not.toHaveBeenCalled()
     const second = FakePeer.instances[1]
     expect(second.configuration.iceServers![0].credential).toBe('credential-2')
     second.channel!.open()
@@ -483,7 +536,7 @@ describe('transport admission and lifetime', () => {
     FakeSocket.instances = []
     FakePeer.instances = []
     vi.useFakeTimers()
-    const callbacks: CollaborationCallbacks = { onStatus: vi.fn(), onRequest: vi.fn(), onMessage: vi.fn(), onError: vi.fn() }
+    const callbacks: CollaborationCallbacks = { onStatus: vi.fn(), onMessage: vi.fn(), onError: vi.fn() }
     const transport = startCollaboration(host, callbacks, { identity: proofIdentity(host), signalingUrl: 'ws://127.0.0.1:4444' })
     active.push(transport)
     expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'error', issue: 'webrtc-unavailable' }))
@@ -514,7 +567,7 @@ describe('transport admission and lifetime', () => {
     vi.stubGlobal('RTCPeerConnection', FakePeer)
     FakeSocket.instances = []
     vi.useFakeTimers()
-    const callbacks: CollaborationCallbacks = { onStatus: vi.fn(), onRequest: vi.fn(), onMessage: vi.fn(), onError: vi.fn() }
+    const callbacks: CollaborationCallbacks = { onStatus: vi.fn(), onMessage: vi.fn(), onError: vi.fn() }
     const transport = startCollaboration(host, callbacks)
     active.push(transport)
     expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ issue: 'identity-unavailable' }))
@@ -527,23 +580,21 @@ describe('transport admission and lifetime', () => {
     expect(vi.getTimerCount()).toBe(0)
   })
 
-  it('requires proof before presenting a requester and refuses a proof copied from another browser key', async () => {
+  it('requires proof before automatically admitting a requester and refuses a proof copied from another browser key', async () => {
     const { host, guest } = await pair()
     const { callbacks, transport } = start(host)
     const ws = await socket(), hello = helloFields(host)
     ws.receive(await sealSignal(guest, hello), host.room)
     let challenge: Awaited<ReturnType<typeof openSignal>>
     await vi.waitFor(async () => { challenge = (await published(ws, guest)).find(signal => signal.kind === 'challenge') ?? null; expect(challenge).toBeTruthy() })
-    expect(callbacks.onRequest).not.toHaveBeenCalled()
     expect(FakePeer.instances).toHaveLength(0)
-    await expect(transport.approve(guest.identity.publicKey)).rejects.toThrow('no longer available')
+    await expect(transport.send(new Uint8Array([1]))).rejects.toThrow('not connected')
     const payload = JSON.parse(challenge!.payload)
     const { proof } = await createIdentityProof(proofIdentity(guest), { room: host.room, descriptor: host.descriptor, role: 'guest',
       publicKey: (await createIdentity()).publicKey, peerKey: host.hostKey, session: hello.session, peerSession: challenge!.session, challenge: payload.challenge })
     ws.receive(await sealSignal(guest, { kind: 'identity', to: host.hostKey, session: hello.session,
       targetSession: challenge!.session, payload: JSON.stringify({ proof }) }), host.room)
     await vi.waitFor(() => expect(callbacks.onError).toHaveBeenCalledWith(expect.objectContaining({ message: IDENTITY_FAILED_MESSAGE })))
-    expect(callbacks.onRequest).not.toHaveBeenCalled()
     expect(FakePeer.instances).toHaveLength(0)
     expect((await loadRoom(host.scope, host.descriptor.id))?.approvedPeer).toBeUndefined()
   })
@@ -556,7 +607,6 @@ describe('transport admission and lifetime', () => {
     await authenticateGuest(ws, host, guest, helloFields(host), testIdentity())
     await vi.waitFor(() => expect(callbacks.onError).toHaveBeenCalledWith(expect.objectContaining({ message: IDENTITY_FAILED_MESSAGE })))
     expect(FakePeer.instances).toHaveLength(0)
-    expect(callbacks.onRequest).not.toHaveBeenCalled()
     expect((await loadRoom(host.scope, host.descriptor.id))?.approvedPeerIdentity).toBe(proofIdentity(guest).owner)
   })
 
@@ -578,7 +628,6 @@ describe('transport admission and lifetime', () => {
     ws.receive(await sealSignal(guest, { kind: 'identity', to: host.hostKey, session: hello.session,
       targetSession: second!.session, payload: JSON.stringify({ proof }) }), host.room)
     await vi.waitFor(() => expect(callbacks.onError).toHaveBeenCalledWith(expect.objectContaining({ message: IDENTITY_FAILED_MESSAGE })))
-    expect(callbacks.onRequest).not.toHaveBeenCalled()
     expect(FakePeer.instances).toHaveLength(0)
   })
 
@@ -626,10 +675,9 @@ describe('transport admission and lifetime', () => {
     const { host, guest } = await pair()
     const { transport, callbacks } = start(host)
     const ws = await socket()
-    await authenticateGuest(ws, host, guest)
-    await vi.waitFor(() => expect(callbacks.onRequest).toHaveBeenCalledOnce())
     vi.stubGlobal('RTCPeerConnection', class { constructor() { throw new DOMException('Blocked', 'NotSupportedError') } })
-    await expect(transport.approve(guest.identity.publicKey)).rejects.toThrow(WEBRTC_UNAVAILABLE_MESSAGE)
+    await authenticateGuest(ws, host, guest)
+    await vi.waitFor(() => expect(callbacks.onError).toHaveBeenCalledWith(expect.objectContaining({ message: WEBRTC_UNAVAILABLE_MESSAGE })))
     expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'error', issue: 'webrtc-unavailable' }))
     expect(ws.readyState).toBe(FakeSocket.CLOSED)
     expect(FakePeer.instances).toHaveLength(0)
@@ -639,18 +687,18 @@ describe('transport admission and lifetime', () => {
     expect(vi.mocked(callbacks.onStatus).mock.lastCall![0]).not.toHaveProperty('issue')
   })
 
-  it('creates no peer or data channel before explicit admission, then persists the approved key', async () => {
+  it('automatically admits a verified link holder and persists both browser key and Pubky identity before opening a peer', async () => {
     const { host, guest } = await pair()
     const { transport, callbacks } = start(host)
     const ws = await socket()
-    await authenticateGuest(ws, host, guest)
-    await vi.waitFor(() => expect(callbacks.onRequest).toHaveBeenCalledOnce())
     expect(FakePeer.instances).toHaveLength(0)
     await expect(transport.send(new Uint8Array([1]))).rejects.toThrow('not connected')
-    expect((await published(ws, guest)).map(signal => signal.kind)).toEqual(['challenge'])
-    await transport.approve(guest.identity.publicKey)
-    expect((await loadRoom(host.scope, host.descriptor.id))?.approvedPeer).toBe(guest.identity.publicKey)
-    expect(FakePeer.instances).toHaveLength(1)
+    await authenticateGuest(ws, host, guest)
+    await vi.waitFor(() => expect(FakePeer.instances).toHaveLength(1))
+    const admitted = await loadRoom(host.scope, host.descriptor.id)
+    expect(admitted?.approvedPeer).toBe(guest.identity.publicKey)
+    expect(admitted?.approvedPeerIdentity).toBe(proofIdentity(guest).owner)
+    await vi.waitFor(async () => expect((await published(ws, guest)).map(signal => signal.kind)).toEqual(['challenge', 'offer']))
     FakePeer.instances[0].channel!.open()
     expect(callbacks.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'connected', relayAvailable: false }))
     await transport.send(new Uint8Array([1, 2, 3]))
@@ -665,7 +713,6 @@ describe('transport admission and lifetime', () => {
     const ws = await socket()
     ws.receive(await sealSignal(outsider, helloFields(host)), host.room)
     await vi.waitFor(() => expect(ws.sent.some(packet => JSON.parse(packet).type === 'publish')).toBe(true))
-    expect(callbacks.onRequest).not.toHaveBeenCalled()
     expect(FakePeer.instances).toHaveLength(0)
     const reply = JSON.parse(ws.sent.find(packet => JSON.parse(packet).type === 'publish')!).data
     expect(await openSignal(reply, outsider, new ReplayGuard())).toMatchObject({ kind: 'reject' })
@@ -675,10 +722,9 @@ describe('transport admission and lifetime', () => {
     const { host, guest } = await pair()
     const { transport, callbacks } = start(host, relay ? [{ urls: 'turn:relay.example:3478', username: 'test', credential: 'test' }] : [])
     const ws = await socket()
-    await authenticateGuest(ws, host, guest)
-    await vi.waitFor(() => expect(callbacks.onRequest).toHaveBeenCalledOnce())
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-    await transport.approve(guest.identity.publicKey)
+    await authenticateGuest(ws, host, guest)
+    await vi.waitFor(async () => expect((await published(ws, guest)).some(signal => signal.kind === 'offer')).toBe(true))
     await answerOffer(ws, host, guest)
     const first = FakePeer.instances[0]
     first.connectionState = 'failed'
@@ -702,11 +748,10 @@ describe('transport admission and lifetime', () => {
     const { host, guest } = await pair()
     const { transport, callbacks } = start(host)
     const ws = await socket()
-    await authenticateGuest(ws, host, guest)
-    await vi.waitFor(() => expect(callbacks.onRequest).toHaveBeenCalledOnce())
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
-    await transport.approve(guest.identity.publicKey)
-    const startedAt = Date.now()
+    await authenticateGuest(ws, host, guest)
+    await vi.waitFor(async () => expect((await published(ws, guest)).some(signal => signal.kind === 'offer')).toBe(true))
+    const startedAt = FakePeer.instances[0].createdAt
     if (answered) await answerOffer(ws, host, guest)
     const remaining = 25_000 - (Date.now() - startedAt)
     await vi.advanceTimersByTimeAsync(remaining - 1)
@@ -726,7 +771,6 @@ describe('transport admission and lifetime', () => {
     const ws = await socket()
     await authenticateGuest(ws, host, guest)
     await vi.waitFor(() => expect(FakePeer.instances).toHaveLength(1))
-    expect(callbacks.onRequest).not.toHaveBeenCalled()
   })
 
   it.each([false, true])('negotiates host presence only from the signed guest answer (supported=%s)', async supported => {
@@ -789,7 +833,6 @@ describe('transport admission and lifetime', () => {
     ws.receive(await sealSignal(guest, helloFields(host)), host.room)
     transport.dispose()
     await new Promise(resolve => setTimeout(resolve, 20))
-    expect(callbacks.onRequest).not.toHaveBeenCalled()
     expect(FakePeer.instances).toHaveLength(0)
   })
 
@@ -811,7 +854,6 @@ describe('transport admission and lifetime', () => {
     await createProof.mock.results[0].value
     await new Promise(resolve => setTimeout(resolve, 20))
     expect((await published(ws, guest))).toHaveLength(0)
-    expect(callbacks.onRequest).not.toHaveBeenCalled()
     expect(FakePeer.instances).toHaveLength(0)
   })
 

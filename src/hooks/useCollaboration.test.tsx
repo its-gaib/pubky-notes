@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 import { webcrypto } from 'node:crypto'
+import { StrictMode } from 'react'
 import { act, cleanup, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useCollaboration } from './useCollaboration'
 import { initializeNote, listNoteVersions, readNoteVersion, readNoteVersionChanges } from '../lib/crdt'
-import { createSharedNote, joinSharedNote, SharedNoteDocument } from '../lib/shared-note'
+import { createSharedNote, joinSharedNote, SharedNoteDocument, sharedNoteDescriptor } from '../lib/shared-note'
 import type { CollaborationCallbacks, StoredRoom } from '../lib/collaboration'
 import type { Invitation } from '../lib/collaboration'
 import { encodeBytes, invitationUrl as actualInvitationUrl, parseInvitation as actualParseInvitation } from '../lib/collaboration/credentials'
@@ -34,7 +35,7 @@ beforeEach(() => {
   mocks.reconnect.mockReset()
   mocks.start.mockReset().mockImplementation((_room: StoredRoom, next: CollaborationCallbacks) => {
     callbacks = next
-    return { send: mocks.send, dispose: mocks.dispose, approve: vi.fn(), reject: vi.fn(), reconnect: mocks.reconnect }
+    return { send: mocks.send, dispose: mocks.dispose, reconnect: mocks.reconnect }
   })
 })
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
@@ -48,30 +49,103 @@ function openInvitation(invite: Invitation) {
   window.history.replaceState(null, '', actualInvitationUrl(invite, window.location.origin))
 }
 
+function guestRoom(invite: Invitation, scope = 'mainnet:alice'): StoredRoom {
+  return { ...invite, scope, role: 'guest', identity: { publicKey: 'key' } } as StoredRoom
+}
+function invitedDocument() {
+  const shared = createSharedNote(initializeNote({ id: 'source', title: 'Shared', content: 'Current text', createdAt: '2026-10-15T00:00:00.000Z', updatedAt: '2026-10-15T00:00:00.000Z' }))
+  return { shared, invite: { ...pendingInvite(), descriptor: sharedNoteDescriptor(shared) }, document: new SharedNoteDocument(shared) }
+}
+
 describe('pending collaboration invitations', () => {
-  it('survives login scope changes and reload, and joins only after an explicit click', async () => {
-    const invite = pendingInvite()
+  it('survives signed-out reload and automatically joins only after identity and the notebook are ready', async () => {
+    const { invite, document } = invitedDocument()
     openInvitation(invite)
-    const options = { identity, scope: 'mainnet:guest', enabled: false, notes: [] as CrdtNote[], persist: vi.fn(async () => {}), beforeRemoteChange: () => undefined }
+    const options = { identity: undefined as typeof identity | undefined, scope: 'mainnet:guest', enabled: false, notes: [] as CrdtNote[], persist: vi.fn(async () => {}), beforeRemoteChange: () => undefined }
     const guest = renderHook(value => useCollaboration(value), { initialProps: options })
     expect(guest.result.current.invitation).toEqual(invite)
     expect(window.location.hash).toBe('')
     expect(readPendingInvitation()).toEqual(invite)
-    guest.rerender({ ...options, scope: 'mainnet:alice', enabled: true })
-    expect(guest.result.current.invitation).toEqual(invite)
-    expect(mocks.start).not.toHaveBeenCalled()
     guest.unmount()
-    const signedIn = renderHook(() => useCollaboration({ ...options, scope: 'mainnet:alice', enabled: true }))
-    expect(signedIn.result.current.invitation).toEqual(invite)
+    const signedIn = renderHook(value => useCollaboration(value), { initialProps: options })
+    signedIn.rerender({ ...options, identity, scope: 'mainnet:alice' })
+    await act(async () => {})
     expect(mocks.start).not.toHaveBeenCalled()
-    const room = { ...invite, scope: 'mainnet:alice', role: 'guest', identity: { publicKey: 'key' } } as StoredRoom
+    expect(mocks.guest).not.toHaveBeenCalled()
+    const room = guestRoom(invite)
     mocks.guest.mockResolvedValue(room)
-    await act(async () => { await signedIn.result.current.join() })
-    expect(mocks.guest).toHaveBeenCalledWith('mainnet:alice', invite)
-    expect(mocks.start).toHaveBeenCalledWith(room, expect.any(Object), { identity })
+    signedIn.rerender({ ...options, identity, scope: 'mainnet:alice', enabled: true })
+    await act(async () => {})
+    expect(mocks.guest).toHaveBeenCalledExactlyOnceWith('mainnet:alice', invite)
+    expect(mocks.start).toHaveBeenCalledExactlyOnceWith(room, expect.any(Object), { identity })
+    // The link remains recoverable until the actual shared text is persisted.
+    expect(readPendingInvitation()).toEqual(invite)
+    await act(async () => { await callbacks.onMessage(new Uint8Array([1, ...document.getUpdate()])) })
+    expect(options.persist).toHaveBeenCalledWith(expect.objectContaining({ content: 'Current text' }), 'mainnet:alice', true)
     expect(signedIn.result.current.invitation).toBeNull()
     expect(sessionStorage.getItem(PENDING_INVITATION_KEY)).toBeNull()
-    expect(window.location.hash).toBe('')
+    document.destroy()
+  })
+
+  it('deduplicates renders and explicit retries while the same automatic join is pending', async () => {
+    const invite = pendingInvite()
+    openInvitation(invite)
+    let finish!: (room: StoredRoom) => void
+    mocks.guest.mockImplementation(() => new Promise<StoredRoom>(resolve => { finish = resolve }))
+    const options = { identity, scope: 'mainnet:alice', enabled: true, notes: [] as CrdtNote[], persist: vi.fn(async () => {}), beforeRemoteChange: () => undefined }
+    const hook = renderHook(value => useCollaboration(value), { initialProps: options })
+    await act(async () => {})
+    hook.rerender({ ...options, notes: [] })
+    let retry!: Promise<void>
+    await act(async () => { retry = hook.result.current.join(); await Promise.resolve() })
+    expect(mocks.guest).toHaveBeenCalledOnce()
+    await act(async () => { finish(guestRoom(invite)); await retry })
+    expect(mocks.start).toHaveBeenCalledOnce()
+  })
+
+  it('automatically joins once after Strict Mode remounts the account effects', async () => {
+    const invite = pendingInvite()
+    openInvitation(invite)
+    mocks.guest.mockResolvedValue(guestRoom(invite))
+    renderHook(() => useCollaboration({ identity, scope: 'mainnet:alice', enabled: true, notes: [], persist: vi.fn(async () => {}), beforeRemoteChange: () => undefined }), { wrapper: StrictMode })
+    await act(async () => {})
+    expect(mocks.guest).toHaveBeenCalledOnce()
+    expect(mocks.start).toHaveBeenCalledOnce()
+  })
+
+  it('retains a failed automatic join without an effect retry loop and permits an explicit retry', async () => {
+    const invite = pendingInvite()
+    openInvitation(invite)
+    mocks.guest.mockRejectedValueOnce(new Error('Storage unavailable')).mockResolvedValue(guestRoom(invite))
+    const options = { identity, scope: 'mainnet:alice', enabled: true, notes: [] as CrdtNote[], persist: vi.fn(async () => {}), beforeRemoteChange: () => undefined }
+    const hook = renderHook(value => useCollaboration(value), { initialProps: options })
+    await act(async () => {})
+    hook.rerender({ ...options, notes: [] })
+    await act(async () => {})
+    expect(mocks.guest).toHaveBeenCalledOnce()
+    expect(hook.result.current.view.error).toBe('Storage unavailable')
+    expect(readPendingInvitation()).toEqual(invite)
+    await act(async () => { await hook.result.current.join() })
+    expect(mocks.guest).toHaveBeenCalledTimes(2)
+    expect(mocks.start).toHaveBeenCalledOnce()
+  })
+
+  it('keeps failed persistence recoverable and clears the invitation after an existing copy syncs durably', async () => {
+    const { shared, invite, document } = invitedDocument()
+    openInvitation(invite)
+    mocks.load.mockResolvedValue(guestRoom(invite))
+    const persist = vi.fn().mockRejectedValueOnce(new Error('Storage unavailable')).mockResolvedValue(undefined)
+    const hook = renderHook(() => useCollaboration({ identity, scope: 'mainnet:alice', enabled: true, notes: [shared], persist, beforeRemoteChange: () => undefined }))
+    await act(async () => {})
+    const update = new Uint8Array([1, ...document.getUpdate()])
+    await act(async () => { await expect(callbacks.onMessage(update)).rejects.toThrow('Storage unavailable') })
+    expect(readPendingInvitation()).toEqual(invite)
+    await act(async () => { await callbacks.onMessage(update) })
+    expect(persist).toHaveBeenCalledTimes(2)
+    expect(hook.result.current.invitation).toBeNull()
+    expect(readPendingInvitation()).toBeNull()
+    expect(mocks.guest).not.toHaveBeenCalled()
+    document.destroy()
   })
 
   it('does not re-open a dismissed invitation after reload', () => {
@@ -87,38 +161,40 @@ describe('pending collaboration invitations', () => {
     expect(mocks.start).not.toHaveBeenCalled()
   })
 
-  it('cancels an in-flight join on account change without consuming the invitation', async () => {
+  it('cancels an in-flight automatic join on logout without consuming the invitation', async () => {
     const invite = pendingInvite()
     openInvitation(invite)
     let finish!: (room: StoredRoom) => void
     mocks.guest.mockImplementation(() => new Promise<StoredRoom>(resolve => { finish = resolve }))
     const options = { identity, scope: 'mainnet:alice', enabled: true, notes: [] as CrdtNote[], persist: vi.fn(async () => {}), beforeRemoteChange: () => undefined }
     const hook = renderHook(value => useCollaboration(value), { initialProps: options })
-    let joining!: Promise<void>
-    await act(async () => { joining = hook.result.current.join(); await Promise.resolve() })
-    hook.rerender({ ...options, scope: 'mainnet:bob' })
-    await act(async () => { finish({ ...invite, scope: 'mainnet:alice', role: 'guest', identity: { publicKey: 'key' } } as StoredRoom); await joining })
+    await act(async () => {})
+    hook.rerender({ ...options, scope: 'mainnet:guest', enabled: false })
+    await act(async () => { finish(guestRoom(invite)); await Promise.resolve() })
     expect(mocks.start).not.toHaveBeenCalled()
     expect(hook.result.current.invitation).toEqual(invite)
     expect(readPendingInvitation()).toEqual(invite)
   })
 
-  it('does not consume a replacement invitation when an older join finishes', async () => {
+  it('does not consume a replacement invitation when an older automatic join finishes', async () => {
     const first = pendingInvite(1), next = pendingInvite(2)
     openInvitation(first)
-    let finish!: (room: StoredRoom) => void
-    mocks.guest.mockImplementation(() => new Promise<StoredRoom>(resolve => { finish = resolve }))
+    let finishFirst!: (room: StoredRoom) => void, finishNext!: (room: StoredRoom) => void
+    mocks.guest.mockImplementationOnce(() => new Promise<StoredRoom>(resolve => { finishFirst = resolve }))
+      .mockImplementationOnce(() => new Promise<StoredRoom>(resolve => { finishNext = resolve }))
     const hook = renderHook(() => useCollaboration({ identity, scope: 'mainnet:alice', enabled: true, notes: [], persist: vi.fn(async () => {}), beforeRemoteChange: () => undefined }))
-    let joining!: Promise<void>
-    await act(async () => { joining = hook.result.current.join(); await Promise.resolve() })
+    await act(async () => {})
     act(() => { openInvitation(next); window.dispatchEvent(new HashChangeEvent('hashchange')) })
-    await act(async () => { finish({ ...first, scope: 'mainnet:alice', role: 'guest', identity: { publicKey: 'key' } } as StoredRoom); await joining })
+    await act(async () => {})
+    await act(async () => { finishFirst(guestRoom(first)); await Promise.resolve() })
     expect(mocks.start).not.toHaveBeenCalled()
     expect(hook.result.current.invitation).toEqual(next)
     expect(readPendingInvitation()).toEqual(next)
+    await act(async () => { finishNext(guestRoom(next)); await Promise.resolve() })
+    expect(mocks.start).toHaveBeenCalledExactlyOnceWith(guestRoom(next), expect.any(Object), { identity })
   })
 
-  it('clears invalid links and does not join a conflicting local note', async () => {
+  it('clears invalid links and does not automatically join a conflicting local note', async () => {
     savePendingInvitation(pendingInvite())
     mocks.parse.mockImplementation(actualParseInvitation)
     window.history.replaceState(null, '', '/#collaborate=invalid')
@@ -133,7 +209,8 @@ describe('pending collaboration invitations', () => {
     openInvitation(invite)
     const conflicting = initializeNote({ id: invite.descriptor.id, title: 'Private', content: 'Unrelated', createdAt: invite.descriptor.createdAt, updatedAt: invite.descriptor.createdAt })
     const hook = renderHook(() => useCollaboration({ ...options, notes: [conflicting] }))
-    await expect(hook.result.current.join()).rejects.toThrow('conflicts with another note')
+    await act(async () => {})
+    expect(hook.result.current.view.error).toContain('conflicts with another note')
     expect(mocks.guest).not.toHaveBeenCalled()
     expect(mocks.start).not.toHaveBeenCalled()
     expect(readPendingInvitation()).toEqual(invite)
@@ -177,7 +254,8 @@ describe('collaboration cursor hook', () => {
   it('retains an invitation when the session cannot prove its identity', async () => {
     openInvitation(pendingInvite())
     const { result } = renderHook(() => useCollaboration({ scope: 'alice', enabled: true, notes: [], persist: vi.fn(), beforeRemoteChange: () => undefined }))
-    await expect(result.current.join()).rejects.toThrow('Sign in again with Pubky')
+    expect(result.current.view.error).toContain('Sign in again with Pubky')
+    await act(async () => { await expect(result.current.join()).rejects.toThrow('Sign in again with Pubky') })
     expect(result.current.invitation).not.toBeNull()
     expect(readPendingInvitation()).not.toBeNull()
     expect(mocks.guest).not.toHaveBeenCalled()

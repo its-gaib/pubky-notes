@@ -5,7 +5,7 @@ import { createSharedNote, joinSharedNote, SharedNoteDocument, sharedNoteDescrip
 import {
   createGuestRoom, createHostRoom, fingerprint, invitationUrl, loadRoom, parseInvitation, startCollaboration, webRtcAvailable, WEBRTC_UNAVAILABLE_MESSAGE, IDENTITY_UNAVAILABLE_MESSAGE,
 } from '../lib/collaboration'
-import type { CollaborationOptions, CollaborationStatus, CollaborationTransport, Invitation, JoinRequest, StoredRoom } from '../lib/collaboration'
+import type { CollaborationOptions, CollaborationStatus, CollaborationTransport, Invitation, StoredRoom } from '../lib/collaboration'
 import { SelectionPresence } from '../lib/collaboration/presence'
 import type { EditorSelection, RemoteSelection } from '../lib/collaboration/presence'
 import { clearPendingInvitation, readPendingInvitation, savePendingInvitation } from '../lib/collaboration/pending-invitation'
@@ -36,7 +36,6 @@ export interface CollaborationView {
   noteId?: string
   role?: 'host' | 'guest'
   status?: CollaborationStatus
-  request?: JoinRequest
   link?: string
   error?: string
   ownFingerprint?: string
@@ -71,6 +70,8 @@ export function useCollaboration(options: Options) {
   })
   const invitationRef = useRef(invitation); invitationRef.current = invitation
   const invitationEpoch = useRef(0)
+  const joining = useRef<{ key: string; promise: Promise<void> } | null>(null)
+  const autoJoinAttempt = useRef('')
   const current = useCallback((connection: LiveRoom) => connection.alive && live.current === connection &&
     latest.current.enabled && latest.current.scope === connection.room.scope, [])
   const stop = useCallback(() => {
@@ -152,14 +153,13 @@ export function useCollaboration(options: Options) {
         connection.connected = status.state === 'connected'
         connection.peerFingerprint = status.peerFingerprint
         connection.presence?.setConnected(connection.connected && status.presenceSupported === true)
-        setView(previous => ({ ...previous, status, ...(connection.connected ? { request: undefined, error: undefined } : { peerReceived: false }) }))
+        setView(previous => ({ ...previous, status, ...(connection.connected ? { error: undefined } : { peerReceived: false }) }))
         if (connection.connected && !wasConnected) {
           void send(packet(0, connection.doc?.getStateVector())).catch(error => {
             if (current(connection)) setView(previous => ({ ...previous, error: error.message }))
           })
         }
       },
-      onRequest(request) { if (current(connection)) setView(previous => ({ ...previous, request })) },
       onError(error) { if (current(connection)) setView(previous => ({ ...previous, error: error.message })) },
       async onMessage(message) {
         if (!current(connection)) return
@@ -187,6 +187,15 @@ export function useCollaboration(options: Options) {
             connection.persistedUpdate = next.crdt!.update
           } else restoreSelection?.()
           if (!current(connection)) return
+          // Keep the invitation recoverable until the received document is durable.
+          // A failed handshake or local write must not strand an empty guest room on reload.
+          const pending = invitationRef.current
+          if (pending && pending.room === room.room && pending.hostKey === room.hostKey && pending.secret === room.secret
+            && pending.descriptor.id === room.descriptor.id && pending.descriptor.lineage === room.descriptor.lineage
+            && pending.descriptor.createdAt === room.descriptor.createdAt) {
+            clearPendingInvitation(pending)
+            invitationRef.current = null; setInvitation(null)
+          }
           // This acknowledges device persistence, not the other person's homeserver.
           const receivedHash = await digest(receivedUpdate)
           if (!current(connection)) return
@@ -277,32 +286,66 @@ export function useCollaboration(options: Options) {
       attach(room, shared)
     } finally { if (scope === latest.current.scope) setView(previous => ({ ...previous, working: false })) }
   }
-  async function join() {
+  const join = useCallback((): Promise<void> => {
     const pending = invitationRef.current
-    if (!pending || !latest.current.enabled) return
-    if (!webRtcAvailable()) throw new Error(WEBRTC_UNAVAILABLE_MESSAGE)
-    if (!latest.current.identity) throw new Error(IDENTITY_UNAVAILABLE_MESSAGE)
+    if (!pending || !latest.current.enabled) return Promise.resolve()
     const scope = latest.current.scope, epoch = generation.current, inviteEpoch = invitationEpoch.current
+    const key = `${scope}:${inviteEpoch}:${epoch}`
+    if (joining.current?.key === key) return joining.current.promise
     const canceled = () => scope !== latest.current.scope || !latest.current.enabled || epoch !== generation.current || inviteEpoch !== invitationEpoch.current
-    setView(previous => ({ ...previous, working: true, error: undefined }))
-    try {
-      const existing = latest.current.notes.find(note => note.id === pending.descriptor.id)
-      if (existing && (existing.crdt?.version !== 2 || existing.crdt.lineage !== pending.descriptor.lineage || existing.createdAt !== pending.descriptor.createdAt)) {
-        throw new Error('This invitation conflicts with another note. Your existing note was retained.')
+    const attempt = { key, promise: Promise.resolve() }
+    joining.current = attempt
+    attempt.promise = (async () => {
+      setView(previous => ({ ...previous, working: true, error: undefined }))
+      try {
+        if (!webRtcAvailable()) throw new Error(WEBRTC_UNAVAILABLE_MESSAGE)
+        if (!latest.current.identity) throw new Error(IDENTITY_UNAVAILABLE_MESSAGE)
+        const existing = latest.current.notes.find(note => note.id === pending.descriptor.id)
+        if (existing && (existing.crdt?.version !== 2 || existing.crdt.lineage !== pending.descriptor.lineage || existing.createdAt !== pending.descriptor.createdAt)) {
+          throw new Error('This invitation conflicts with another note. Your existing note was retained.')
+        }
+        if (existing?.deleted) throw new Error('Restore your copy from Trash before joining again.')
+        const stored = await loadRoom(scope, pending.descriptor.id)
+        if (canceled()) return
+        const room = stored?.room === pending.room && stored.hostKey === pending.hostKey && stored.secret === pending.secret &&
+          stored.descriptor.createdAt === pending.descriptor.createdAt && stored.descriptor.lineage === pending.descriptor.lineage
+          ? stored : await createGuestRoom(scope, pending)
+        if (canceled()) return
+        if (!webRtcAvailable()) throw new Error(WEBRTC_UNAVAILABLE_MESSAGE)
+        if (!latest.current.identity) throw new Error(IDENTITY_UNAVAILABLE_MESSAGE)
+        attach(room, existing)
+      } finally {
+        if (joining.current === attempt) {
+          joining.current = null
+          if (scope === latest.current.scope && inviteEpoch === invitationEpoch.current) setView(previous => ({ ...previous, working: false }))
+        }
       }
-      if (existing?.deleted) throw new Error('Restore your copy from Trash before joining again.')
-      const stored = await loadRoom(scope, pending.descriptor.id)
-      if (canceled()) return
-      const room = stored?.room === pending.room && stored.hostKey === pending.hostKey && stored.secret === pending.secret &&
-        stored.descriptor.createdAt === pending.descriptor.createdAt && stored.descriptor.lineage === pending.descriptor.lineage
-        ? stored : await createGuestRoom(scope, pending)
-      if (canceled()) return
-      if (!webRtcAvailable()) throw new Error(WEBRTC_UNAVAILABLE_MESSAGE)
-      attach(room, existing)
-      clearPendingInvitation(pending)
-      invitationRef.current = null; setInvitation(null)
-    } finally { if (scope === latest.current.scope) setView(previous => ({ ...previous, working: false })) }
-  }
+    })()
+    return attempt.promise
+  }, [attach])
+
+  useEffect(() => {
+    if (!options.enabled) { autoJoinAttempt.current = ''; return }
+    const pending = invitationRef.current
+    if (!pending) return
+    if (!options.identity) {
+      setView(previous => previous.error === IDENTITY_UNAVAILABLE_MESSAGE ? previous : { ...previous, error: IDENTITY_UNAVAILABLE_MESSAGE })
+      return
+    }
+    const connection = live.current
+    if (connection && current(connection) && connection.room.room === pending.room
+      && connection.room.hostKey === pending.hostKey && connection.room.secret === pending.secret) return
+    const key = `${options.scope}:${invitationEpoch.current}:${generation.current}`
+    if (autoJoinAttempt.current === key) return
+    autoJoinAttempt.current = key
+    const scope = options.scope, epoch = invitationEpoch.current, started = generation.current
+    void join().catch(error => {
+      if (latest.current.enabled && latest.current.scope === scope && invitationEpoch.current === epoch && generation.current === started) {
+        setView(previous => ({ ...previous, error: error instanceof Error ? error.message : 'Collaboration could not join.' }))
+      }
+    })
+  }, [options.enabled, options.scope, options.identity, invitation, join, current])
+
   function editorIdentity(): NoteEditor | undefined {
     const id = latest.current.editorId
     if (!id) return undefined
@@ -359,17 +402,6 @@ export function useCollaboration(options: Options) {
     }
     return next
   }
-  async function approve() {
-    const connection = live.current, request = view.request
-    if (!connection || !request || !current(connection)) return
-    await connection.transport!.approve(request.peerId)
-    if (current(connection)) setView(previous => ({ ...previous, request: undefined }))
-  }
-  function reject() {
-    const connection = live.current
-    if (connection && view.request && current(connection)) connection.transport?.reject(view.request.peerId)
-    setView(previous => ({ ...previous, request: undefined }))
-  }
   function reconnect() {
     const connection = live.current
     if (!connection) {
@@ -392,6 +424,6 @@ export function useCollaboration(options: Options) {
     invitationRef.current = null; setInvitation(null)
     if (pending) clearPendingInvitation(pending)
   }
-  return { view, invitation, start, join, edit, checkpoint, restoreVersion, approve, reject, stop, updateSelection, remoteSelection,
+  return { view, invitation, start, join, edit, checkpoint, restoreVersion, stop, updateSelection, remoteSelection,
     dismissInvitation, reconnect }
 }

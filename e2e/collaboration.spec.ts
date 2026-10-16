@@ -11,6 +11,7 @@ type Peer = { context: BrowserContext; page: Page; owner: string; browserErrors:
 type Note = { note: { id: string; title: string; content: string; folder?: string; crdt?: { version: number; update: string } }; published: unknown }
 type RelayFixture = { firstExpiryMs?: number }
 type IceResponse = { iceServers: RTCIceServer[]; relayAvailable: true; expiresAt: number }
+const relayRequests = new WeakMap<Page, { method: string; status?: number; failure?: string }[]>()
 
 const test = base.extend<{ accounts: Peer[] }>({
   accounts: [async ({ browser }, use) => {
@@ -132,6 +133,16 @@ async function peer(browser: Browser, relayOnly = false, beforeSignIn?: (page: P
     }
   }, relayOnly)
   const page = await context.newPage()
+  const relayEvents: { method: string; status?: number; failure?: string }[] = []
+  relayRequests.set(page, relayEvents)
+  page.on('response', response => {
+    if (new URL(response.url()).hostname === 'httprelay.pubky.app') relayEvents.push({ method: response.request().method(), status: response.status() })
+    if (relayEvents.length > 100) relayEvents.shift()
+  })
+  page.on('requestfailed', request => {
+    if (new URL(request.url()).hostname === 'httprelay.pubky.app') relayEvents.push({ method: request.method(), failure: request.failure()?.errorText })
+    if (relayEvents.length > 100) relayEvents.shift()
+  })
   const browserErrors: string[] = []
   page.on('pageerror', error => browserErrors.push(error.message))
   page.on('console', message => {
@@ -200,11 +211,27 @@ async function cleanup(peers: Peer[]) {
 }
 
 async function connected(page: Page) {
-  await expect.poll(() => page.evaluate(() => {
-    const state = window as typeof window & { __testChannels: RTCDataChannel[]; __testConnections: RTCPeerConnection[] }
-    return state.__testChannels.some(channel => channel.readyState === 'open')
-      && state.__testConnections.some(connection => connection.connectionState === 'connected')
-  }), { message: 'An actual WebRTC data channel must open' }).toBe(true)
+  try {
+    await expect.poll(() => page.evaluate(() => {
+      const state = window as typeof window & { __testChannels: RTCDataChannel[]; __testConnections: RTCPeerConnection[] }
+      return state.__testChannels.some(channel => channel.readyState === 'open')
+        && state.__testConnections.some(connection => connection.connectionState === 'connected')
+    }), { message: 'An actual WebRTC data channel must open',
+      // Automatic joining includes the identity exchange; public rendezvous has
+      // several round trips that the former approval wait measured separately.
+      timeout: process.env.COLLAB_E2E_SIGNAL_URL?.startsWith('https:') ? 60_000 : 20_000 }).toBe(true)
+  } catch (error) {
+    const diagnostics = await page.evaluate(() => {
+      const state = window as typeof window & { __testChannels: RTCDataChannel[]; __testConnections: RTCPeerConnection[] }
+      return { connections: state.__testConnections.map(connection => ({ state: connection.connectionState, ice: connection.iceConnectionState, signaling: connection.signalingState,
+        localDescription: connection.localDescription?.type, remoteDescription: connection.remoteDescription?.type })),
+        channels: state.__testChannels.map(channel => channel.readyState),
+        messages: [...document.querySelectorAll('.inline-error, .collaboration-panel-status')].map(node => node.textContent) }
+    })
+    console.info('Connection state diagnostics:', JSON.stringify({ ...diagnostics, relayRequests: relayRequests.get(page) }))
+    await test.info().attach('connection-state-diagnostics', { body: JSON.stringify(diagnostics), contentType: 'application/json' })
+    throw error
+  }
 }
 
 async function relayed(page: Page, firstConnection = 0) {
@@ -263,34 +290,18 @@ async function acceptInvitation(alice: Page, bob: Page) {
     page.evaluate(() => localStorage.getItem('pubky-notes:e2e:disposable-account'))))
   expect(hostOwner).toBeTruthy()
   expect(guestOwner).toBeTruthy()
-  await expect(bob.getByRole('region', { name: 'Collaboration', exact: true })).toBeVisible()
-  await expect(bob.getByRole('dialog')).toHaveCount(0)
-  await bob.getByRole('button', { name: 'Join collaboration', exact: true }).click()
-  await expect(alice.getByRole('button', { name: 'Allow collaborator' })).toBeVisible()
-  await expect(alice.getByRole('button', { name: 'Copy verified Pubky identifier' })).toHaveText(`pubky${guestOwner}`)
-  await expect(bob.getByRole('button', { name: 'Copy verified Pubky identifier' })).toHaveText(`pubky${hostOwner}`)
-  await expect(alice.getByText('You don’t follow this person.')).toBeVisible()
-  await expect(bob.getByText('You don’t follow this person.')).toBeVisible()
-  if (test.info().title.startsWith('shared history')) {
-    await alice.screenshot({ path: test.info().outputPath('verified-approval-desktop.png'), fullPage: true })
-    const previousViewport = bob.viewportSize()!
-    await bob.setViewportSize({ width: 390, height: 844 })
-    expect(await bob.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
-    await bob.screenshot({ path: test.info().outputPath('verified-inviter-phone.png'), fullPage: true })
-    await bob.setViewportSize(previousViewport)
-  }
-  await expect(alice.getByRole('textbox', { name: 'Markdown content' })).toBeFocused()
-  await expect(alice.getByRole('dialog')).toHaveCount(0)
-  // Approval is an actual authorization boundary: no document or peer channel yet.
-  expect(await notes(bob)).toEqual([])
-  await expect(bob.getByRole('textbox', { name: 'Markdown content' })).toHaveCount(0)
-  expect(await bob.evaluate(() => (window as typeof window & { __testChannels: RTCDataChannel[] }).__testChannels.length)).toBe(0)
-  expect(new URL(bob.url()).hash).toBe('')
-  await alice.getByRole('button', { name: 'Allow collaborator' }).click()
-  await Promise.all([connected(alice), connected(bob)])
-  await Promise.all([alice, bob].map(async page => {
-    await expect(page.getByRole('region', { name: 'Collaboration', exact: true })).toHaveCount(0)
+  // Opening the link and signing in is sufficient: neither participant approves.
+  const connectionResults = await Promise.allSettled([connected(alice), connected(bob)])
+  for (const result of connectionResults) if (result.status === 'rejected') throw result.reason
+  for (const [page, owner] of [[alice, guestOwner], [bob, hostOwner]] as const) {
+    const bar = page.getByRole('region', { name: 'Active collaborators', exact: true })
+    await expect(bar).toBeVisible()
+    await expect(bar.getByRole('button', { name: 'Copy verified Pubky identifier' })).toHaveText(`pubky${owner}`)
+    await expect(bar.getByText('You don’t follow this person.')).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Allow collaborator' })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Join collaboration', exact: true })).toHaveCount(0)
     await expect(page.getByRole('dialog')).toHaveCount(0)
+    await expect(page.getByRole('region', { name: 'Collaboration', exact: true })).toHaveCount(0)
     try { await expect(page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(BODY) }
     catch (error) {
       const diagnostics = await page.evaluate(async () => {
@@ -306,7 +317,18 @@ async function acceptInvitation(alice: Page, bob: Page) {
       await test.info().attach('connection-diagnostics', { body: JSON.stringify(diagnostics), contentType: 'application/json' })
       throw error
     }
-  }))
+  }
+  if (test.info().title.startsWith('shared history')) {
+    await alice.screenshot({ path: test.info().outputPath('verified-collaborator-desktop.png'), fullPage: true })
+    const previousViewport = bob.viewportSize()!
+    await bob.setViewportSize({ width: 390, height: 844 })
+    expect(await bob.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+    await expect(bob.getByRole('region', { name: 'Active collaborators', exact: true })).toBeVisible()
+    await bob.screenshot({ path: test.info().outputPath('verified-collaborator-phone.png'), fullPage: true })
+    await bob.setViewportSize(previousViewport)
+  }
+  await expect(alice.getByRole('textbox', { name: 'Markdown content' })).toBeFocused()
+  expect(new URL(bob.url()).hash).toBe('')
 }
 
 async function share(alice: Page, bob: Page) {
@@ -367,7 +389,7 @@ async function overlaysStayInsideEditor(page: Page) {
   }), { message: 'Remote cursor, name, and selection must remain clipped to the textarea' }).toBe(true)
 }
 
-test('approved browsers exchange real RTC edits, keep independent private files, and stop on logout', async ({ browser, accounts: peers }) => {
+test('automatically verified browsers exchange real RTC edits, keep independent private files, and stop on logout', async ({ browser, accounts: peers }) => {
     const alice = await peer(browser); peers.push(alice)
     const bob = await peer(browser); peers.push(bob)
     expect(alice.owner).not.toBe(bob.owner)
@@ -391,10 +413,8 @@ test('approved browsers exchange real RTC edits, keep independent private files,
     await alice.page.getByRole('textbox', { name: 'Folder name' }).fill('Research')
     await alice.page.getByRole('button', { name: 'Create folder', exact: true }).click()
     await alice.page.getByRole('button', { name: 'Notes', exact: true }).click()
-    await alice.page.locator(`[data-note-id="${id}"]`).getByRole('button', { name: 'Move note E2E shared draft', exact: true }).click()
-    await alice.page.getByRole('combobox', { name: 'Move note to', exact: true }).selectOption('Alice only/Research')
+    await alice.page.locator(`[data-note-id="${id}"]`).dragTo(alice.page.getByRole('button', { name: 'Open folder Alice only/Research', exact: true }))
     await expect(alice.page.getByRole('dialog')).toHaveCount(0)
-    await alice.page.getByRole('button', { name: 'Move', exact: true }).click()
     await expect.poll(async () => (await notes(alice.page)).find(row => row.note.id === id)?.note.folder).toBe('Alice only/Research')
     expect((await notes(bob.page)).find(row => row.note.id === id)?.note.folder || '').toBe('')
     await expect(bob.page.getByRole('button', { name: 'Open folder Alice only/Research' })).toHaveCount(0)
@@ -474,7 +494,7 @@ test('unavailable WebRTC explains the browser problem before sharing a private n
   await expect(alice.page.getByRole('textbox', { name: 'Invitation link' })).toHaveCount(0)
 })
 
-test('pending invitation survives sign-in and reload until the recipient explicitly joins', async ({ browser, accounts: peers }) => {
+test('pending invitation survives signed-out reload and automatically joins after sign-in', async ({ browser, accounts: peers }) => {
   const alice = await peer(browser); peers.push(alice)
   const { id, link } = await createInvitation(alice.page)
   const bob = await peer(browser, false, async page => {
@@ -489,11 +509,6 @@ test('pending invitation survives sign-in and reload until the recipient explici
     // returns to the app without an invitation fragment, in this same tab.
   }); peers.push(bob)
   expect(new URL(bob.page.url()).hash).toBe('')
-  await expect(bob.page.getByRole('button', { name: 'Join collaboration', exact: true })).toBeVisible()
-  await bob.page.reload()
-  await expect(bob.page.getByRole('button', { name: 'Join collaboration', exact: true })).toBeVisible()
-  expect(await notes(bob.page)).toEqual([])
-  await expect(alice.page.getByRole('button', { name: 'Allow collaborator' })).toHaveCount(0)
   await acceptInvitation(alice.page, bob.page)
   await insert(bob.page, 'end', '\nJoined after signing in.')
   const merged = `${BODY}\nJoined after signing in.`

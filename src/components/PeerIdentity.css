@@ -11,3 +11,14 @@
 .peer-identifier:hover { color: var(--accent); }
 .peer-followed { color: #506958; font-size: 13px; }
 .peer-follow-warning { color: #805718; font-size: 13px; }
+.peer-identity.compact { display: grid; grid-template-columns: minmax(130px, 200px) minmax(0, 1fr); column-gap: 14px; row-gap: 3px; margin: 0; padding: 0; border: 0; background: transparent; }
+.peer-identity.compact .peer-identity-heading { grid-row: 1 / span 3; align-self: start; }
+.peer-identity.compact .peer-identity-heading strong { font-size: 13px; }
+.peer-identity.compact .peer-verified { font-size: 11px; }
+.peer-identity.compact .peer-identifier { grid-column: 2; padding: 0; }
+.peer-identity.compact p { grid-column: 2; margin: 0; font-size: 12px; }
+@media (max-width: 700px) {
+  .peer-identity.compact { grid-template-columns: minmax(0, 1fr); gap: 5px; }
+  .peer-identity.compact .peer-identity-heading { grid-row: auto; }
+  .peer-identity.compact .peer-identifier, .peer-identity.compact p { grid-column: 1; }
+}

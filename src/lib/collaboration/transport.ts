@@ -61,7 +61,6 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
   } | undefined
   const identity = options.identity ? { ...options.identity } : undefined
   let presenceSupported = false
-  let pending: Signal | undefined
   let state: CollaborationStatus['state'] = 'connecting'
   let issue: CollaborationStatus['issue']
   let relayAvailable = false
@@ -113,7 +112,6 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
     identityTimer = undefined
     verifiedPair = undefined
     exchange = undefined
-    pending = undefined
     peerIdentity = undefined
     localChallenge = randomToken(24)
   }
@@ -369,13 +367,22 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
     return connection
   }
 
-  async function flushLocalCandidates(connection: RTCPeerConnection) {
-    if (disposed || peer !== connection) return
+  function flushLocalCandidates(connection: RTCPeerConnection) {
+    const authenticated = verifiedPair, key = remoteKey, session = remoteSession
+    const current = () => !disposed && peer === connection && verifiedPair === authenticated && identityValid()
+      && remoteKey === key && remoteSession === session
+    if (!current()) return
     localCandidatesReady = true
-    for (const candidate of localCandidates.splice(0)) {
-      if (disposed || peer !== connection) return
-      await publish('ice', remoteKey, remoteSession, JSON.stringify(candidate))
-    }
+    const candidates = localCandidates.splice(0)
+    // SDP has already been acknowledged. HTTP ICE delivery can wait on several
+    // round trips, so it must not hold the incoming queue ahead of the answer.
+    void (async () => {
+      for (const candidate of candidates) {
+        if (!current()) return
+        await publish('ice', key, session, JSON.stringify(candidate))
+        if (!current()) return
+      }
+    })().catch(error => { if (current()) report(error) })
   }
 
   async function offer(signal: Signal) {
@@ -396,7 +403,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
     await connection.setLocalDescription(description)
     if (disposed || peer !== connection || !identityValid()) return
     await publish('offer', signal.from, signal.session, advertisePresence(description.sdp ?? ''))
-    await flushLocalCandidates(connection)
+    flushLocalCandidates(connection)
   }
 
   async function receive(signal: Signal) {
@@ -437,7 +444,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
       closePeer()
       resetIdentity()
       status('error')
-      report(new Error('The host declined this invitation or already has a collaborator'))
+      report(new Error('This document already has a collaborator'))
       return
     }
     if (signal.kind === 'challenge' && room.role === 'guest') {
@@ -479,17 +486,12 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
       // Consuming this exchange prevents a second proof from replacing the approved identity.
       bindIdentity(signal, other, attempt.ownIdentity)
       if (!identityValid()) return
-      if (room.approvedPeer === signal.from) {
-        await admitPeer(room, signal.from, other.owner)
-        if (disposed || exchange !== attempt || !identityValid()) return
-        await offer(signal)
-        return
-      }
-      pending = signal
-      const requestFingerprint = await fingerprint(signal.from)
-      if (disposed || exchange !== attempt || pending !== signal || !identityValid()) return
-      status('approval')
-      callbacks.onRequest({ peerId: signal.from, fingerprint: requestFingerprint, owner: other.owner })
+      // Possessing the invitation authorizes joining; the verified proof binds
+      // that capability to the real Pubky owner before the atomic guest slot is claimed.
+      const authenticated = verifiedPair
+      await admitPeer(room, signal.from, other.owner)
+      if (disposed || exchange !== attempt || authenticated !== verifiedPair || !identityValid()) return
+      await offer(signal)
       return
     }
     if (!identityValid() || verifiedPair?.key !== signal.from || verifiedPair.session !== signal.session) return
@@ -509,7 +511,7 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
       await connection.setLocalDescription(answer)
       if (disposed || peer !== connection || !identityValid()) return
       await publish('answer', signal.from, signal.session, advertisePresence(answer.sdp ?? ''))
-      await flushLocalCandidates(connection)
+      flushLocalCandidates(connection)
       return
     }
     const connection = peer
@@ -653,24 +655,6 @@ export function startCollaboration(room: StoredRoom, callbacks: CollaborationCal
       })
       sendQueue = work.catch(() => {}).finally(() => { sendQueuedBytes -= copy.length })
       return work
-    },
-    async approve(peerId) {
-      const request = pending
-      const authenticated = verifiedPair
-      if (disposed || room.role !== 'host' || !request || request.from !== peerId || !authenticated || !identityValid()
-        || authenticated.key !== peerId || authenticated.session !== request.session) throw new Error('This join request is no longer available')
-      await admitPeer(room, peerId, authenticated.owner)
-      if (disposed || pending !== request || authenticated !== verifiedPair || !identityValid()) return
-      pending = undefined
-      await offer(request)
-    },
-    reject(peerId) {
-      const request = pending
-      if (disposed || room.role !== 'host' || !request || request.from !== peerId) return
-      pending = undefined
-      void publish('reject', peerId, request.session).catch(report)
-      resetIdentity()
-      status('waiting')
     },
     reconnect,
     dispose() {

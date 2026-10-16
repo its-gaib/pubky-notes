@@ -348,13 +348,18 @@ describe('folders and notebook-wide search', () => {
     await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Folder name' })).toBeNull())
     await screen.findByRole('button', { name: 'Open folder Work/Project' })
     fireEvent.click(screen.getByRole('button', { name: /^Notes$/ }))
-    fireEvent.click(screen.getByRole('button', { name: `Move note ${original.title}` }))
-    const destination = screen.getByRole('combobox', { name: 'Move note to' })
+    const source = screen.getByRole('button', { name: `Open note ${original.title}` })
+    const destination = screen.getByRole('button', { name: 'Open folder Work/Project' })
     expect(destination.closest('#notebook-navigation')).not.toBeNull()
     expect(screen.queryByRole('dialog')).toBeNull()
-    fireEvent.change(destination, { target: { value: 'Work/Project' } })
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /^Move$/ })) })
-    await waitFor(() => expect(screen.queryByRole('combobox', { name: 'Move note to' })).toBeNull())
+    const dataTransfer = { effectAllowed: 'uninitialized', dropEffect: 'none', setData: vi.fn() }
+    await act(async () => {
+      fireEvent.dragStart(source, { dataTransfer })
+      fireEvent.dragOver(destination, { dataTransfer })
+      fireEvent.drop(destination, { dataTransfer })
+      fireEvent.dragEnd(source, { dataTransfer })
+    })
+    await waitFor(() => expect(screen.getByRole('button', { name: `Open note ${original.title}` }).closest('[data-folder-path]')?.getAttribute('data-folder-path')).toBe('Work/Project'))
     await act(async () => { fireEvent.keyDown(window, { key: 's', ctrlKey: true }) })
 
     await waitFor(() => expect(mocks.saveNote).toHaveBeenCalledWith(session, expect.objectContaining({

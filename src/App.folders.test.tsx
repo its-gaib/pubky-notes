@@ -34,9 +34,6 @@ function renameFolder(path: string) {
   fireEvent.click(folder(path))
   if (!screen.queryByRole('textbox', { name: 'Folder name' })) fireEvent.click(folder(path))
 }
-function moveNote(title: string) {
-  fireEvent.click(screen.getByRole('button', { name: `Move note ${title}` }))
-}
 function folder(path: string) { return screen.getByRole('button', { name: `Open folder ${path}` }) }
 function folderName() { return screen.getByRole('textbox', { name: 'Folder name' }) as HTMLInputElement }
 function expectInline(control: HTMLElement) {
@@ -158,11 +155,8 @@ describe('sidebar folder management', { timeout: 15_000 }, () => {
     await open([row('First'), row('Second', undefined, true)], ['Work'])
     const noteUrl = window.location.pathname
     expect(document.querySelector('.editor-bottom button.folder-location')).toBeNull()
-    moveNote('Second')
-    const destination = screen.getByRole('combobox', { name: 'Move note to' })
-    expectInline(destination)
-    fireEvent.change(destination, { target: { value: 'Work' } })
-    await submit('Move')
+    await drag(screen.getByRole('button', { name: 'Open note Second' }), folder('Work'))
+    await flush()
     expect(mocks.save).toHaveBeenCalledExactlyOnceWith(session, expect.objectContaining({ id: 'Second', folder: 'Work', content: 'Content of Second' }))
     expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe('First')
     expect((screen.getByRole('textbox', { name: 'Markdown content' }) as HTMLTextAreaElement).value).toBe('Content of First')
@@ -382,27 +376,4 @@ describe('sidebar folder management', { timeout: 15_000 }, () => {
     expect(mocks.save).not.toHaveBeenCalled()
   })
 
-  it('supports keyboard folder moves directly from the sidebar icon', async () => {
-    const user = userEvent.setup()
-    await open([row('First', 'Work/Ideas')], ['Archive'])
-    const move = screen.getByRole('button', { name: 'Move folder Work' })
-    move.focus()
-    await user.keyboard('{Enter}')
-    expect(screen.queryByRole('menu')).toBeNull()
-    expect(document.activeElement).toBe(screen.getByRole('combobox', { name: 'Move folder to' }))
-    await user.keyboard('{Escape}')
-    expect(screen.queryByRole('combobox', { name: 'Move folder to' })).toBeNull()
-    move.focus()
-    await user.keyboard('{Enter}')
-    const destination = screen.getByRole('combobox', { name: 'Move folder to' })
-    expectInline(destination)
-    expect(within(destination).queryByRole('option', { name: 'Work/Ideas' })).toBeNull()
-    await user.selectOptions(destination, 'Archive')
-    screen.getByRole('button', { name: 'Move' }).focus()
-    await user.keyboard('{Enter}')
-    await waitFor(() => expect(screen.queryByRole('combobox', { name: 'Move folder to' })).toBeNull())
-    await flush()
-    expect(folder('Archive/Work/Ideas')).toBeTruthy()
-    expect(mocks.save).toHaveBeenCalledWith(session, expect.objectContaining({ id: 'First', folder: 'Archive/Work/Ideas' }))
-  })
 })

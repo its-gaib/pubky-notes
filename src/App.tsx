@@ -2,7 +2,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import type { ChangeEvent, CSSProperties, DragEvent, ReactNode } from 'react'
 import type { JsonValue, Session } from '@synonymdev/pubky'
 import QRCode from 'qrcode'
-import { ArrowDownToLine, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight, Code2, Copy, FileText, Folder, FolderInput, Globe2, Heading2, History, Link, List, LoaderCircle, LockKeyhole, PenLine, Plus, Search, Trash2, Undo2, X, MoreHorizontal, FolderPlus, Bold, Italic, Quote, ExternalLink, UsersRound } from 'lucide-react'
+import { ArrowDownToLine, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight, Code2, Copy, FileText, Folder, Globe2, Heading2, History, Link, List, LoaderCircle, LockKeyhole, PenLine, Plus, Search, Trash2, Undo2, X, MoreHorizontal, FolderPlus, Bold, Italic, Quote, ExternalLink, UsersRound } from 'lucide-react'
 import Markdown from './components/Markdown'
 import AccountProfile from './components/AccountProfile'
 import RemoteSelection from './components/RemoteSelection'
@@ -22,6 +22,7 @@ import { adoptGuestNotebook, readLocalNotebook, resolveLocalNoteDestination, set
 import type { LocalNotebook } from './lib/local-notebook'
 import { GUEST_SCOPE, mergeRemoteNotebook, scopeForSession, synchronizeNotebook, uploadNotebook } from './lib/notebook-sync'
 import { useCollaboration } from './hooks/useCollaboration'
+import CollaborationBar from './components/CollaborationBar'
 import type { SharedNoteDocument } from './lib/shared-note'
 import { EditorSelectionKeeper } from './lib/editor-selection'
 import { notePath, noteUrl, parseNoteRoute } from './lib/note-links'
@@ -403,7 +404,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     if (note && (historyOpen || mode !== 'write' || note.deleted || busy || initializing || modal || (mobileViewport && menuOpen))) collaboration.updateSelection(note.id, null)
   }, [mode, historyOpen, note?.id, note?.deleted, busy, initializing, modal, mobileViewport, menuOpen, collaboration.updateSelection])
   useEffect(() => { if (collaboration.invitation && !initializing) setCollaborationOpen(true) }, [collaboration.invitation, initializing])
-  useEffect(() => { if (collaboration.view.request || collaboration.view.status?.issue) setCollaborationOpen(true) }, [collaboration.view.request, collaboration.view.status?.issue])
+  useEffect(() => { if (collaboration.view.status?.issue || collaboration.view.error) setCollaborationOpen(true) }, [collaboration.view.status?.issue, collaboration.view.error])
   useEffect(() => { if (collaboration.view.status?.state === 'connected') setCollaborationOpen(false) }, [collaboration.view.status?.state])
   const checkpointHistory = useCallback(() => {
     const capturedScope = scopeRef.current
@@ -1133,7 +1134,6 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
               <button className={`folder-select ${selectedFolder === path ? 'active' : ''}`} aria-label={`Open folder ${path}`} title={selectedFolder === path ? `${path} · click to rename` : path} disabled={locked} draggable={!locked} onDragStart={event => startDrag(event, 'folder', path)} onDragEnd={endDrag} onClick={() => openFolder(path)}><Folder size={15} /><span>{folderLabel(path)}</span></button>
             </div><div className="sidebar-row-actions">
               <button type="button" className="icon-button" aria-label={`New subfolder in ${path}`} title={`New subfolder in ${path}`} disabled={locked} onClick={() => manageFolder('create', path)}><FolderPlus size={15} /></button>
-              <button type="button" className="icon-button" aria-label={`Move folder ${path}`} title={`Move folder ${path}`} disabled={locked} onClick={() => openMove(path, 'folder')}><FolderInput size={15} /></button>
               <button type="button" className="icon-button row-delete" aria-label={`Delete folder ${path}`} title={empty ? `Delete folder ${path}` : 'Only empty folders can be deleted'} disabled={locked || !empty} onClick={() => void deleteFolder(path)}><Trash2 size={15} /></button>
             </div></>}
             {moveControl('folder', path)}
@@ -1156,7 +1156,6 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
       </button>
       {row.note.id !== exampleId.current && <div className="sidebar-row-actions">
         {row.note.deleted ? <button type="button" className="icon-button" aria-label={`Restore note ${title}`} title={`Restore note ${title}`} disabled={locked} onClick={() => void restoreNote(row.note.id)}><Undo2 size={15} /></button> : <>
-          <button type="button" className="icon-button" aria-label={`Move note ${title}`} title={`Move note ${title}`} disabled={locked} onClick={() => openMove(row.note.id)}><FolderInput size={15} /></button>
           <button type="button" className="icon-button row-delete" aria-label={`Move note ${title} to Trash`} title={`Move note ${title} to Trash`} disabled={locked} onClick={() => void remove(row.note.id)}><Trash2 size={15} /></button>
         </>}
       </div>}
@@ -1167,11 +1166,10 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   const collaborationPanel = collaborationOpen && <CollaborationPanel
     invitation={!!collaboration.invitation} view={collaboration.view} note={note}
     sharedTitle={records.find(row => row.note.id === collaboration.view.noteId)?.note.title}
-    signedIn={!!session} ownOwner={owner || undefined} disabled={locked} close={() => { setCollaborationOpen(false); if (collaboration.invitation) collaboration.dismissInvitation() }}
+    signedIn={!!session} disabled={locked} close={() => { setCollaborationOpen(false); if (collaboration.invitation && !collaboration.view.noteId) collaboration.dismissInvitation() }}
     connect={() => void connect()} start={() => { if (note) void flushLocal().then(() => collaboration.start(note)).catch(error => notice(errorMessage(error), true)) }}
     join={() => void collaboration.join().catch(error => notice(errorMessage(error), true))}
-    approve={() => void collaboration.approve().catch(error => notice(errorMessage(error), true))} reject={collaboration.reject}
-    retry={collaboration.reconnect} disconnect={() => { collaboration.stop(); setCollaborationOpen(false) }} copy={link => void copy(link)} />
+    retry={collaboration.reconnect} disconnect={() => { collaboration.dismissInvitation(); collaboration.stop(); setCollaborationOpen(false) }} copy={link => void copy(link)} />
   return <div className={`app-shell ${menuOpen ? 'mobile-open' : ''} ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`} style={sidebarStyle}>
     {menuOpen && <button className="navigation-dismiss" aria-label="Close sidebar" onClick={() => setMenuOpen(false)} />}
     <div className="navigation-pane"><aside className="sidebar" id="notebook-navigation" aria-label="Notebook">
@@ -1210,6 +1208,10 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
       </div>
     </aside>{!mobileViewport && !sidebarCollapsed && <SidebarResizeHandle label="Resize sidebar" controls="notebook-navigation" width={fittedLayout.width} min={SIDEBAR_LIMITS.min} max={fittedLayout.maxWidth} defaultWidth={SIDEBAR_LIMITS.default} onResize={resizeSidebar} />}<button className="pane-toggle navigation-edge" aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'} title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'} aria-controls="notebook-navigation" aria-expanded={!sidebarCollapsed} onClick={() => mobileViewport ? setMenuOpen(current => !current) : setLayout(current => ({ ...current, collapsed: !current.collapsed }))}>{sidebarCollapsed ? <ChevronRight size={17} /> : <ChevronLeft size={17} />}</button></div>
     <main className="editor-panel">
+      <CollaborationBar view={collaboration.view} ownOwner={owner || undefined}
+        sharedTitle={records.find(row => row.note.id === collaboration.view.noteId)?.note.title}
+        openNote={() => { if (collaboration.view.noteId) void switchNote(collaboration.view.noteId) }}
+        disconnect={() => { collaboration.dismissInvitation(); collaboration.stop(); setCollaborationOpen(false) }} copy={value => void copy(value)} />
       {(routeLoading || routeIssue || (!note && initializing)) && collaborationPanel}
       {routeLoading ? <div className="empty-state editor-empty"><LoaderCircle className="spin" aria-label="Loading note" /><p>Opening note…</p></div> : routeIssue ? <div className="empty-state editor-empty"><LockKeyhole size={30} /><h2>{routeIssue.title}</h2><p>{routeIssue.message}</p><div className="modal-actions">{route.kind === 'private' && !ownsPrivateRoute && <button className="button primary" disabled={locked} onClick={() => void connect()}>Connect Pubky</button>}{requestedNote && canOpenRoute && <button className="button secondary" disabled={locked} onClick={() => void retryNoteLink()}>Retry</button>}<button className="button secondary" onClick={openNotebook}>Open your notebook</button></div></div> : note ? <><div className="editor-topbar"><div className="note-location"><div className="mode-switch"><button className={mode === 'write' ? 'active' : ''} onClick={() => { setHistoryIdentity(null); setMode('write') }}><PenLine size={14} /> Write</button><button className={mode === 'preview' ? 'active' : ''} onClick={() => { setHistoryIdentity(null); setMode('preview') }}><BookOpen size={14} /> Preview</button></div></div>{mode === 'write' && !historyOpen && <div className="formatting-toolbar" aria-label="Markdown formatting">{[{ icon: Bold, title: 'Bold', before: '**', after: '**' }, { icon: Italic, title: 'Italic', before: '_', after: '_' }, { icon: Heading2, title: 'Heading', before: '\n## ', after: '' }, { icon: List, title: 'List', before: '\n- ', after: '' }, { icon: Quote, title: 'Quote', before: '\n> ', after: '' }, { icon: Code2, title: 'Code', before: '`', after: '`' }, { icon: Link, title: 'Link', before: '[', after: '](https://)' }].map(item => <button key={item.title} className="icon-button" aria-label={item.title} title={item.title} disabled={locked || note.deleted} onClick={() => format(item.before, item.after)}><item.icon size={16} /></button>)}</div>}<div className="editor-actions">{session && <span className={`visibility-badge ${active?.published ? 'public' : ''}`}>{active?.published ? <Globe2 size={13} /> : <LockKeyhole size={13} />}{active?.published ? 'Public copy' : 'Private'}</span>}{note.id !== exampleId.current && <button className="icon-button" onClick={() => void copyNoteLink()} disabled={locked} aria-label="Copy note link" title="Copy note link"><Link size={16} /></button>}{note.content === SAMPLE_MARKDOWN && <button className="icon-button" onClick={() => void copy(SAMPLE_MARKDOWN)} aria-label="Copy Markdown" title="Copy Markdown"><Copy size={16} /></button>}<button className="button ghost small" onClick={() => download(note)} aria-label="Export Markdown" title="Export Markdown"><ArrowDownToLine size={16} /></button>{note.deleted && <button className="button secondary small" disabled={locked} onClick={() => void restoreNote(note.id)}>Restore</button>}{note.id !== exampleId.current && <button className="icon-button" onClick={openHistory} disabled={locked} aria-label="Version history" title="Version history" aria-expanded={historyOpen}><History size={17} /></button>}<button className="button secondary small collaboration-button" onClick={() => setCollaborationOpen(current => !current)} aria-expanded={collaborationOpen} aria-controls="collaboration-panel" disabled={locked || note.deleted} aria-label="Collaborate"><UsersRound size={15} /><span>Collaborate</span></button><button className="button secondary small" onClick={() => setModal('share')} disabled={locked || note.deleted}><Globe2 size={14} /> Share</button></div></div>
       {collaborationPanel}

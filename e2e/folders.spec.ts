@@ -150,7 +150,7 @@ test('native sidebar dragging moves notes and folder descendants, renames inline
   expect(actual.published).toBeNull()
 })
 
-test('mobile sidebar move controls organize local notes and folders without editor overlays', async ({ browser }) => {
+test('sidebar dragging in a narrow viewport organizes local notes and folders without editor overlays', async ({ browser }) => {
   const context = await browser.newContext({ viewport: { width: 390, height: 844 } })
   context.setDefaultTimeout(15_000)
   const page = await context.newPage()
@@ -165,20 +165,11 @@ test('mobile sidebar move controls organize local notes and folders without edit
     await page.getByRole('button', { name: 'Expand sidebar', exact: true }).click()
     await createFolder(page, 'Archive')
     await page.getByRole('button', { name: 'Notes', exact: true }).click()
-    await page.getByRole('button', { name: 'Move note Mobile move fixture', exact: true }).click()
-    const moveNote = page.getByRole('combobox', { name: 'Move note to', exact: true })
-    expect(await moveNote.evaluate(element => !!element.closest('#notebook-navigation'))).toBe(true)
-    await expect(page.getByRole('dialog')).toHaveCount(0)
-    await moveNote.selectOption('Archive')
-    await page.getByRole('button', { name: 'Move', exact: true }).click()
-    await expect(moveNote).toHaveCount(0)
-    expect(await page.getByRole('button', { name: 'Open note Mobile move fixture', exact: true }).evaluate(element => element.closest('[data-folder-path]')?.getAttribute('data-folder-path'))).toBe('Archive')
+    const archive = page.getByRole('button', { name: 'Open folder Archive', exact: true })
+    await page.getByRole('button', { name: 'Open note Mobile move fixture', exact: true }).dragTo(archive)
+    await expect.poll(async () => page.getByRole('button', { name: 'Open note Mobile move fixture', exact: true }).evaluate(element => element.closest('[data-folder-path]')?.getAttribute('data-folder-path'))).toBe('Archive')
 
-    await page.getByRole('button', { name: 'Move folder Travel', exact: true }).click()
-    const moveFolder = page.getByRole('combobox', { name: 'Move folder to', exact: true })
-    expect(await moveFolder.evaluate(element => !!element.closest('#notebook-navigation'))).toBe(true)
-    await moveFolder.selectOption('Archive')
-    await page.getByRole('button', { name: 'Move', exact: true }).click()
+    await page.getByRole('button', { name: 'Open folder Travel', exact: true }).dragTo(archive)
     await expect(page.getByRole('button', { name: 'Open folder Archive/Travel', exact: true })).toBeVisible()
     const treeNote = page.getByRole('button', { name: 'Open note Mobile move fixture', exact: true })
     await expect(treeNote).toBeVisible()
