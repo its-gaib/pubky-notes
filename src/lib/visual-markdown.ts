@@ -21,7 +21,13 @@ export function plainOffsets(source: string, rendered: string): number[] {
   const offsets = [0]
   let original = 0
   for (const [operation, text] of diff(source, rendered)) {
-    if (operation === -1) original += text.length
+    if (operation === -1) {
+      original += text.length
+      // Markdown can omit structural prefixes inside one rendered text
+      // leaf (for example `> ` after a soft newline). The next visible
+      // character starts after that prefix, so editing it preserves syntax.
+      offsets[offsets.length - 1] = original
+    }
     else for (let index = 0; index < text.length; index++) {
       if (operation === 0) original++
       offsets.push(original)

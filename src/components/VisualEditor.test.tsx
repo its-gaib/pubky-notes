@@ -35,6 +35,12 @@ describe('Visual Markdown editing', () => {
     select('&amp;', 1, 4); input('xyz')
     expect(screen.getByTestId('source').textContent).toBe('A and B\n\n`&xyz;`')
   })
+  it('preserves quote prefixes while editing a soft continuation line', () => {
+    render(<Editor source={'> One\n> Two'} />)
+    select('One\nTwo', 4, 7); input('Next')
+    expect(screen.getByTestId('source').textContent).toBe('> One\n> Next')
+    expect(document.querySelector('blockquote p')?.textContent).toBe('One\nNext')
+  })
   it('preserves paired formatting when replacing a selection across inline spans', () => {
     render(<Editor source="one **bold** two" />)
     const strong = document.querySelector('strong span')!.firstChild!
