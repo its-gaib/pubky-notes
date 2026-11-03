@@ -29,6 +29,7 @@ async function open(records = [row('First'), row('Second')], folders: string[] =
   await waitFor(() => expect(screen.getByText('Saved to Pubky')).toBeTruthy())
   await act(async () => { fireEvent.click(screen.getByRole('button', { name: `Open note ${records[0].note.title}` })) })
   await waitFor(() => expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe(records[0].note.title))
+  await waitFor(() => expect((screen.getByRole('button', { name: 'New note' }) as HTMLButtonElement).disabled).toBe(false))
 }
 function renameFolder(path: string) {
   fireEvent.click(folder(path))
@@ -119,7 +120,7 @@ describe('sidebar folder management', { timeout: 15_000 }, () => {
     expect(within(publishedButton).getByRole('img', { name: 'Public copy published' }).getAttribute('title')).toBe('Public copy published')
     expect(within(changedButton).getByRole('img', { name: 'Public copy published; draft has unpublished changes' }).getAttribute('title')).toBe('Public copy published; draft has unpublished changes')
     await act(async () => { fireEvent.click(changedButton) })
-    expect((screen.getByRole('textbox', { name: 'Markdown content' }) as HTMLTextAreaElement).value).toBe('Private edits not in the public copy')
+    await waitFor(() => expect((screen.getByRole('textbox', { name: 'Markdown content' }) as HTMLTextAreaElement).value).toBe('Private edits not in the public copy'))
     expect((await readLocalNotebook(scopeForSession(session))).records.find(record => record.note.id === 'Draft-changes')?.published).toEqual(draftChanged.published)
     expect(mocks.save).not.toHaveBeenCalled()
     expect(mocks.publish).not.toHaveBeenCalled()

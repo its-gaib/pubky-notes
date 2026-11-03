@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   loadFolders: vi.fn(), saveFolders: vi.fn(), localWriteStarted: vi.fn(),
   remote: [] as NoteRecord[], folders: [] as string[], failedTitle: null as string | null,
   archiveGate: null as Promise<void> | null, archiveStarted: vi.fn(),
+  localWriteGate: null as Promise<void> | null,
 }))
 vi.mock('./lib/pubky', () => ({ restoreSession: mocks.restore, startSignIn: vi.fn(), persistSession: vi.fn(), discardSession: vi.fn(), signOut: mocks.signOut }))
 vi.mock('./lib/notes', async original => ({ ...await original<typeof import('./lib/notes')>(), listNotes: mocks.list, saveNote: mocks.save, publishNote: mocks.publish }))
@@ -24,6 +25,8 @@ vi.mock('./lib/local-notebook', async original => {
   const actual = await original<typeof import('./lib/local-notebook')>()
   return { ...actual, writeLocalNote: async (...args: Parameters<typeof actual.writeLocalNote>) => {
     mocks.localWriteStarted(...args)
+    const gate = mocks.localWriteGate
+    if (gate) await gate
     if (args[1].note.title === mocks.failedTitle) throw new Error('Device storage is temporarily full.')
     return actual.writeLocalNote(...args)
   } }
@@ -72,7 +75,7 @@ beforeEach(async () => {
   await closeLocalNotebook(); vi.stubGlobal('indexedDB', new IDBFactory())
   localStorage.clear(); window.history.replaceState(null, '', '/')
   vi.clearAllMocks()
-  mocks.failedTitle = null; mocks.archiveGate = null; mocks.remote = []; mocks.folders = []
+  mocks.failedTitle = null; mocks.archiveGate = null; mocks.localWriteGate = null; mocks.remote = []; mocks.folders = []
   mocks.restore.mockResolvedValue(session); mocks.signOut.mockResolvedValue(undefined)
   mocks.list.mockImplementation(async () => mocks.remote)
   mocks.loadFolders.mockImplementation(async () => mocks.folders)
@@ -208,5 +211,69 @@ describe('notebook backup and bulk import integration', { timeout: 15_000 }, () 
     expect(URL.createObjectURL).not.toHaveBeenCalled()
     expect(screen.queryByRole('dialog', { name: 'Backup and import' })).toBeNull()
     expect((await readLocalNotebook(GUEST_SCOPE)).records).toEqual([])
+  })
+
+  it('locks the old Visual editor during New note flushing and exports both notes with their own edits', async () => {
+    await open([row('first', 'First note', 'First original body.')])
+    fireEvent.click(screen.getByRole('button', { name: 'Visual' }))
+    const gate = deferred<void>(); mocks.localWriteGate = gate.promise
+    const visual = screen.getByRole('textbox', { name: 'Visual content' })
+    const leaf = [...visual.querySelectorAll<HTMLElement>('[data-source-start]')].find(node => node.textContent === 'First original body.')!
+    visual.focus()
+    const range = document.createRange(); range.setStart(leaf.firstChild!, 0); range.setEnd(leaf.firstChild!, leaf.textContent!.length)
+    const selection = window.getSelection()!; selection.removeAllRanges(); selection.addRange(range)
+    act(() => { visual.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: 'Visual edit belongs to first note.' })) })
+    expect(visual.textContent).toContain('Visual edit belongs to first note.')
+    await waitFor(() => expect(mocks.localWriteStarted).toHaveBeenCalledWith(scopeForSession(session), expect.objectContaining({ note: expect.objectContaining({ id: 'first', content: 'Visual edit belongs to first note.' }) })))
+    fireEvent.click(screen.getByRole('button', { name: 'New note' }))
+    await waitFor(() => expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).disabled).toBe(true))
+    expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe('First note')
+    expect(screen.getByRole('textbox', { name: 'Visual content' }).getAttribute('aria-readonly')).toBe('true')
+    await act(async () => { gate.resolve() })
+    await waitFor(() => {
+      const title = screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement
+      expect(title.value).toBe('Untitled note'); expect(title.disabled).toBe(false)
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Note title' }), { target: { value: 'Second note' } })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Markdown content' }), { target: { value: 'Body belongs to second note.' } })
+    panel()
+    fireEvent.click(screen.getByRole('button', { name: 'Download notebook backup' }))
+    await waitFor(() => expect(URL.createObjectURL).toHaveBeenCalledOnce())
+    const blob = vi.mocked(URL.createObjectURL).mock.calls[0][0] as Blob
+    const json = await new Promise<string>(resolve => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.readAsText(blob) })
+    const backup = JSON.parse(json)
+    expect(backup.notes.map((note: Note) => [note.title, note.content]).sort()).toEqual([
+      ['First note', 'Visual edit belongs to first note.'], ['Second note', 'Body belongs to second note.'],
+    ])
+    expect((await cached()).records.map(row => [row.note.title, row.note.content]).sort()).toEqual([
+      ['First note', 'Visual edit belongs to first note.'], ['Second note', 'Body belongs to second note.'],
+    ])
+  })
+
+  it('locks the previous editor while switching notes waits for an outstanding device write', async () => {
+    await open([row('first', 'First note'), row('second', 'Second note')])
+    fireEvent.click(screen.getByRole('button', { name: 'Open note First note' }))
+    await waitFor(() => {
+      const title = screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement
+      expect(title.value).toBe('First note'); expect(title.disabled).toBe(false)
+    })
+    const gate = deferred<void>(); mocks.localWriteGate = gate.promise
+    fireEvent.change(screen.getByRole('textbox', { name: 'Markdown content' }), { target: { value: 'First edit awaiting a device write.' } })
+    await waitFor(() => expect(mocks.localWriteStarted).toHaveBeenCalledWith(scopeForSession(session), expect.objectContaining({ note: expect.objectContaining({ id: 'first', content: 'First edit awaiting a device write.' }) })))
+    fireEvent.click(screen.getByRole('button', { name: 'Open note Second note' }))
+    await waitFor(() => expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).disabled).toBe(true))
+    expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe('First note')
+    expect((screen.getByRole('textbox', { name: 'Markdown content' }) as HTMLTextAreaElement).disabled).toBe(true)
+    await act(async () => { gate.resolve() })
+    await waitFor(() => {
+      const title = screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement
+      expect(title.value).toBe('Second note'); expect(title.disabled).toBe(false)
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Markdown content' }), { target: { value: 'Second edit after navigation.' } })
+    await waitFor(async () => {
+      const records = (await cached()).records
+      expect(records.find(row => row.note.id === 'first')?.note.content).toBe('First edit awaiting a device write.')
+      expect(records.find(row => row.note.id === 'second')?.note.content).toBe('Second edit after navigation.')
+    })
   })
 })

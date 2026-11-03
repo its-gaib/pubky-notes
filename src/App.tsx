@@ -690,7 +690,11 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     } catch (error) { notice(errorMessage(error), true) }
   }
   async function addNote(imported?: { title: string; content: string }) {
+    if (busyRef.current || initializing) return
     const capturedScope = scopeRef.current
+    // Flushes can outlive the click, especially after rapid Visual typing.
+    // Lock the previous editor until the new note is actually selected.
+    busyRef.current = true; setBusy(true)
     try {
       await flushLocal()
       if (scopeRef.current !== capturedScope) return
@@ -702,10 +706,17 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
       navigateToNote(draft.id)
       await persistRecord(row, capturedScope); await setLocalActiveId(capturedScope, draft.id)
     } catch (error) { notice(errorMessage(error), true) }
+    finally { if (scopeRef.current === capturedScope) { busyRef.current = false; setBusy(false) } }
   }
   async function switchNote(id: string) {
     const capturedScope = scopeRef.current
     if (busyRef.current || !recordsRef.current.some(row => row.note.id === id)) return
+    if (id === activeIdRef.current) {
+      setMenuOpen(false)
+      if (id !== exampleId.current) navigateToNote(id, capturedScope); else navigateRoute('/')
+      return
+    }
+    busyRef.current = true; setBusy(true)
     try {
       await flushLocal()
       if (scopeRef.current !== capturedScope || !recordsRef.current.some(row => row.note.id === id)) return
@@ -713,6 +724,7 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
       if (id !== exampleId.current) navigateToNote(id, capturedScope); else navigateRoute('/')
       await setLocalActiveId(capturedScope, id)
     } catch (error) { notice(errorMessage(error), true) }
+    finally { if (scopeRef.current === capturedScope) { busyRef.current = false; setBusy(false) } }
   }
   function openFolder(path: string) {
     if (path && selectedFolder === path && !busyRef.current && !initializing) {

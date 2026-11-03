@@ -176,3 +176,30 @@ test('whole-notebook backup restores private copies with folders and history, an
     expect(portable.folders).toContain('Work/Empty')
   } finally { await other.close() }
 })
+
+test('creating another note while Visual saves are queued preserves both notes in a backup', async ({ page }) => {
+  await page.goto('/')
+  await createNote(page, 'First note', 'Initial first body.')
+  await page.getByRole('button', { name: 'Visual', exact: true }).click()
+  const visual = page.getByRole('textbox', { name: 'Visual content', exact: true })
+  await visual.locator('p').click()
+  await page.keyboard.press('Home')
+  await page.keyboard.press('Shift+End')
+  const firstBody = 'Verified Visual writing while saves are still queued.'
+  await page.keyboard.type(firstBody)
+  await page.getByRole('button', { name: 'Markdown', exact: true }).click()
+  await expect(page.getByRole('textbox', { name: 'Markdown content', exact: true })).toHaveValue(firstBody)
+  await page.getByRole('button', { name: 'Pin note First note', exact: true }).click()
+  // Intentionally start typing as soon as the New note click returns: the old
+  // editor must stay locked until the new identity has actually been selected.
+  await createNote(page, 'Second note', 'Independent second body.')
+  await expect(page.getByRole('textbox', { name: 'Note title', exact: true })).toHaveValue('Second note')
+  const panel = await backupPanel(page)
+  const downloaded = page.waitForEvent('download')
+  await panel.getByRole('button', { name: 'Download notebook backup', exact: true }).click()
+  const file = await downloaded
+  const backup = JSON.parse(await readFile((await file.path())!, 'utf8'))
+  expect(backup.notes).toHaveLength(2)
+  expect(backup.notes.find((note: { title: string }) => note.title === 'First note')?.content).toBe(firstBody)
+  expect(backup.notes.find((note: { title: string }) => note.title === 'Second note')?.content).toBe('Independent second body.')
+})
