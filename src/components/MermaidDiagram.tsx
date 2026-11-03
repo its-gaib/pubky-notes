@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import mermaidAsset from 'mermaid/dist/mermaid.min.js?url'
 import runtimeAsset from './mermaid-runtime.js?url&no-inline'
 import './MermaidDiagram.css'
@@ -96,12 +97,11 @@ function DiagramJob({ source }: { source: string }) {
         <p className="mermaid-loading" role="status">Rendering diagram…</p>
         {runtime && <iframe key="renderer" ref={frame} className="mermaid-renderer" title="Rendering Mermaid diagram" sandbox="allow-scripts" referrerPolicy="no-referrer" srcDoc={runtime} aria-hidden="true" tabIndex={-1} />}
       </>}
-    <details className="mermaid-source"><summary>Diagram source</summary><pre><code>{source}</code></pre></details>
   </div>
 }
 
-export default function MermaidDiagram({ source }: { source: string }) {
+export default function MermaidDiagram({ source, sourceEditor }: { source: string; sourceEditor?: ReactNode }) {
   // Replacing the job also replaces its browsing context. Late messages from a
   // previous note/version can never supply a result for the current source.
-  return <DiagramJob key={source} source={source} />
+  return <><DiagramJob key={source} source={source} /><details className="mermaid-source"><summary>Diagram source</summary><pre><code>{source}</code></pre>{sourceEditor}</details></>
 }

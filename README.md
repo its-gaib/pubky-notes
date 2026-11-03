@@ -4,7 +4,7 @@ A Markdown notebook for Pubky. Built with React, TypeScript and Vite, using the 
 
 ## Run
 
-Requires Node.js 22.12 or later.
+Requires Node.js 22.22.2+, 24.15.0+, or 26+ (matching the supported release lines in `package.json`).
 
 ```sh
 npm ci
@@ -34,11 +34,13 @@ Authentication uses scoped Pubky Ring grant sessions. SDK-managed IndexedDB stor
 
 ## Features and boundaries
 
-Search across all note titles and Markdown content, nested folders, Markdown editing/preview with GFM tables and task lists, formatting tools, `.md` import/export, explicit publish/update/unpublish, and responsive navigation. New notes start with the concise Markdown sample as a template; imported files retain their own content. Search covers all live notes regardless of the selected folder. Use Ctrl/⌘+S to save immediately.
+Search across all note titles and Markdown content, nested folders, Markdown and Visual editing with GFM tables and task lists, formatting tools, `.md` import/export, explicit publish/update/unpublish, and responsive navigation. New notes start with the concise Markdown sample as a template; imported files retain their own content. Search covers all live notes regardless of the selected folder. Use Ctrl/⌘+S to save immediately.
 
-Use **Insert table** in the formatting toolbar to choose rows and columns from a grid, or enter dimensions up to 20 × 20. The row count includes the header. The table is inserted at the current selection as ordinary Markdown and renders in Preview.
+Choose **Markdown** to edit source or **Visual** to edit formatted text directly. Both modes autosave through the same notebook and live collaboration; switching modes preserves the original Markdown. Visual mode supports typing, selections, plain-text paste, undo/redo, formatting tools, table cells, and task checkboxes. Enter starts a paragraph or continues a list; Shift+Enter inserts a line break. To edit a Mermaid diagram, expand **Diagram source** and edit its source field. Public notes and version history remain read only.
 
-Fenced code blocks labeled `mermaid` render as diagrams in Preview, public notes, and version history. For example:
+Use **Insert table** in the formatting toolbar to choose rows and columns from a grid, or enter dimensions up to 20 × 20. The row count includes the header. The table is inserted at the current selection as ordinary Markdown and renders in Visual mode.
+
+Fenced code blocks labeled `mermaid` render as diagrams in Visual mode, public notes, and version history. For example:
 
 ````markdown
 ```mermaid
@@ -47,7 +49,7 @@ flowchart LR
 ```
 ````
 
-Each diagram also has expandable source. Invalid syntax shows an error while preserving the source. Diagram rendering runs in an isolated browser sandbox with external resources and interactive links disabled; note-provided Mermaid configuration directives and frontmatter are unsupported. Preview supports up to 20 diagrams per note, each limited to 20 KB, 500 lines, and 500 edges. Markdown exports retain the original diagram code.
+Each diagram also has expandable source. Invalid syntax shows an error while preserving the source. Diagram rendering runs in an isolated browser sandbox with external resources and interactive links disabled; note-provided Mermaid configuration directives and frontmatter are unsupported. Visual mode supports up to 20 diagrams per note, each limited to 20 KB, 500 lines, and 500 edges. Markdown exports retain the original diagram code.
 
 One sidebar contains the folder and note tree and a search field. Search looks through every live note’s title and Markdown, showing matching notes with their folder ancestors expanded; clearing search restores collapsed folders. The small **Notebook options** menu contains Trash, Markdown import, refresh, and Help. Trash keeps deleted notes recoverable and offers **Back to notes**; switching this view leaves the open editor unchanged. Each note has a muted lock for private notes or a green globe for a published copy, with a tooltip distinguishing unpublished changes or a public copy awaiting removal.
 
@@ -83,7 +85,7 @@ A compact **Active collaborators** bar remains visible while connected, independ
 
 Each participant edits the same Yjs document through ordered WebRTC data channels to the other admitted participants and independently saves the complete merged document under `/priv/notes/<id>.json` on their own homeserver. Folder changes and Trash belong only to that person's copy. Publication remains a separate, explicit action. The footer's **Everyone connected received your edits** means all currently connected participants acknowledged that exact document snapshot persisted on their devices; the existing **Saved to Pubky** status describes your own homeserver.
 
-While people edit the shared Markdown, separate colored cursors and selections show where each collaborator is working. Positions follow the text as concurrent edits merge. The label uses the participant's shared profile display name when available, with a browser connection code as fallback; a name is not verified Pubky identity. Cursor presence is temporary, clears when the participant leaves the editor, and is never saved in a note or sent to a homeserver. All browsers must support the current collaboration handshake.
+While people use Markdown mode to edit a shared note, separate colored cursors and selections show where each collaborator is working. Positions follow the text as concurrent edits merge. The label uses the participant's shared profile display name when available, with a browser connection code as fallback; a name is not verified Pubky identity. Cursor presence is temporary, clears when the participant leaves the editor, and is never saved in a note or sent to a homeserver. All browsers must support the current collaboration handshake.
 
 Connection identity uses SDK custom proofs of possession: the root-signed grant authenticates a delegated key, which signs a fresh challenge bound to both browser keys, sessions, roles, the app/network, and the complete shared-note identity. Both sides verify before admission or document exchange, and reconnects retain the admitted Pubky identity. Proofs stay in encrypted signaling and are never stored in notes. Grant expiry bounds the connection lifetime; the SDK verifies signatures and expiry offline, without querying homeserver revocation. Peer avatars are restricted to public Pubky resources belonging to the verified identity. Sessions without grant proof support must sign in again.
 
@@ -140,7 +142,7 @@ docker run --rm --name pubky-notes-testnet \
 
 The broader suite also covers account isolation and guest adoption, editor saves, folder operations, authorization, pagination, and bounded downloads. Mainnet Ring approval remains a separate manual check; automated tests do not use a user's account.
 
-The SDK version is pinned to 0.16.1. Some linked Pubky agent-skill references target earlier SDK versions; implementation follows installed types and the current template.
+The SDK version is pinned to 0.17.1. Some linked Pubky agent-skill references target earlier SDK versions; implementation follows installed types and the current template.
 
 ## Credits
 

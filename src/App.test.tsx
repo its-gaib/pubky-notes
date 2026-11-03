@@ -226,7 +226,7 @@ describe('private saving and explicit publication', () => {
     expect(content.value).not.toContain('chosen')
     await waitFor(() => expect(content.value.slice(content.selectionStart, content.selectionEnd)).toBe('Header 1'))
     expect(document.activeElement).toBe(content)
-    fireEvent.click(screen.getByRole('button', { name: 'Preview' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Visual' }))
     const table = screen.getByRole('table')
     expect(within(table).getAllByRole('row')).toHaveLength(3)
     expect(within(table).getAllByRole('columnheader')).toHaveLength(4)
@@ -269,7 +269,7 @@ describe('private saving and explicit publication', () => {
     await waitFor(() => expect((screen.getByRole('textbox', { name: 'Note title' }) as HTMLInputElement).value).toBe(savedNote.title))
     expect(screen.queryByRole('textbox', { name: 'Sample Markdown' })).toBeNull()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Write' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Markdown' }))
 
     fireEvent.change(screen.getByRole('textbox', { name: 'Markdown content' }), {
       target: { value: 'A private edit that is not ready for publication.' },

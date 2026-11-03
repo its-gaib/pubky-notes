@@ -209,6 +209,13 @@ button svg { pointer-events: none; }
 .markdown-editor { display: block; width: 100%; min-height: 280px; flex: 1; padding: 0; resize: none; border: 0; border-radius: 0; background: transparent; color: #424958; font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; font-size: 15px; font-weight: 400; line-height: 1.8; tab-size: 2; }
 .markdown-editor::placeholder { color: #bab8c1; }
 .markdown-editor:focus-visible { outline: 0; }
+.visual-editor { flex: 1; min-height: 280px; outline: none; cursor: text; }
+.visual-editor:focus-visible { outline: none; }
+.visual-editor [data-source-start] { white-space: pre-wrap; }
+.visual-editor .visual-placeholder { margin: 0; min-height: 1.8em; }
+.visual-editor .visual-placeholder::before { content: 'Write a note…'; position: absolute; color: #bab8c1; pointer-events: none; }
+.visual-editor[aria-readonly="true"] { cursor: default; }
+.visual-editor .mermaid-source textarea { display: block; width: 100%; min-height: 140px; margin: 12px 0; padding: 12px; resize: vertical; border: 1px solid var(--line); border-radius: 5px; background: #f8f8fa; font-family: "SFMono-Regular", Consolas, monospace; font-size: 13px; line-height: 1.6; }
 .markdown-preview { width: 100%; min-width: 0; color: #424958; font-size: 16px; line-height: 1.8; overflow-wrap: anywhere; }
 .markdown-preview > :first-child { margin-top: 0; }
 .markdown-preview > :last-child { margin-bottom: 0; }

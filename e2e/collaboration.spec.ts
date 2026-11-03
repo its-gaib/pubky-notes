@@ -872,3 +872,30 @@ test('real TURN collaboration keeps syncing beyond the original 600-second crede
   await replacedAllocations(peers, originalConnections)
   await exchange('both original credentials expired at least 15 seconds ago')
 })
+
+test('Visual edits synchronize with a Markdown editor and preserve the caret across incoming edits', async ({ browser, accounts: peers }) => {
+  const alice = await peer(browser); peers.push(alice)
+  const bob = await peer(browser); peers.push(bob)
+  const id = await share(alice.page, bob.page)
+  await alice.page.getByRole('button', { name: 'Visual', exact: true }).click()
+  const visual = alice.page.getByRole('textbox', { name: 'Visual content', exact: true })
+  await visual.getByRole('heading', { name: 'Shared draft', exact: true }).evaluate(heading => {
+    const text = document.createTreeWalker(heading, NodeFilter.SHOW_TEXT).nextNode()!
+    const range = document.createRange()
+    range.setStart(text, text.textContent!.length); range.collapse(true)
+    ;(heading.closest('[contenteditable]') as HTMLElement).focus()
+    const selection = window.getSelection()!
+    selection.removeAllRanges(); selection.addRange(range)
+  })
+  await alice.page.keyboard.insertText(' Visual')
+  const edited = BODY.replace('Shared draft', 'Shared draft Visual')
+  await expect(bob.page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(edited)
+  await insert(bob.page, 'end', '\n\nRemote paragraph.')
+  await expect(visual).toContainText('Remote paragraph.')
+  await alice.page.keyboard.insertText(' again')
+  const merged = edited.replace('Shared draft Visual', 'Shared draft Visual again') + '\n\nRemote paragraph.'
+  await expect(bob.page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(merged)
+  await alice.page.getByRole('button', { name: 'Markdown', exact: true }).click()
+  await expect(alice.page.getByRole('textbox', { name: 'Markdown content' })).toHaveValue(merged)
+  await Promise.all(peers.map(({ page }) => saved(page, id, merged)))
+})
