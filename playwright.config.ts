@@ -2,6 +2,13 @@ import { defineConfig } from '@playwright/test'
 
 export default defineConfig({
   testDir: './e2e',
+  projects: [
+    { name: 'chromium', use: { browserName: 'chromium' as const } },
+    ...(process.env.VISUAL_CROSS_BROWSER === '1' ? [
+      { name: 'firefox', testMatch: '**/visual-enhancements.spec.ts', use: { browserName: 'firefox' as const } },
+      { name: 'webkit', testMatch: '**/visual-enhancements.spec.ts', use: { browserName: 'webkit' as const } },
+    ] : []),
+  ],
   timeout: 90_000,
   expect: { timeout: 20_000 },
   workers: 1,

@@ -4,7 +4,7 @@ import { createContext, useContext, useMemo } from 'react'
 import MermaidDiagram from './MermaidDiagram'
 import { sourceMappedMarkdown } from '../lib/visual-markdown'
 
-export type MarkdownEditing = { source: string; disabled: boolean; replace: (start: number, end: number, text: string) => void }
+export type MarkdownEditing = { source: string; disabled: boolean; replace: (start: number, end: number, text: string) => void; editLink?: (link: HTMLElement) => void }
 const EditingContext = createContext<MarkdownEditing | undefined>(undefined)
 
 type MarkdownNode = { type: string; lang?: string | null; children?: MarkdownNode[]; data?: { hProperties?: Record<string, unknown> } }
@@ -28,7 +28,7 @@ function limitMermaidDiagrams() {
 const components: Components = {
   a: ({ children, href, node: _node, ...props }) => {
     const editing = useContext(EditingContext)
-    return <a {...props} href={href} target="_blank" rel="noopener noreferrer" onClick={editing ? event => { if (!event.ctrlKey && !event.metaKey) event.preventDefault() } : undefined}>{children}</a>
+    return <a {...props} href={href} target="_blank" rel="noopener noreferrer" onClick={editing ? event => { if (!event.ctrlKey && !event.metaKey) { event.preventDefault(); editing.editLink?.(event.currentTarget) } } : undefined}>{children}</a>
   },
   // Remote images can disclose a reader's IP address and private note URLs.
   img: ({ alt }) => <span className="image-placeholder" contentEditable={false}>[Image: {alt || 'external image'} — remote images are not loaded]</span>,

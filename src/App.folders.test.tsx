@@ -95,7 +95,7 @@ describe('sidebar folder management', { timeout: 15_000 }, () => {
     expect(nestedNote.closest('[data-folder-path]')?.getAttribute('data-folder-path')).toBe('Work')
     expect(tree.queryByRole('button', { name: 'Open note Deleted' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Unfiled' })).toBeNull()
-    for (const name of ['All notes', 'Public', 'Private', 'Trash']) expect(screen.queryByRole('button', { name })).toBeNull()
+    for (const name of ['Public', 'Private', 'Trash']) expect(screen.queryByRole('button', { name })).toBeNull()
     expect(screen.getAllByRole('button', { name: 'Open note Second' })).toHaveLength(1)
     fireEvent.click(screen.getByRole('button', { name: 'Collapse folder Work' }))
     expect(tree.queryByRole('button', { name: 'Open note Second' })).toBeNull()

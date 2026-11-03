@@ -47,6 +47,7 @@ export function expandMulticharReferences(source: string): string {
 
 type MarkdownNode = {
   type: string; value?: string; checked?: boolean | null; lang?: string | null
+  url?: string; align?: ('left' | 'right' | 'center' | null)[]
   position?: { start: { offset?: number }; end: { offset?: number } }
   children?: MarkdownNode[]
   data?: { hName?: string; hProperties?: Record<string, unknown>; hChildren?: unknown[] }
@@ -56,12 +57,17 @@ export function sourceMappedMarkdown({ source }: { source: string }) {
   return (tree: MarkdownNode) => {
     function visit(node: MarkdownNode) {
       const start = node.position?.start.offset, end = node.position?.end.offset
-      if ((node.type === 'paragraph' || node.type === 'heading') && end !== undefined && node.children?.length) {
+      // Table edits use the parsed content bounds, excluding cell padding.
+      // Preserve these before adding editable whitespace presentation leaves.
+      const cellContentStart = node.type === 'tableCell' ? node.children?.[0]?.position?.start.offset : undefined
+      const cellContentEnd = node.type === 'tableCell' ? node.children?.at(-1)?.position?.end.offset : undefined
+      if (['paragraph', 'heading', 'tableCell'].includes(node.type) && end !== undefined && node.children?.length) {
         const previous = node.children.at(-1)?.position?.end.offset
-        const tail = previous === undefined ? '' : source.slice(previous, end)
+        const tailEnd = node.type === 'tableCell' && source[end - 1] === '|' ? end - 1 : end
+        const tail = previous === undefined ? '' : source.slice(previous, tailEnd)
         // CommonMark drops spaces at the end of a block. Keep an editable
         // leaf for them so the next keystroke stays after the typed space.
-        if (previous !== undefined && /^[ \t]+$/.test(tail)) node.children.push({ type: 'text', value: tail, position: { start: { offset: previous }, end: { offset: end } } })
+        if (previous !== undefined && /^[ \t]+$/.test(tail)) node.children.push({ type: 'text', value: tail, position: { start: { offset: previous }, end: { offset: tailEnd } } })
       }
       if (node.type === 'listItem' && !node.children?.length && end !== undefined) {
         const position = { start: { offset: end }, end: { offset: end } }
@@ -73,6 +79,19 @@ export function sourceMappedMarkdown({ source }: { source: string }) {
         node.children = [{ type: 'text', value: '\u200b', position }]
       }
       if (start !== undefined && end !== undefined) {
+        if (['heading', 'listItem', 'blockquote'].includes(node.type)) {
+          node.data ??= {}
+          node.data.hProperties = { ...node.data.hProperties, 'data-block-start': start, 'data-block-end': end }
+        }
+        if (node.type === 'table' || node.type === 'tableRow' || node.type === 'tableCell') {
+          node.data ??= {}
+          node.data.hProperties = { ...node.data.hProperties, 'data-table-start': start, 'data-table-end': end }
+          if (node.type === 'table') node.data.hProperties['data-table-align'] = JSON.stringify(node.align ?? [])
+          if (node.type === 'tableCell') {
+            node.data.hProperties['data-cell-start'] = cellContentStart ?? end
+            node.data.hProperties['data-cell-end'] = cellContentEnd ?? end
+          }
+        }
         if (node.type === 'text' || node.type === 'inlineCode' || node.type === 'code') {
           let from = start, to = end
           const raw = source.slice(start, end)
@@ -93,9 +112,13 @@ export function sourceMappedMarkdown({ source }: { source: string }) {
           if (node.type === 'inlineCode' || node.type === 'code') Object.assign(node.data.hProperties, { 'data-format-start': start, 'data-format-end': end })
           // Preserve original text-node whitespace instead of HAST's trimLines.
           if (node.type === 'text') node.data.hChildren = [{ type: 'text', value: node.value ?? '' }]
-        } else if (['strong', 'emphasis', 'delete', 'link'].includes(node.type)) {
+        } else if (['strong', 'emphasis', 'delete', 'link', 'linkReference'].includes(node.type)) {
           node.data ??= {}
-          node.data.hProperties = { ...node.data.hProperties, 'data-format-start': start, 'data-format-end': end }
+          node.data.hProperties = { ...node.data.hProperties, 'data-format-start': start, 'data-format-end': end, 'data-format-kind': node.type }
+          if (node.type === 'link' || node.type === 'linkReference') {
+            node.data.hProperties['data-link-label-start'] = node.children?.[0]?.position?.start.offset ?? start + 1
+            node.data.hProperties['data-link-label-end'] = node.children?.at(-1)?.position?.end.offset ?? start + 1
+          }
         } else if (node.type === 'listItem' && typeof node.checked === 'boolean') {
           node.data ??= {}
           node.data.hProperties = { ...node.data.hProperties, 'data-task-start': start, 'data-task-end': end }

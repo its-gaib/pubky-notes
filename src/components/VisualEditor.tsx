@@ -1,10 +1,18 @@
 import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from 'react'
 import Markdown from './Markdown'
+import VisualLinkEditor from './VisualLinkEditor'
+import type { LinkDraft } from './VisualLinkEditor'
+import { markdownTable } from './TablePicker'
+import { changeTable, linkMarkdown, tableModel, TABLE_LIMIT } from '../lib/visual-tools'
+import type { InlineFormat, TableAction } from '../lib/visual-tools'
+export { default as VisualEditorToolbar } from './VisualEditorToolbar'
 import { expandMulticharReferences, paragraphInsertion, plainOffsets, renderedOffsets } from '../lib/visual-markdown'
 
 type Selection = { start: number; end: number }
-export type VisualEditorHandle = { selection: () => Selection; select: (start: number, end?: number) => void; apply: (content: string, start: number, end?: number) => boolean; format: (before: string, after: string) => void }
-type Props = { content: string; disabled: boolean; onChange: (content: string) => boolean; onSelection?: (selection: Selection | null) => void }
+export type VisualEditorState = { bold: boolean; italic: boolean; code: boolean; heading: boolean; list: boolean; quote: boolean; link: boolean; table: boolean; headerCell: boolean; canAddRow: boolean; canAddColumn: boolean }
+export const EMPTY_VISUAL_EDITOR_STATE: VisualEditorState = { bold: false, italic: false, code: false, heading: false, list: false, quote: false, link: false, table: false, headerCell: false, canAddRow: false, canAddColumn: false }
+export type VisualEditorHandle = { selection: () => Selection; select: (start: number, end?: number) => void; apply: (content: string, start: number, end?: number) => boolean; format: (before: string, after: string) => void; rememberSelection: () => void; toggleFormat: (format: InlineFormat) => void; openLinkEditor: () => void; insertTable: (rows: number, columns: number) => void; tableAction: (action: TableAction) => void }
+type Props = { content: string; disabled: boolean; onChange: (content: string) => boolean; onSelection?: (selection: Selection | null) => void; onStateChange?: (state: VisualEditorState) => void }
 type Checkpoint = { content: string; selection: Selection }
 
 function leaves(root: HTMLElement) { return [...(root.matches('[data-source-start]') ? [root] : []), ...root.querySelectorAll<HTMLElement>('[data-source-start]')] }
@@ -57,14 +65,18 @@ function restoreSelection(root: HTMLElement, content: string, selected: Selectio
 
 /** Edits the canonical Markdown through its rendered leaf positions. The DOM
  * is never serialized and clipboard HTML never enters the note or renderer. */
-const VisualEditor = forwardRef<VisualEditorHandle, Props>(function VisualEditor({ content, disabled, onChange, onSelection }, handle) {
+const VisualEditor = forwardRef<VisualEditorHandle, Props>(function VisualEditor({ content, disabled, onChange, onSelection, onStateChange }, handle) {
   const root = useRef<HTMLDivElement>(null)
-  const current = useRef({ content, disabled, onChange, onSelection })
+  const current = useRef({ content, disabled, onChange, onSelection, onStateChange })
   const remembered = useRef<Selection>({ start: content.length, end: content.length })
   const pending = useRef<Selection | undefined>(undefined)
   const undo = useRef<Checkpoint[]>([]), redo = useRef<Checkpoint[]>([])
   const composing = useRef<{ content: string; selection: Selection } | undefined>(undefined)
   const [generation, setGeneration] = useState(0)
+  const [linkDraft, setLinkDraft] = useState<LinkDraft | null>(null)
+  const [toolError, setToolError] = useState('')
+  const stateKey = useRef('')
+  const capturedTable = useRef<{ source: string; selection: Selection } | null>(null)
   if (content !== current.current.content && !pending.current) {
     if (root.current && root.current.contains(document.activeElement) && !(document.activeElement instanceof HTMLTextAreaElement) && !(document.activeElement instanceof HTMLInputElement)) {
       const selected = readSelection(root.current, current.current.content)
@@ -77,7 +89,7 @@ const VisualEditor = forwardRef<VisualEditorHandle, Props>(function VisualEditor
     // restoring a stale document snapshot.
     undo.current = []; redo.current = []
   }
-  current.current = { content, disabled, onChange, onSelection }
+  current.current = { content, disabled, onChange, onSelection, onStateChange }
 
   function selection() { return (root.current && readSelection(root.current, current.current.content)) || remembered.current }
   function select(start: number, end = start) {
@@ -86,18 +98,125 @@ const VisualEditor = forwardRef<VisualEditorHandle, Props>(function VisualEditor
     if (root.current) restoreSelection(root.current, current.current.content, remembered.current)
     current.current.onSelection?.(remembered.current)
   }
-  useImperativeHandle(handle, () => ({ selection, select,
-    apply: (value, start, end = start) => commit(value, { start, end }),
-    format: (before, after) => {
-      const { start, end } = selection(), value = current.current.content
-      // An empty `- ` directly after prose is a Setext heading underline,
-      // not a list. Separate the blocks before placing the list caret.
-      const prefix = before === '\n- ' && start > 0 && value[start - 1] !== '\n' ? '\n' + before : before
-      const selected = value.slice(start, end) || (after ? before === '[' ? 'link' : 'text' : '')
-      commit(value.slice(0, start) + prefix + selected + after + value.slice(end), { start: start + prefix.length, end: start + prefix.length + selected.length })
-      root.current?.focus()
-    },
-  }))
+  function formatNode(tag: string, selected = selection()) {
+    return [...(root.current?.querySelectorAll<HTMLElement>(`${tag}[data-format-start]`) ?? [])].reverse().find(node => {
+      const mapped = leaves(node)
+      return mapped.length && selected.start >= Number(mapped[0].dataset.sourceStart) && selected.end <= Number(mapped.at(-1)!.dataset.sourceEnd)
+    })
+  }
+  function blockNode(tag: string, selected = selection()) {
+    return [...(root.current?.querySelectorAll<HTMLElement>(tag) ?? [])].reverse().find(node => selected.start >= Number(node.dataset.blockStart) && selected.end <= Number(node.dataset.blockEnd))
+  }
+  function selectedTable(selected = selection()) {
+    return [...(root.current?.querySelectorAll<HTMLTableElement>('table[data-table-start]') ?? [])].find(node => selected.start >= Number(node.dataset.tableStart) && selected.end <= Number(node.dataset.tableEnd))
+  }
+  function refreshState() {
+    const selected = selection(), table = selectedTable(selected)
+    const model = table ? tableModel(table, current.current.content, selected.start) : undefined
+    const state: VisualEditorState = {
+      bold: !!formatNode('strong', selected), italic: !!formatNode('em', selected), code: !!formatNode('code', selected),
+      heading: !!blockNode('h1,h2,h3,h4,h5,h6', selected), list: !!blockNode('li', selected), quote: !!blockNode('blockquote', selected),
+      link: !!formatNode('a', selected), table: !!model, headerCell: model?.row === 0,
+      canAddRow: !!model && model.rows.length < TABLE_LIMIT, canAddColumn: !!model && model.rows[0].length < TABLE_LIMIT,
+    }
+    const key = JSON.stringify(state)
+    if (key !== stateKey.current) { stateKey.current = key; current.current.onStateChange?.(state) }
+  }
+  function rememberSelection() {
+    remembered.current = selection()
+    capturedTable.current = { source: current.current.content, selection: remembered.current }
+    refreshState()
+  }
+  function format(before: string, after: string) {
+    const { start, end } = selection(), value = current.current.content
+    const prefix = before === '\n- ' && start > 0 && value[start - 1] !== '\n' ? '\n' + before : before
+    const selected = value.slice(start, end) || (after ? before === '[' ? 'link' : 'text' : '')
+    commit(value.slice(0, start) + prefix + selected + after + value.slice(end), { start: start + prefix.length, end: start + prefix.length + selected.length })
+    root.current?.focus()
+  }
+  function toggleFormat(kind: InlineFormat) {
+    if (current.current.disabled) return
+    const selected = selection(), value = current.current.content
+    const tag = kind === 'bold' ? 'strong' : kind === 'italic' ? 'em' : kind === 'code' ? 'code' : ''
+    const existing = tag ? formatNode(tag, selected) : undefined
+    if (existing) {
+      const start = Number(existing.dataset.formatStart), end = Number(existing.dataset.formatEnd)
+      const raw = value.slice(start, end)
+      const size = kind === 'code' ? raw.match(/^`+/)?.[0].length ?? 1 : kind === 'bold' ? 2 : 1
+      commit(value.slice(0, start) + raw.slice(size, -size) + value.slice(end), { start: Math.max(start, selected.start - size), end: Math.max(start, selected.end - size) })
+      root.current?.focus(); return
+    }
+    if (kind === 'heading' || kind === 'list' || kind === 'quote') {
+      const lineStart = value.lastIndexOf('\n', selected.start - 1) + 1
+      const marker = kind === 'heading' ? /^ {0,3}#{1,6} +/ : kind === 'list' ? /^[ \t]*(?:[-+*]|\d+[.)]) +/ : /^ {0,3}> ?/
+      const found = value.slice(lineStart).match(marker)
+      if (found) {
+        commit(value.slice(0, lineStart) + value.slice(lineStart + found[0].length), { start: Math.max(lineStart, selected.start - found[0].length), end: Math.max(lineStart, selected.end - found[0].length) })
+        root.current?.focus(); return
+      }
+    }
+    if (kind === 'bold') format('**', '**')
+    else if (kind === 'italic') format('_', '_')
+    else if (kind === 'code') format('`', '`')
+    else if (kind === 'heading') format('\n## ', '')
+    else if (kind === 'list') format('\n- ', '')
+    else format('\n> ', '')
+  }
+  function openLinkEditor(element?: HTMLElement) {
+    if (current.current.disabled) return
+    const selected = selection(), node = element ?? formatNode('a', selected), value = current.current.content
+    remembered.current = selected
+    const labelStart = node ? Number(node.dataset.linkLabelStart) : selected.start
+    const labelEnd = node ? Number(node.dataset.linkLabelEnd) : selected.end
+    setLinkDraft({ source: value, start: node ? Number(node.dataset.formatStart) : selected.start, end: node ? Number(node.dataset.formatEnd) : selected.end,
+      label: node?.textContent?.replace(/\u200b/g, '') ?? window.getSelection()?.toString() ?? value.slice(selected.start, selected.end),
+      rawLabel: value.slice(labelStart, labelEnd), href: node?.getAttribute('href') ?? '', existing: !!node })
+  }
+  function closeLinkEditor() { setLinkDraft(null); select(remembered.current.start, remembered.current.end) }
+  function saveLink(label: string, href: string) {
+    if (!linkDraft || current.current.disabled) return
+    if (linkDraft.source !== current.current.content) { setLinkDraft(null); setToolError('The note changed. Select the link again.'); return }
+    const labelSource = label === linkDraft.label ? linkDraft.rawLabel || label : label
+    const markdown = linkMarkdown(labelSource, href, label === linkDraft.label && !!linkDraft.rawLabel)
+    const at = linkDraft.start
+    setLinkDraft(null)
+    commit(current.current.content.slice(0, at) + markdown + current.current.content.slice(linkDraft.end), { start: at + 1, end: at + 1 + labelSource.length })
+    root.current?.focus()
+  }
+  function removeLink() {
+    if (!linkDraft || current.current.disabled || linkDraft.source !== current.current.content) { setLinkDraft(null); return }
+    const at = linkDraft.start
+    setLinkDraft(null)
+    commit(current.current.content.slice(0, at) + linkDraft.rawLabel + current.current.content.slice(linkDraft.end), { start: at, end: at + linkDraft.rawLabel.length })
+    root.current?.focus()
+  }
+  function insertTable(rows: number, columns: number) {
+    if (current.current.disabled) return
+    const captured = capturedTable.current
+    if (captured && captured.source !== current.current.content) { setToolError('The note changed. Choose the insertion point again.'); return }
+    const selected = captured?.selection ?? selection(), value = current.current.content
+    capturedTable.current = null
+    const text = markdownTable(rows, columns), before = value.slice(0, selected.start), after = value.slice(selected.end)
+    const leading = before && !before.endsWith('\n\n') ? '\n\n' : '', trailing = after && !after.startsWith('\n\n') ? '\n\n' : ''
+    const at = before.length + leading.length + 2
+    commit(before + leading + text + trailing + after, { start: at, end: at + 8 })
+    root.current?.focus()
+  }
+  function tableAction(action: TableAction, firstColumn = false) {
+    if (current.current.disabled) return
+    const selected = selection(), table = selectedTable(selected)
+    if (!table) return
+    const value = current.current.content, model = tableModel(table, value, selected.start)
+    if (!model) return
+    if (firstColumn) model.column = 0
+    try {
+      const result = changeTable(model, action)
+      commit(value.slice(0, model.start) + result.text + value.slice(model.end), { start: model.start + result.start, end: model.start + result.end })
+      root.current?.focus(); setToolError('')
+    } catch (error) { setToolError(error instanceof Error ? error.message : 'Unable to update the table.') }
+  }
+  useImperativeHandle(handle, () => ({ selection, select, apply: (value, start, end = start) => commit(value, { start, end }), format, rememberSelection, toggleFormat, openLinkEditor, insertTable, tableAction }))
+  useEffect(() => { if (linkDraft && (linkDraft.source !== content || disabled)) setLinkDraft(null) }, [content, disabled, linkDraft])
 
   function commit(value: string, selected: Selection, history = true, restore = true) {
     const state = current.current
@@ -200,6 +319,7 @@ const VisualEditor = forwardRef<VisualEditorHandle, Props>(function VisualEditor
       current.current.onSelection?.(pending.current)
       pending.current = undefined
     }
+    refreshState()
   }, [content, generation])
 
   useEffect(() => {
@@ -230,6 +350,16 @@ const VisualEditor = forwardRef<VisualEditorHandle, Props>(function VisualEditor
     }
     function keydown(event: KeyboardEvent) {
       if (nested(event) || event.isComposing) return
+      if (event.key === 'Tab') {
+        const cell = window.getSelection()?.anchorNode?.parentElement?.closest('td, th')
+        if (cell && element.contains(cell)) {
+          const table = cell.closest('table')!, cells = [...table.querySelectorAll('td, th')], index = cells.indexOf(cell)
+          const next = cells[index + (event.shiftKey ? -1 : 1)]
+          if (next) { event.preventDefault(); const leaf = next.querySelector<HTMLElement>('[data-source-start]'); if (leaf) select(Number(leaf.dataset.sourceStart), Number(leaf.dataset.sourceEnd)) }
+          else if (!event.shiftKey && cells.length && table.rows.length < TABLE_LIMIT) { event.preventDefault(); tableAction('row-after', true) }
+        }
+        return
+      }
       if ((event.ctrlKey || event.metaKey) && !event.altKey) {
         if (event.key.toLowerCase() === 'a') {
           event.preventDefault()
@@ -239,11 +369,8 @@ const VisualEditor = forwardRef<VisualEditorHandle, Props>(function VisualEditor
           event.preventDefault(); history(event.key.toLowerCase() === 'z' && !event.shiftKey)
         } else if (['b', 'i', 'k'].includes(event.key.toLowerCase())) {
           event.preventDefault()
-          const selected = selection(), text = current.current.content.slice(selected.start, selected.end) || 'text'
-          const marker = event.key.toLowerCase() === 'b' ? '**' : event.key.toLowerCase() === 'i' ? '_' : '['
-          const after = marker === '[' ? '](https://)' : marker
-          replace(selected.start, selected.end, marker + text + after)
-          pending.current = { start: selected.start + marker.length, end: selected.start + marker.length + text.length }
+          if (event.key.toLowerCase() === 'k') openLinkEditor()
+          else toggleFormat(event.key.toLowerCase() === 'b' ? 'bold' : 'italic')
         }
       }
     }
@@ -282,7 +409,7 @@ const VisualEditor = forwardRef<VisualEditorHandle, Props>(function VisualEditor
     function changed() {
       if (!element.contains(document.activeElement) || composing.current) return
       const selected = readSelection(element, current.current.content)
-      if (selected) { remembered.current = selected; current.current.onSelection?.(selected) }
+      if (selected) { remembered.current = selected; current.current.onSelection?.(selected); refreshState() }
     }
     function blur(event: FocusEvent) { if (!element.contains(event.relatedTarget as Node | null)) current.current.onSelection?.(null) }
     element.addEventListener('beforeinput', beforeInput)
@@ -298,8 +425,8 @@ const VisualEditor = forwardRef<VisualEditorHandle, Props>(function VisualEditor
     }
   }, [])
 
-  return <div ref={root} className="visual-editor" role="textbox" aria-label="Visual content" aria-multiline="true" aria-readonly={disabled} contentEditable={!disabled} suppressContentEditableWarning spellCheck>
-    {content ? <><Markdown key={generation} content={content} editing={{ source: content, disabled, replace: (start, end, text) => replace(start, end, text, true) }} />{(content.endsWith('\n') || /\n[ \t]*\n[ \t]*$/.test(content) || /^\s+$/.test(content)) && <p><span data-source-start={content.length} data-source-end={content.length}>{'\u200b'}</span></p>}</> : <p className="visual-placeholder"><span data-source-start="0" data-source-end="0">{'\u200b'}</span></p>}
-  </div>
+  return <>{toolError && <p className="visual-tool-error" role="alert">{toolError}</p>}{linkDraft && <VisualLinkEditor draft={linkDraft} close={closeLinkEditor} save={saveLink} remove={removeLink} />}<div ref={root} className="visual-editor" role="textbox" aria-label="Visual content" aria-multiline="true" aria-readonly={disabled} contentEditable={!disabled} suppressContentEditableWarning spellCheck>
+    {content ? <><Markdown key={generation} content={content} editing={{ source: content, disabled, replace: (start, end, text) => replace(start, end, text, true), editLink: openLinkEditor }} />{(content.endsWith('\n') || /\n[ \t]*\n[ \t]*$/.test(content) || /^\s+$/.test(content)) && <p><span data-source-start={content.length} data-source-end={content.length}>{'\u200b'}</span></p>}</> : <p className="visual-placeholder"><span data-source-start="0" data-source-end="0">{'\u200b'}</span></p>}
+  </div></>
 })
 export default VisualEditor

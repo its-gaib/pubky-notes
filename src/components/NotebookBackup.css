@@ -1,0 +1,18 @@
+.notebook-backup { display: grid; gap: 22px; }
+.notebook-backup section + section { border-top: 1px solid var(--line); padding-top: 20px; }
+.notebook-backup h3 { margin: 0 0 8px; font-size: 16px; }
+.notebook-backup p { margin: 8px 0 12px; }
+.notebook-backup .backup-option { display: flex; align-items: center; gap: 8px; margin: 8px 0; font-size: 14px; }
+.notebook-backup .backup-option input { width: 16px; height: 16px; margin: 0; accent-color: #7062a9; }
+.backup-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.backup-actions .button { justify-content: center; }
+.notebook-backup input.backup-file-input[type="file"] { display: none; }
+.backup-plan { margin-top: 16px; padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: #fbfafe; }
+.backup-plan h4 { margin: 0; }
+.backup-preview-list { list-style: none; margin: 12px 0; padding: 0; max-height: 180px; overflow: auto; }
+.backup-preview-list li { display: flex; flex-wrap: wrap; gap: 6px 10px; margin: 7px 0; overflow-wrap: anywhere; font-size: 13px; }
+.backup-preview-list strong { font-weight: 500; }
+.backup-preview-list span { color: #85828e; }
+.backup-progress { display: flex; align-items: center; gap: 8px; color: #77717f; font-size: 13px; }
+.backup-result { color: #466249; font-size: 14px; }
+@media (max-width: 540px) { .backup-actions > .button { width: 100%; } .backup-plan { padding: 12px; } }
