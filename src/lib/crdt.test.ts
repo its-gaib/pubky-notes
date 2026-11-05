@@ -8,6 +8,25 @@ import type { CrdtNote } from './crdt'
 const fixture = (): CrdtNote => ({ id: 'note-1', title: 'A note', content: 'First line\nLast line', createdAt: '2026-10-14T10:00:00.000Z', updatedAt: '2026-10-14T10:00:00.000Z' })
 
 describe('note CRDT', () => {
+  it('validates identical merge inputs even after their valid state was cached', () => {
+    const base = initializeNote(fixture())
+    const cached = validateCrdtNote(base)
+    cached.title = 'Caller mutation'
+    cached.crdt!.update = 'AAAA'
+    expect(validateCrdtNote(base)).toEqual(base)
+    const tampered = { ...base, content: 'Snapshot tampering' }
+    expect(() => mergeNotes(tampered, tampered)).toThrow('does not match')
+    expect(() => validateCrdtNote({ ...base, crdt: { ...base.crdt!, update: 'AAAA' } })).toThrow()
+    expect(validateCrdtNote(base)).toEqual(base)
+  })
+
+  it('preserves the latest timestamp when identical editing states merge', () => {
+    const base = initializeNote(fixture())
+    const later = { ...base, updatedAt: '2026-10-15T10:00:00.000Z' }
+    expect(mergeNotes(base, later)).toEqual(later)
+    expect(mergeNotes(later, base)).toEqual(later)
+  })
+
   it('merges independent text changes in either order without dropping either edit', () => {
     const base = initializeNote(fixture())
     const left = editNote(base, { content: 'First line changed\nLast line' })

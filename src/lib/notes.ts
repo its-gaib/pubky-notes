@@ -19,6 +19,7 @@ const DOWNLOAD_CONCURRENCY = 5
 const LOCK_SECONDS = 60
 type StorageSpace = keyof typeof APP_PATHS
 type Locks = Record<StorageSpace, StorageLock>
+const lockExpirations = new WeakMap<StorageLock, number>()
 
 export function createNote(text: Partial<Pick<Note, 'title' | 'content' | 'folder'>> = {}): Note {
   const now = new Date().toISOString()
@@ -249,7 +250,9 @@ async function withLocks<T>(session: Session, id: string, action: (locks: Locks)
   const locks = {} as Locks
   try {
     for (const space of ['private', 'public'] as const) {
+      const startedAt = performance.now()
       const lock = await session.storage.lock(notePath(space, id), LOCK_SECONDS)
+      rememberLockLifetime(lock, startedAt)
       acquired.push(lock)
       locks[space] = lock
     }
@@ -268,8 +271,23 @@ async function withLocks<T>(session: Session, id: string, action: (locks: Locks)
 }
 
 async function renew(session: Session, locks: Locks): Promise<void> {
-  await session.storage.refreshLock(locks.private, LOCK_SECONDS)
-  await session.storage.refreshLock(locks.public, LOCK_SECONDS)
+  for (const lock of [locks.private, locks.public]) {
+    const expires = lockExpirations.get(lock)
+    const lifetime = lock.timeoutSeconds * 1000
+    const margin = Math.min(5000, lifetime / 2)
+    if (expires !== undefined && Number.isFinite(lifetime) && lifetime > 0 && performance.now() < expires - margin) continue
+    const startedAt = performance.now()
+    await session.storage.refreshLock(lock, LOCK_SECONDS)
+    rememberLockLifetime(lock, startedAt)
+  }
+}
+
+function rememberLockLifetime(lock: StorageLock, startedAt: number): void {
+  // Use the actual granted lifetime, conservatively charging request time to
+  // the lease as well. Unknown lifetimes renew rather than assuming 60 seconds.
+  if (Number.isFinite(lock.timeoutSeconds) && lock.timeoutSeconds > 0) {
+    lockExpirations.set(lock, startedAt + lock.timeoutSeconds * 1000)
+  } else lockExpirations.delete(lock)
 }
 
 async function deleteLockedIfPresent(session: Session, lock: StorageLock): Promise<void> {

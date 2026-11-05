@@ -73,6 +73,20 @@ describe('quick note switcher', () => {
     expect(screen.getByRole('combobox').hasAttribute('aria-activedescendant')).toBe(false)
   })
 
+  it('bounds rendered results while keeping every matching note reachable', () => {
+    const records = Array.from({ length: 205 }, (_, index) => ({ ...rows[1], note: { ...rows[1].note, id: `note-${index}`, title: `Result ${String(index).padStart(3, '0')}` } }))
+    const open = vi.fn()
+    render(<QuickSwitcher records={records} navigation={{ pinned: [], recent: [] }} onOpen={open} onClose={() => {}} />)
+    expect(screen.getAllByRole('option')).toHaveLength(100)
+    fireEvent.click(screen.getByRole('button', { name: 'Show more results (100 of 205)' }))
+    expect(screen.getAllByRole('option')).toHaveLength(200)
+    fireEvent.click(screen.getByRole('button', { name: 'Show more results (200 of 205)' }))
+    expect(screen.getAllByRole('option')).toHaveLength(205)
+    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'End' })
+    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Enter' })
+    expect(open).toHaveBeenCalledExactlyOnceWith('note-204')
+  })
+
   it('exposes highlighted source characters only as text', () => {
     const { container } = render(<HighlightedText parts={[{ text: '<b>literal</b>', match: true }, { text: ' plain', match: false }]} />)
     expect(container.textContent).toBe('<b>literal</b> plain')

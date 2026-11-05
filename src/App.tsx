@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useDeferredValue, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, DragEvent, ReactNode } from 'react'
 import type { JsonValue, Session } from '@synonymdev/pubky'
 import QRCode from 'qrcode'
@@ -13,6 +13,7 @@ import { materializeNotebookImport } from './lib/notebook-backup'
 import type { NotebookImportPlan, NotebookExportSnapshot } from './lib/notebook-backup'
 import QuickSwitcher, { HighlightedText } from './components/QuickSwitcher'
 import { searchNotes } from './lib/note-search'
+import { startBackgroundRefresh } from './lib/background-refresh'
 import { readNoteNavigation, writeNoteNavigation, rememberNote, toggleNotePin, sortNavigableNotes } from './lib/note-navigation'
 import type { NoteNavigation } from './lib/note-navigation'
 import TablePicker, { markdownTable } from './components/TablePicker'
@@ -74,8 +75,8 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : 'Something went wrong. Please try again.'
 }
 function dateLabel(value: string) { return new Date(value).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) }
-function historyKey(scope: string, note: Note) { return JSON.stringify([scope, note.id, note.createdAt, note.crdt?.lineage]) }
-function sameHistory(left: Note, right: Note) { return left.id === right.id && left.createdAt === right.createdAt && left.crdt?.lineage === right.crdt?.lineage }
+function historyKey(scope: string, note: Note) { return JSON.stringify([scope, note.id, note.createdAt, note.crdt?.lineage, note.crdt?.version]) }
+function sameHistory(left: Note, right: Note) { return left.id === right.id && left.createdAt === right.createdAt && left.crdt?.lineage === right.crdt?.lineage && left.crdt?.version === right.crdt?.version }
 function download(note: Note) {
   const blob = new Blob([`# ${note.title || 'Untitled note'}\n\n${note.content}`], { type: 'text/markdown;charset=utf-8' })
   const url = URL.createObjectURL(blob)
@@ -211,6 +212,8 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   const scopeRef = useRef(scope); scopeRef.current = scope
   const activeIdRef = useRef(activeId); activeIdRef.current = activeId
   const exampleId = useRef<string | null>(records[0]?.note.id ?? null)
+  const checkpointCandidates = useRef(new Set<string>())
+  const checkpointScope = useRef(scope)
   const dirtyLocal = useRef(new Map<string, { scope: string; record: NoteRecord }>())
   const dirtyFolders = useRef<{ scope: string; folders: string[] } | null>(null)
   const folderVersion = useRef(0)
@@ -301,7 +304,18 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   }, [])
 
   const replaceRecords = useCallback((next: NoteRecord[]) => {
+    const sameScope = checkpointScope.current === scopeRef.current
+    if (!sameScope) { checkpointCandidates.current.clear(); checkpointScope.current = scopeRef.current }
     const previous = recordsRef.current
+    const previousNotes = new Map((sameScope ? previous : []).map(row => [historyKey(scopeRef.current, row.note), row.note]))
+    const nextKeys = new Set<string>()
+    for (const row of next) {
+      if (row.note.id === exampleId.current) continue
+      const key = historyKey(scopeRef.current, row.note), before = previousNotes.get(key)
+      nextKeys.add(key)
+      if (!before || before.title !== row.note.title || before.content !== row.note.content) checkpointCandidates.current.add(key)
+    }
+    for (const key of checkpointCandidates.current) if (!nextKeys.has(key)) checkpointCandidates.current.delete(key)
     if (previous.length === next.length && previous.every((row, index) => {
       const other = next[index]
       return row.note.id === other.note.id && row.note.updatedAt === other.note.updatedAt && noteRevision(row.note) === noteRevision(other.note) && JSON.stringify(row.published) === JSON.stringify(other.published)
@@ -450,9 +464,11 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     const capturedScope = scopeRef.current
     const changed: NoteRecord[] = []
     const next = recordsRef.current.map(row => {
-      if (row.note.id === exampleId.current) return row
+      const key = historyKey(capturedScope, row.note)
+      if (row.note.id === exampleId.current || !checkpointCandidates.current.has(key)) return row
       try {
         const checkpointed = collaboration.checkpoint(row.note)
+        checkpointCandidates.current.delete(key)
         if (noteRevision(checkpointed) === noteRevision(row.note)) return row
         const updated = { ...row, note: checkpointed }
         changed.push(updated)
@@ -626,11 +642,17 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
   }, [records, explicitFolders, session, initializing, busy, needsSync, sync, notice])
   useEffect(() => {
     if (!session) return
-    const update = () => { if (document.visibilityState !== 'hidden' && !busyRef.current) void sync(true, true).catch(() => undefined) }
-    const interval = setInterval(update, 20_000)
-    window.addEventListener('online', update); window.addEventListener('focus', update)
-    document.addEventListener('visibilitychange', update)
-    return () => { clearInterval(interval); window.removeEventListener('online', update); window.removeEventListener('focus', update); document.removeEventListener('visibilitychange', update) }
+    const polling = startBackgroundRefresh({
+      canRefresh: () => document.visibilityState !== 'hidden' && !busyRef.current,
+      refresh: async () => {
+        const before = recordsRef.current
+        await sync(true, true)
+        return recordsRef.current !== before
+      },
+    })
+    window.addEventListener('online', polling.wake); window.addEventListener('focus', polling.wake)
+    document.addEventListener('visibilitychange', polling.wake)
+    return () => { polling.stop(); window.removeEventListener('online', polling.wake); window.removeEventListener('focus', polling.wake); document.removeEventListener('visibilitychange', polling.wake) }
   }, [session, sync])
   useEffect(() => {
     const warn = (event: BeforeUnloadEvent) => {
@@ -1217,30 +1239,35 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
     navigateRoute('/')
   }
   const liveRecords = useMemo(() => records.filter(row => !row.note.deleted), [records])
-  // Keep complete paths for move destinations and validation. Search only prunes
-  // the rendered tree, and never changes folder selection or collapse settings.
-  const paths = folderPaths(liveRecords, explicitFolders)
-  const searching = !!query.trim()
+  const paths = useMemo(() => folderPaths(liveRecords, explicitFolders), [liveRecords, explicitFolders])
+  const deferredQuery = useDeferredValue(query)
+  const searching = !!deferredQuery.trim()
   const viewRecords = useMemo(() => notebookView === 'trash' ? records.filter(row => row.note.deleted) : liveRecords, [records, liveRecords, notebookView])
-  const searchMatches = useMemo(() => searching ? searchNotes(viewRecords, query) : [], [viewRecords, query, searching])
-  const matchesById = new Map(searchMatches.map(match => [match.row.note.id, match]))
-  const matchingRecords = searching ? searchMatches.map(match => match.row)
+  const searchMatches = useMemo(() => searching ? searchNotes(viewRecords, deferredQuery) : [], [viewRecords, deferredQuery, searching])
+  const matchesById = useMemo(() => new Map(searchMatches.map(match => [match.row.note.id, match])), [searchMatches])
+  const matchingRecords = useMemo(() => searching ? searchMatches.map(match => match.row)
     : notebookView === 'trash' ? [...viewRecords].sort((a, b) => a.note.title.localeCompare(b.note.title))
       : noteView === 'pinned' ? sortNavigableNotes(liveRecords.filter(row => navigation.pinned.includes(row.note.id)), navigation, 'recent')
         : noteView === 'recent' ? sortNavigableNotes(liveRecords.filter(row => row.note.id !== exampleId.current), { ...navigation, pinned: [] }, 'recent').slice(0, 100)
-          : sortNavigableNotes(liveRecords, navigation, 'title')
+          : sortNavigableNotes(liveRecords, navigation, 'title'), [searching, searchMatches, notebookView, viewRecords, noteView, liveRecords, navigation])
+  const [searchLimit, setSearchLimit] = useState(100)
+  useEffect(() => setSearchLimit(100), [deferredQuery, notebookView])
+  const displayedRecords = useMemo(() => searching ? matchingRecords.slice(0, searchLimit) : matchingRecords, [searching, matchingRecords, searchLimit])
   const flatNoteList = notebookView === 'trash' || (!searching && noteView !== 'all')
-  const renderedPaths = searching ? folderPaths(matchingRecords) : paths
-  const childFolders = new Map<string, string[]>()
-  const childNotes = new Map<string, NoteRecord[]>()
-  for (const path of renderedPaths) {
-    const parent = path.split('/').slice(0, -1).join('/')
-    childFolders.set(parent, [...childFolders.get(parent) || [], path])
-  }
-  for (const row of matchingRecords) {
-    const folder = row.note.folder || ''
-    childNotes.set(folder, [...childNotes.get(folder) || [], row])
-  }
+  const renderedPaths = useMemo(() => searching ? folderPaths(displayedRecords) : paths, [searching, displayedRecords, paths])
+  const { childFolders, childNotes } = useMemo(() => {
+    const childFolders = new Map<string, string[]>(), childNotes = new Map<string, NoteRecord[]>()
+    for (const path of renderedPaths) {
+      const parent = path.split('/').slice(0, -1).join('/')
+      const children = childFolders.get(parent) ?? []
+      children.push(path); childFolders.set(parent, children)
+    }
+    for (const row of displayedRecords) {
+      const folder = row.note.folder || '', children = childNotes.get(folder) ?? []
+      children.push(row); childNotes.set(folder, children)
+    }
+    return { childFolders, childNotes }
+  }, [renderedPaths, displayedRecords])
   const words = note?.content.trim().split(/\s+/).filter(Boolean).length ?? 0
   const publicChanged = active?.published && (active?.published.content !== note?.content || active?.published.title !== note?.title)
   const locked = busy || initializing
@@ -1370,7 +1397,8 @@ function Notebook({ route, navigate }: { route: NoteRoute; navigate: (path: stri
         </div>
         {notebookView === 'notes' && folderEditor?.kind === 'create' && !folderEditor.path && folderNameForm()}
         <nav className="folder-tree" aria-label={notebookView === 'trash' ? 'Deleted notes' : 'Folders and notes'}>
-          {flatNoteList ? matchingRecords.map(row => treeNote(row)) : treeContents('')}
+          {flatNoteList ? displayedRecords.map(row => treeNote(row)) : treeContents('')}
+          {searching && displayedRecords.length < matchingRecords.length && <button className="button ghost small" onClick={() => setSearchLimit(limit => limit + 100)}>Show more results ({displayedRecords.length} of {matchingRecords.length})</button>}
           {!matchingRecords.length && (searching || flatNoteList) && <div className="tree-empty"><p>{searching ? 'No notes match your search.' : notebookView === 'trash' ? 'Trash is empty.' : noteView === 'pinned' ? 'Pin a note to keep it here.' : 'Notes you open or edit appear here.'}</p>{searching && <button className="button ghost small" onClick={() => setQuery('')}>Clear search</button>}</div>}
         </nav>
         {notebookView === 'notes' && <div className={`root-drop-zone ${dragging && canDrop('') ? 'drop-available' : ''} ${dropFolder === '' ? 'drop-target' : ''}`} role="region" aria-label="Move to top level" onDragOver={event => dragOver(event, '')} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropFolder(null) }} onDrop={event => dropInto(event, '')}>

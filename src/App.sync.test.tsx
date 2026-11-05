@@ -13,7 +13,7 @@ import { acknowledgeLocalNote, adoptGuestNotebook, closeLocalNotebook, readLocal
 configure({ asyncUtilTimeout: 3000 })
 
 const mocks = vi.hoisted(() => ({
-  restore: vi.fn(), start: vi.fn(), persist: vi.fn(), discard: vi.fn(), signOut: vi.fn(),
+  checkpoint: vi.fn(), restore: vi.fn(), start: vi.fn(), persist: vi.fn(), discard: vi.fn(), signOut: vi.fn(),
   list: vi.fn(), save: vi.fn(), publish: vi.fn(), unpublish: vi.fn(), remove: vi.fn(),
   loadFolders: vi.fn(), saveFolders: vi.fn(),
   adoptionGate: null as Promise<void> | null,
@@ -23,6 +23,13 @@ const mocks = vi.hoisted(() => ({
   localWriteStarted: vi.fn(),
 }))
 
+vi.mock('./lib/crdt', async importOriginal => {
+  const actual = await importOriginal<typeof import('./lib/crdt')>()
+  return { ...actual, checkpointNote: (...args: Parameters<typeof actual.checkpointNote>) => {
+    mocks.checkpoint(...args)
+    return actual.checkpointNote(...args)
+  } }
+})
 vi.mock('./lib/pubky', () => ({
   restoreSession: mocks.restore, startSignIn: mocks.start, persistSession: mocks.persist,
   discardSession: mocks.discard, signOut: mocks.signOut,
@@ -157,6 +164,27 @@ describe('durable local notes and account synchronization', () => {
       expect(versions[2].restoredFrom).toBe(versions[0].id)
     })
     expect(mocks.publish).not.toHaveBeenCalled()
+  })
+
+  it('checkpoints only changed histories after the initial notebook flush', async () => {
+    await writeLocalNote(GUEST_SCOPE, row('First dirty history', 'Initial'))
+    await writeLocalNote(GUEST_SCOPE, row('Unchanged history', 'Untouched'))
+    await setLocalActiveId(GUEST_SCOPE, 'First-dirty-history')
+    render(<App />)
+    await readyGuest()
+    await saveNow()
+    mocks.checkpoint.mockClear()
+    changeContent('Only this history changed')
+    await saveNow()
+    expect(mocks.checkpoint.mock.calls.length).toBeGreaterThan(0)
+    expect(new Set(mocks.checkpoint.mock.calls.map(([note]) => note.id))).toEqual(new Set(['First-dirty-history']))
+    await waitFor(async () => {
+      const saved = (await readLocalNotebook(GUEST_SCOPE)).records.find(row => row.note.id === 'First-dirty-history')!
+      expect(readNoteVersion(saved.note, listNoteVersions(saved.note).at(-1)!.id).content).toBe('Only this history changed')
+    })
+    mocks.checkpoint.mockClear()
+    await saveNow()
+    expect(mocks.checkpoint).not.toHaveBeenCalled()
   })
 
   it('records saved versions after an idle pause and flushes pending text before switching notes', async () => {

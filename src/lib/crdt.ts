@@ -10,6 +10,9 @@ export const MAX_VERSION_SNAPSHOT_BYTES = 128 * 1024
 export const MAX_NOTE_EDITS = 20_000
 export const MAX_VERSION_CHANGE_TEXT_LENGTH = 1024 * 1024
 const MAX_EDIT_RANGES = 2_048
+const VALIDATION_CACHE_BYTES = 8 * 1024 * 1024
+const validatedNotes = new Map<string, CrdtNote>()
+let validationCacheBytes = 0
 
 /** Editor-supplied attribution, not an independently authenticated identity. */
 export interface NoteEditor { id: string; label: string }
@@ -86,6 +89,11 @@ export function mergeNotes(left: CrdtNote, right: CrdtNote): CrdtNote {
   const a = validateCrdtNote(left), b = validateCrdtNote(right)
   if (!a.crdt || !b.crdt) throw new Error('Initialize both notes before merging them.')
   if (a.id !== b.id || a.createdAt !== b.createdAt || a.crdt.lineage !== b.crdt.lineage || a.crdt.version !== b.crdt.version) throw new LineageConflictError()
+  // Both complete snapshots were validated above, including their readable text.
+  if (a.crdt.update === b.crdt.update &&
+      (a.crdt.version !== 2 || b.crdt.version === 2 && a.crdt.personal === b.crdt.personal)) {
+    return a.updatedAt >= b.updatedAt ? a : b
+  }
   if (a.crdt.version === 2 && b.crdt.version === 2) {
     const doc = sharedDocumentOf(a), personal = personalDocumentOf(a)
     try {
@@ -110,6 +118,8 @@ export function validateCrdtNote(note: CrdtNote): CrdtNote {
     if (!('lineage' in value) || typeof value.lineage !== 'string' || !/^shared:[a-f0-9-]{36}$/.test(value.lineage) ||
         !('update' in value) || typeof value.update !== 'string' || !('personal' in value) || typeof value.personal !== 'string') throw new Error('Invalid shared note editing history.')
     const shared = { ...clean, crdt: { version: 2 as const, lineage: value.lineage, update: value.update, personal: value.personal } }
+    const cached = validatedNotes.get(validationKey(shared))
+    if (cached) return copyNote(cached)
     const doc = sharedDocumentOf(shared), personal = personalDocumentOf(shared)
     try {
       const decoded = materializeSharedNote(doc, personal, clean, value.lineage)
@@ -122,7 +132,10 @@ export function validateCrdtNote(note: CrdtNote): CrdtNote {
       !('lineage' in value) || typeof value.lineage !== 'string' ||
       !/^(?:legacy:[a-f0-9]{64}|new:[a-f0-9-]{36})$/.test(value.lineage) ||
       !('update' in value) || typeof value.update !== 'string') throw new Error('Invalid note editing history.')
-  const doc = documentOf({ ...clean, crdt: { version: 1, lineage: value.lineage, update: value.update } })
+  const prepared = { ...clean, crdt: { version: 1 as const, lineage: value.lineage, update: value.update } }
+  const cached = validatedNotes.get(validationKey(prepared))
+  if (cached) return copyNote(cached)
+  const doc = documentOf(prepared)
   try {
     const decoded = materialize(doc, clean, value.lineage)
     if (decoded.title !== clean.title || decoded.content !== clean.content ||
@@ -131,6 +144,32 @@ export function validateCrdtNote(note: CrdtNote): CrdtNote {
     }
     return decoded
   } finally { doc.destroy() }
+}
+
+function validationKey(note: CrdtNote): string {
+  // Only called with a structurally checked envelope. Key every accepted field
+  // by value rather than identity, including readable text and timestamps.
+  const crdt = note.crdt
+  return JSON.stringify([note.id, note.title, note.content, note.createdAt, note.updatedAt, note.folder ?? '', note.deleted === true,
+    crdt?.version, crdt?.lineage, crdt?.update, crdt?.version === 2 ? crdt.personal : null])
+}
+
+function copyNote(note: CrdtNote): CrdtNote {
+  return { ...note, ...(note.crdt ? { crdt: { ...note.crdt } } : {}) }
+}
+
+function rememberValidated(note: CrdtNote): CrdtNote {
+  const key = validationKey(note)
+  if (!validatedNotes.has(key) && key.length * 4 <= VALIDATION_CACHE_BYTES) {
+    while (validatedNotes.size >= 128 || validationCacheBytes + key.length * 4 > VALIDATION_CACHE_BYTES) {
+      const oldest = validatedNotes.keys().next().value!
+      validationCacheBytes -= oldest.length * 4
+      validatedNotes.delete(oldest)
+    }
+    validatedNotes.set(key, copyNote(note))
+    validationCacheBytes += key.length * 4
+  }
+  return note
 }
 
 /** Compare full editing state, including operations hidden by a deletion. */
@@ -286,7 +325,7 @@ function materialize(doc: Y.Doc, note: CrdtNote, lineage: string): CrdtNote {
   const clean = validateFields({ ...note, title: title.toString(), content: content.toString(), folder: meta.get('folder') as string, deleted: meta.get('deleted') as boolean })
   const result: CrdtNote = { ...clean, crdt: { version: 1, update: encode(Y.encodeStateAsUpdate(doc)), lineage } }
   if (new TextEncoder().encode(JSON.stringify(result)).byteLength > MAX_NOTE_BYTES) throw new Error('This note’s editing history is too large to save. Export the Markdown before continuing.')
-  return result
+  return rememberValidated(result)
 }
 
 export function editText(text: Y.Text, value: string): void {
@@ -545,7 +584,7 @@ export function materializeSharedNote(doc: Y.Doc, personal: Y.Doc, note: CrdtNot
   const clean = validateFields({ ...note, title: doc.getText('title').toString(), content: doc.getText('content').toString(), folder: meta.get('folder') as string, deleted: meta.get('deleted') as boolean })
   const result: CrdtNote = { ...clean, crdt: { version: 2, update: encode(Y.encodeStateAsUpdate(doc)), personal: encode(Y.encodeStateAsUpdate(personal)), lineage } }
   if (new TextEncoder().encode(JSON.stringify(result)).byteLength > MAX_NOTE_BYTES) throw new Error('This note’s editing history is too large to save. Export the Markdown before continuing.')
-  return result
+  return rememberValidated(result)
 }
 
 function versionId(value: unknown): value is string {

@@ -1,4 +1,4 @@
-import { editNote, ensureCrdt, initializeNote, mergeNotes, noteRevision } from './crdt'
+import { editNote, ensureCrdt, initializeNote, mergeNotes, noteRevision, validateCrdtNote } from './crdt'
 import type { CrdtNote } from './crdt'
 import { normalizeFolderPaths } from './folder-store'
 import type { NoteRecord } from './notes'
@@ -83,7 +83,9 @@ export async function writeLocalNote(scope: string, record: NoteRecord): Promise
       ? { note: mergeNotes(existing.record.note, incoming.note), published: incoming.published }
       : incoming
     if (!existing) await checkCapacity(transaction, destination.scope)
-    store.put({ scope: destination.scope, id: destination.id, record: merged, pending: true } satisfies StoredNote)
+    if (!existing || !existing.pending || !sameRecord(existing.record, merged)) {
+      store.put({ scope: destination.scope, id: destination.id, record: merged, pending: true } satisfies StoredNote)
+    }
     return merged
   })
 }
@@ -130,7 +132,9 @@ export async function acknowledgeLocalNote(
       : incoming
     const pending = noteRevision(record.note) !== noteRevision(incoming.note)
     if (!existing) await checkCapacity(transaction, destination.scope)
-    store.put({ scope: destination.scope, id: destination.id, record, pending } satisfies StoredNote)
+    if (!existing || existing.pending !== pending || !sameRecord(existing.record, record)) {
+      store.put({ scope: destination.scope, id: destination.id, record, pending } satisfies StoredNote)
+    }
     return { record, pending }
   })
 }
@@ -372,10 +376,13 @@ function remapRecord(record: NoteRecord, id: string): NoteRecord {
 }
 
 function sameHistory(left: NoteRecord, right: NoteRecord): boolean {
-  try { mergeNotes(left.note, right.note); return true } catch (error) {
-    if (error instanceof Error && error.name === 'LineageConflictError') return false
-    throw error
-  }
+  const a = validateCrdtNote(left.note), b = validateCrdtNote(right.note)
+  return !!a.crdt && !!b.crdt && a.id === b.id && a.createdAt === b.createdAt &&
+    a.crdt.version === b.crdt.version && a.crdt.lineage === b.crdt.lineage
+}
+
+function sameRecord(left: NoteRecord, right: NoteRecord): boolean {
+  return JSON.stringify(left) === JSON.stringify(right)
 }
 
 function requireScope(scope: string): void {

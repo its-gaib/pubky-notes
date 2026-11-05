@@ -30,6 +30,27 @@ afterEach(async () => {
 })
 
 describe('durable account-scoped local notebook', () => {
+  it('skips unchanged cache writes but still clears pending edits and updates publication and timestamps', async () => {
+    const base = note()
+    await acknowledgeLocalNote(alice, record(base))
+    const put = vi.spyOn(IDBObjectStore.prototype, 'put')
+    await acknowledgeLocalNote(alice, record(structuredClone(base)))
+    expect(put).not.toHaveBeenCalled()
+
+    await writeLocalNote(alice, record(base))
+    put.mockClear()
+    await writeLocalNote(alice, record(base))
+    expect(put).not.toHaveBeenCalled()
+    await acknowledgeLocalNote(alice, record(base))
+    expect(put).toHaveBeenCalledTimes(1)
+    expect((await readLocalNotebook(alice)).pending).toEqual([])
+
+    const later = { ...base, updatedAt: '2026-10-15T12:00:00Z' }
+    const published = { ...base, content: 'Reviewed public text' }
+    await acknowledgeLocalNote(alice, { note: later, published })
+    expect((await readLocalNotebook(alice)).records).toEqual([{ note: later, published }])
+  })
+
   it('restores committed drafts, the outbox, folders, and selection after reconnecting to IndexedDB', async () => {
     const draft = note()
     await writeLocalNote(guest, record(draft))

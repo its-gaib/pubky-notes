@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { Fragment, useDeferredValue, useEffect, useId, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import { FileText, Pin, Search } from 'lucide-react'
 import type { NoteRecord } from '../lib/notes'
@@ -27,8 +27,12 @@ export default function QuickSwitcher({ records, navigation, disabled = false, o
   const list = useRef<HTMLDivElement>(null)
   const id = useId()
   const rows = useMemo(() => sortNavigableNotes(records, navigation), [records, navigation])
-  const matches = useMemo(() => searchNotes(rows, query), [rows, query])
-  const active = Math.min(selected, Math.max(0, matches.length - 1))
+  const deferredQuery = useDeferredValue(query)
+  const matches = useMemo(() => searchNotes(rows, deferredQuery), [rows, deferredQuery])
+  const [limit, setLimit] = useState(100)
+  useEffect(() => setLimit(100), [deferredQuery])
+  const displayed = matches.slice(0, limit)
+  const active = Math.min(selected, Math.max(0, displayed.length - 1))
   const opened = useRef(false)
   useEffect(() => {
     field.current?.focus()
@@ -48,7 +52,7 @@ export default function QuickSwitcher({ records, navigation, disabled = false, o
     if (event.key === 'Enter') { event.preventDefault(); open(active); return }
     if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
       event.preventDefault()
-      const last = Math.max(0, matches.length - 1)
+      const last = Math.max(0, displayed.length - 1)
       setSelected(event.key === 'Home' ? 0 : event.key === 'End' ? last : Math.max(0, Math.min(last, active + (event.key === 'ArrowDown' ? 1 : -1))))
     }
   }
@@ -56,7 +60,7 @@ export default function QuickSwitcher({ records, navigation, disabled = false, o
     <label className="quick-switcher-search"><Search size={17} aria-hidden="true" /><input ref={field} role="combobox" aria-label="Find a note" placeholder="Search titles and note text…" autoComplete="off" spellCheck={false} aria-expanded="true" aria-controls={`${id}-results`} aria-autocomplete="list" aria-activedescendant={matches.length ? `${id}-result-${active}` : undefined} value={query} disabled={disabled} onChange={event => { opened.current = false; setQuery(event.currentTarget.value); setSelected(0) }} onKeyDown={keydown} /></label>
     <p className="quick-switcher-hint">{query.trim() ? `${matches.length} ${matches.length === 1 ? 'note matches' : 'notes match'} across titles and full note text` : 'Pinned and recently opened notes'}<span>↑↓ to choose · Enter to open</span></p>
     <div ref={list} id={`${id}-results`} className="quick-switcher-results" role="listbox" aria-label="Matching notes" aria-busy={disabled}>
-      {matches.map((match, index) => {
+      {displayed.map((match, index) => {
         const note = match.row.note
         return <div role="option" id={`${id}-result-${index}`} key={note.id} aria-selected={index === active} aria-disabled={disabled} className={`quick-switcher-result ${index === active ? 'active' : ''}`} onMouseMove={() => setSelected(index)} onMouseDown={event => event.preventDefault()} onClick={() => open(index)}>
           <FileText size={16} aria-hidden="true" />
@@ -65,6 +69,7 @@ export default function QuickSwitcher({ records, navigation, disabled = false, o
         </div>
       })}
     </div>
+    {displayed.length < matches.length && <button className="button ghost small" onClick={() => setLimit(value => value + 100)}>Show more results ({displayed.length} of {matches.length})</button>}
     {!matches.length && <p className="quick-switcher-empty" role="status">{query.trim() ? 'No notes match this text.' : 'No notes to open yet.'}</p>}
   </div>
 }

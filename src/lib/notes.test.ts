@@ -49,7 +49,7 @@ function makeSession(initial: Array<[string, Note]> = []) {
     }),
     lock: vi.fn(async (path: string) => ({ path, free: vi.fn() })),
     unlock: vi.fn(async () => undefined),
-    refreshLock: vi.fn(async () => undefined),
+    refreshLock: vi.fn(async (_lock: { path: string; timeoutSeconds?: number }, _seconds: number) => undefined),
     putTextLocked: vi.fn(async (lock: { path: string }, text: string) => { files.set(lock.path, JSON.parse(text)) }),
     deleteLocked: vi.fn(async (lock: { path: string }) => { if (!files.delete(lock.path)) throw missing }),
   }
@@ -288,6 +288,63 @@ describe('flat storage and private folder metadata', () => {
 })
 
 describe('locked CRDT synchronization', () => {
+  it('avoids immediate refreshes while both actual granted leases remain fresh', async () => {
+    const { session, storage } = makeSession()
+    storage.lock.mockImplementation(async path => ({ path, timeoutSeconds: 60, free: vi.fn() }))
+    await saveNote(session, fixture())
+    expect(storage.refreshLock).not.toHaveBeenCalled()
+    expect(storage.putTextLocked).toHaveBeenCalledTimes(1)
+    expect(storage.unlock).toHaveBeenCalledTimes(2)
+  })
+
+  it('renews a shorter granted lease before writing without refreshing a fresh public lease', async () => {
+    const { session, storage } = makeSession()
+    let now = 0
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now)
+    try {
+      storage.lock.mockImplementation(async path => ({ path, timeoutSeconds: path.startsWith('/priv/') ? 2 : 60, free: vi.fn() }))
+      const get = storage.get.getMockImplementation()!
+      storage.get.mockImplementation(async path => { now = 1500; return get(path) })
+      await saveNote(session, fixture())
+      expect(storage.refreshLock).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ path: notePath('private', 'note-1') }), 60)
+      expect(storage.putTextLocked).toHaveBeenCalledTimes(1)
+    } finally { clock.mockRestore() }
+  })
+
+  it('accounts for slow lock acquisition before deciding whether to renew', async () => {
+    const { session, storage } = makeSession()
+    let now = 0
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now)
+    try {
+      storage.lock.mockImplementation(async path => {
+        if (path.startsWith('/priv/')) now = 1500
+        return { path, timeoutSeconds: path.startsWith('/priv/') ? 2 : 60, free: vi.fn() }
+      })
+      await saveNote(session, fixture())
+      expect(storage.refreshLock).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ path: notePath('private', 'note-1') }), 60)
+      expect(storage.putTextLocked).toHaveBeenCalledTimes(1)
+    } finally { clock.mockRestore() }
+  })
+
+  it('uses the new granted lifetime after a refresh during publication', async () => {
+    const { session, storage } = makeSession()
+    let now = 0
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now)
+    try {
+      storage.lock.mockImplementation(async path => ({ path, timeoutSeconds: path.startsWith('/priv/') ? 2 : 60, free: vi.fn() }))
+      const get = storage.get.getMockImplementation()!
+      storage.get.mockImplementation(async path => { now = Math.max(now, 1500); return get(path) })
+      storage.refreshLock.mockImplementation(async lock => {
+        lock.timeoutSeconds = storage.refreshLock.mock.calls.length === 1 ? 1 : 60
+      })
+      const put = storage.putTextLocked.getMockImplementation()!
+      storage.putTextLocked.mockImplementation(async (lock, text) => { await put(lock, text); now = 2100 })
+      await publishNote(session, fixture())
+      expect(storage.refreshLock).toHaveBeenCalledTimes(2)
+      expect(storage.refreshLock.mock.calls.every(([lock]) => lock.path.startsWith('/priv/'))).toBe(true)
+    } finally { clock.mockRestore() }
+  })
+
   it('locks both paths in CLI order, merges remote edits, and acknowledges the actual stored state', async () => {
     const base = initializeNote({ ...fixture(), content: 'First\nLast' })
     const local = editNote(base, { content: 'First local\nLast' })
